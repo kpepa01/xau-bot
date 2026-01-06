@@ -1,0 +1,2469 @@
+## Safe Confluence XAU Bot - Professional Edition v16
+## FULLY AUTOMATED with Comprehensive Logging and Safety Features
+## ENHANCED: 70-PIPS-FIRST SL Movement Strategy
+## TEST ON DEMO ACCOUNT FIRST.
+
+import MetaTrader5 as mt5
+import pandas as pd
+import numpy as np
+import time
+import math
+import threading
+import logging
+import csv
+import os
+import json
+import hashlib
+from datetime import datetime, date, time as dt_time, timedelta
+from typing import Dict, List, Tuple, Optional, Any
+from collections import deque, defaultdict
+from dataclasses import dataclass, field
+from ta.trend import EMAIndicator, MACD
+from ta.volatility import AverageTrueRange
+from ta.momentum import RSIIndicator, StochasticOscillator
+
+# ==================== SECURITY & CONFIGURATION ====================
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+@dataclass
+class BotConfig:
+    # MT5 Connection
+    LOGIN: int = int(os.getenv("MT5_LOGIN", "52536980"))
+    PASSWORD: str = os.getenv("MT5_PASSWORD", "z!Kt1zsRa8Buyb")
+    SERVER: str = os.getenv("MT5_SERVER", "ICMarketsSC-Demo")
+    
+    # Trading Parameters
+    SYMBOLS: List[str] = field(default_factory=lambda: ["XAUUSD", "XAUJPY"])
+    ENTRY_TF: int = mt5.TIMEFRAME_M5
+    HTF_TF: int = mt5.TIMEFRAME_M15
+    MAGIC: int = 987654
+    MODE: str = "CONFLUENCE"
+    
+    # Risk Management - OPTIMIZED FOR XAU
+    LOT_FIXED: float = 0.01
+    USE_FIXED_LOT: bool = True
+    MAX_TRADES_PER_SYMBOL: int = 2
+    MAX_POSITIONS_TOTAL: int = 4
+    COOLDOWN: int = 300  # 5 minutes
+    FORCE_TRADE_EVERY: int = 300  # Force trade every 5 minutes if no signals
+    
+    # Indicator Parameters
+    EMA_FAST: int = 5
+    EMA_SLOW: int = 13
+    ATR_PERIOD: int = 14
+    RSI_PERIOD: int = 7
+    RSI_OB: int = 70
+    RSI_OS: int = 30
+    MIN_ATR: float = 0.8  # Increased for XAU
+    SL_ATR_MULT: float = 1.2
+    TP_ATR_MULT: float = 2.5
+    
+    # Daily Limits
+    DAILY_LOSS_PCT: float = 3.0
+    DAILY_PROFIT_PCT: float = 5.0
+    MAX_DAILY_TRADES: int = 30
+    MAX_DRAWDOWN_PCT: float = 5.0
+    
+    # Time Restrictions
+    NO_TRADE_START: dt_time = dt_time(23, 0)
+    NO_TRADE_END: dt_time = dt_time(0, 30)
+    
+    # Partial Close
+    PARTIAL_CLOSE_ENABLED: bool = True
+    PARTIAL_CLOSE_PCT: float = 0.5
+    PARTIAL_CLOSE_MIN_VOL: float = 0.01
+    
+    # ==== 70-PIPS-FIRST SL MOVEMENT STRATEGY ====
+    TRAILING_ENABLED: bool = True
+    FIRST_MOVE_PIPS: int = 70  # Move SL after 70 pips profit
+    TRAIL_DISTANCE_PIPS: int = 70  # Trail by 70 pips
+    BREAKEVEN_PIPS: int = 20  # Lock 20 pips on first move
+    MIN_PROFIT_FOR_FIRST_MOVE: float = 7.0  # $7 minimum
+    
+    # Market Regime Detection
+    MARKET_REGIME_PERIOD: int = 50
+    TRENDING_THRESHOLD: float = 0.5
+    RANGING_THRESHOLD: float = 0.3
+    
+    # Signal Detection - OPTIMIZED
+    MIN_CONFIRMING_SIGNALS: int = 2
+    CONSECUTIVE_LOSS_LIMIT: int = 5  # Increased from 3
+    CONSECUTIVE_LOSS_COOLDOWN: int = 1800  # 30 minutes
+    MAX_LOSS_PER_TRADE: float = 15.0
+    
+    # Performance Monitoring
+    SUMMARY_INTERVAL: int = 1800
+    MONITOR_INTERVAL: int = 30
+    
+    # Automation Settings
+    AUTO_RECONNECT: bool = True
+    MAX_RECONNECT_ATTEMPTS: int = 10
+    RECONNECT_BACKOFF_BASE: float = 2.0
+    DATA_CACHE_SECONDS: int = 60
+    VALIDATE_SYMBOLS_ON_STARTUP: bool = True
+
+config = BotConfig()
+
+# ==================== AUTOMATIC LOGGING SETUP ====================
+class AutomatedLogger:
+    """AUTOMATIC LOGGING SYSTEM - Creates all logs on startup"""
+    
+    def __init__(self):
+        # Create timestamped folder for this run
+        self.run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_dir = os.path.expanduser(fr"C:\Users\klajd\Documents\XAU_Bot_Logs\Run_{self.run_timestamp}")
+        
+        # Create directory if it doesn't exist
+        os.makedirs(self.log_dir, exist_ok=True)
+        
+        # Define all log file paths
+        self.log_files = {
+            'main': os.path.join(self.log_dir, "trading_bot.log"),
+            'trades': os.path.join(self.log_dir, "trade_log.csv"),
+            'errors': os.path.join(self.log_dir, "error_log.csv"),
+            'performance': os.path.join(self.log_dir, "performance_log.csv"),
+            'sl_movements': os.path.join(self.log_dir, "sl_movement_log.csv"),
+            'debug': os.path.join(self.log_dir, "debug_log.csv"),
+            'signals': os.path.join(self.log_dir, "signals_log.csv")
+        }
+        
+        # Initialize all log files
+        self._init_all_log_files()
+        
+        # Setup main logger with console and file output
+        self.setup_main_logger()
+        
+        # Log startup
+        self.logger.info("=" * 80)
+        self.logger.info("ENHANCED XAU BOT - 70-PIPS-FIRST STRATEGY v16")
+        self.logger.info(f"Run Timestamp: {self.run_timestamp}")
+        self.logger.info(f"Log Directory: {self.log_dir}")
+        self.logger.info("=" * 80)
+        self.logger.info("✅ ALL LOG FILES CREATED AUTOMATICALLY")
+        
+    def _init_all_log_files(self):
+        """Initialize all CSV log files with headers"""
+        
+        # Trade Log
+        with open(self.log_files['trades'], 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestamp', 'symbol', 'direction', 'entry_price', 'exit_price',
+                'volume', 'profit', 'reason', 'status', 'sl_price', 'tp_price',
+                'ticket', 'magic', 'consecutive_losses'
+            ])
+        
+        # Error Log
+        with open(self.log_files['errors'], 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestamp', 'function', 'error_message', 'severity',
+                'symbol', 'line_number', 'thread_id'
+            ])
+        
+        # Performance Log
+        with open(self.log_files['performance'], 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestamp', 'date', 'balance', 'equity', 'floating_pnl',
+                'total_trades', 'win_rate', 'profit_factor', 'max_drawdown',
+                'daily_trades', 'daily_pnl', 'consecutive_losses'
+            ])
+        
+        # SL Movement Log
+        with open(self.log_files['sl_movements'], 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestamp', 'ticket', 'symbol', 'direction', 'entry_price',
+                'current_price', 'old_sl', 'new_sl', 'profit_pips',
+                'profit_usd', 'reason', 'move_type'
+            ])
+        
+        # Debug Log
+        with open(self.log_files['debug'], 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestamp', 'symbol', 'price', 'ema_fast', 'ema_slow',
+                'rsi', 'atr', 'market_regime', 'signals_detected',
+                'volume', 'spread', 'data_points'
+            ])
+        
+        # Signals Log
+        with open(self.log_files['signals'], 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestamp', 'symbol', 'signal_direction', 'signal_type',
+                'confidence', 'price', 'rsi', 'ema_alignment', 'volume_confirmation',
+                'market_regime', 'confluence_count', 'action_taken'
+            ])
+        
+        self.logger = None  # Will be set in setup_main_logger
+        
+    def setup_main_logger(self):
+        """Setup the main logging system"""
+        self.logger = logging.getLogger("XAU_Bot_Pro_v16")
+        self.logger.setLevel(logging.INFO)
+        
+        # Clear any existing handlers
+        self.logger.handlers.clear()
+        
+        # File Handler
+        fh = logging.FileHandler(
+            self.log_files['main'],
+            mode='a',
+            encoding='utf-8'
+        )
+        
+        # Console Handler
+        ch = logging.StreamHandler()
+        
+        # Formatter
+        fmt = logging.Formatter(
+            "%(asctime)s | %(levelname)-8s | %(threadName)-15s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        
+        fh.setFormatter(fmt)
+        ch.setFormatter(fmt)
+        
+        self.logger.addHandler(fh)
+        self.logger.addHandler(ch)
+    
+    def log_trade(self, trade_data: Dict):
+        """Log trade execution with consecutive loss tracking"""
+        try:
+            with open(self.log_files['trades'], 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    trade_data.get('symbol', ''),
+                    trade_data.get('direction', ''),
+                    trade_data.get('entry_price', 0),
+                    trade_data.get('exit_price', 0),
+                    trade_data.get('volume', 0),
+                    trade_data.get('profit', 0),
+                    trade_data.get('reason', ''),
+                    trade_data.get('status', ''),
+                    trade_data.get('sl_price', 0),
+                    trade_data.get('tp_price', 0),
+                    trade_data.get('ticket', 0),
+                    trade_data.get('magic', 0),
+                    trade_data.get('consecutive_losses', 0)
+                ])
+            self.logger.info(f"Trade logged: {trade_data.get('symbol')} {trade_data.get('direction')}")
+        except Exception as e:
+            self.logger.error(f"Failed to log trade: {e}")
+            self.log_error("log_trade", str(e), "WARNING")
+    
+    def log_signal(self, signal_data: Dict):
+        """Log every signal detected"""
+        try:
+            with open(self.log_files['signals'], 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    signal_data.get('symbol', ''),
+                    signal_data.get('signal_direction', ''),
+                    signal_data.get('signal_type', ''),
+                    signal_data.get('confidence', 0),
+                    signal_data.get('price', 0),
+                    signal_data.get('rsi', 0),
+                    signal_data.get('ema_alignment', ''),
+                    signal_data.get('volume_confirmation', False),
+                    signal_data.get('market_regime', ''),
+                    signal_data.get('confluence_count', 0),
+                    signal_data.get('action_taken', '')
+                ])
+        except Exception as e:
+            self.logger.error(f"Failed to log signal: {e}")
+    
+    def log_error(self, function_name: str, error_msg: str, severity: str = "ERROR", 
+                  symbol: str = "", line_num: str = ""):
+        """Log errors with detailed information"""
+        try:
+            with open(self.log_files['errors'], 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    function_name,
+                    error_msg,
+                    severity,
+                    symbol,
+                    line_num,
+                    threading.current_thread().name
+                ])
+            
+            # Also log to main logger
+            if severity == "CRITICAL":
+                self.logger.critical(f"{function_name}: {error_msg}")
+            elif severity == "ERROR":
+                self.logger.error(f"{function_name}: {error_msg}")
+            elif severity == "WARNING":
+                self.logger.warning(f"{function_name}: {error_msg}")
+            else:
+                self.logger.info(f"{function_name}: {error_msg}")
+                
+        except Exception as e:
+            print(f"CRITICAL: Failed to log error: {e}")
+    
+    def log_performance(self, performance_data: Dict):
+        """Log performance metrics"""
+        try:
+            with open(self.log_files['performance'], 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    datetime.now().date().isoformat(),
+                    performance_data.get('balance', 0),
+                    performance_data.get('equity', 0),
+                    performance_data.get('floating_pnl', 0),
+                    performance_data.get('total_trades', 0),
+                    performance_data.get('win_rate', 0),
+                    performance_data.get('profit_factor', 0),
+                    performance_data.get('max_drawdown', 0),
+                    performance_data.get('daily_trades', 0),
+                    performance_data.get('daily_pnl', 0),
+                    performance_data.get('consecutive_losses', 0)
+                ])
+        except Exception as e:
+            self.logger.error(f"Failed to log performance: {e}")
+            self.log_error("log_performance", str(e), "WARNING")
+    
+    def log_sl_movement(self, sl_data: Dict):
+        """Log SL movements"""
+        try:
+            with open(self.log_files['sl_movements'], 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    sl_data.get('ticket', 0),
+                    sl_data.get('symbol', ''),
+                    sl_data.get('direction', ''),
+                    sl_data.get('entry_price', 0),
+                    sl_data.get('current_price', 0),
+                    sl_data.get('old_sl', 0),
+                    sl_data.get('new_sl', 0),
+                    sl_data.get('profit_pips', 0),
+                    sl_data.get('profit_usd', 0),
+                    sl_data.get('reason', ''),
+                    sl_data.get('move_type', '')
+                ])
+        except Exception as e:
+            self.logger.error(f"Failed to log SL movement: {e}")
+            self.log_error("log_sl_movement", str(e), "WARNING")
+    
+    def log_debug(self, debug_data: Dict):
+        """Log market data and indicators for debugging"""
+        try:
+            with open(self.log_files['debug'], 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    debug_data.get('symbol', ''),
+                    debug_data.get('price', 0),
+                    debug_data.get('ema_fast', 0),
+                    debug_data.get('ema_slow', 0),
+                    debug_data.get('rsi', 0),
+                    debug_data.get('atr', 0),
+                    debug_data.get('market_regime', ''),
+                    debug_data.get('signals_detected', ''),
+                    debug_data.get('volume', 0),
+                    debug_data.get('spread', 0),
+                    debug_data.get('data_points', 0)
+                ])
+        except Exception as e:
+            self.logger.error(f"Failed to log debug data: {e}")
+
+# Initialize automated logger
+logger = AutomatedLogger()
+
+# ==================== AUTOMATIC CONNECTION MANAGER ====================
+class ConnectionManager:
+    """AUTOMATIC CONNECTION MANAGEMENT with exponential backoff"""
+    
+    def __init__(self):
+        self.connected = False
+        self.last_connection_check = 0
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = config.MAX_RECONNECT_ATTEMPTS
+        self.backoff_base = config.RECONNECT_BACKOFF_BASE
+        
+    def initialize_with_retry(self) -> float:
+        """Initialize MT5 with exponential backoff retry"""
+        attempt = 0
+        
+        while attempt < self.max_reconnect_attempts:
+            try:
+                logger.logger.info(f"MT5 Connection Attempt {attempt + 1}/{self.max_reconnect_attempts}")
+                
+                if not mt5.initialize(login=config.LOGIN, password=config.PASSWORD, server=config.SERVER):
+                    error_msg = f"MT5 initialize failed: {mt5.last_error()}"
+                    logger.logger.error(error_msg)
+                    logger.log_error("initialize_with_retry", error_msg, "ERROR")
+                    
+                    attempt += 1
+                    self.reconnect_attempts = attempt
+                    
+                    # Exponential backoff
+                    wait_time = self.backoff_base ** attempt
+                    logger.logger.warning(f"Waiting {wait_time:.1f} seconds before retry...")
+                    time.sleep(wait_time)
+                    continue
+                
+                # Validate account info
+                acct = mt5.account_info()
+                if acct is None:
+                    error_msg = "Account info unavailable after connection"
+                    logger.logger.error(error_msg)
+                    logger.log_error("initialize_with_retry", error_msg, "ERROR")
+                    mt5.shutdown()
+                    
+                    attempt += 1
+                    self.reconnect_attempts = attempt
+                    wait_time = self.backoff_base ** attempt
+                    time.sleep(wait_time)
+                    continue
+                
+                # Validate symbols if configured
+                if config.VALIDATE_SYMBOLS_ON_STARTUP:
+                    self.validate_all_symbols()
+                
+                self.connected = True
+                self.reconnect_attempts = 0
+                self.last_connection_check = time.time()
+                
+                logger.logger.info(f"✅ MT5 Connected Successfully")
+                logger.logger.info(f"Account: {acct.login}, Balance: ${acct.balance:.2f}")
+                
+                return float(acct.balance)
+                
+            except Exception as e:
+                error_msg = f"Connection error: {str(e)}"
+                logger.logger.error(error_msg)
+                logger.log_error("initialize_with_retry", error_msg, "CRITICAL")
+                
+                attempt += 1
+                self.reconnect_attempts = attempt
+                
+                if attempt < self.max_reconnect_attempts:
+                    wait_time = self.backoff_base ** attempt
+                    logger.logger.warning(f"Retrying in {wait_time:.1f} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    logger.logger.critical(f"Max reconnection attempts reached ({self.max_reconnect_attempts})")
+                    raise SystemExit(f"Failed to connect to MT5 after {self.max_reconnect_attempts} attempts")
+        
+        raise SystemExit("MT5 connection failed")
+    
+    def validate_all_symbols(self):
+        """Validate all trading symbols on startup"""
+        logger.logger.info("Validating trading symbols...")
+        
+        for symbol in config.SYMBOLS:
+            try:
+                info = mt5.symbol_info(symbol)
+                if info is None:
+                    logger.logger.error(f"❌ Symbol {symbol} not found!")
+                    logger.log_error("validate_all_symbols", f"Symbol {symbol} not found", "ERROR")
+                else:
+                    logger.logger.info(f"✅ Symbol {symbol} validated")
+                    logger.logger.debug(f"  Point: {info.point}, Spread: {info.spread}")
+            except Exception as e:
+                logger.logger.error(f"Error validating symbol {symbol}: {e}")
+                logger.log_error("validate_all_symbols", str(e), "WARNING", symbol)
+    
+    def check_connection(self) -> bool:
+        """Check if MT5 connection is still active"""
+        try:
+            current_time = time.time()
+            
+            # Only check every 30 seconds to avoid overhead
+            if current_time - self.last_connection_check < config.MONITOR_INTERVAL:
+                return self.connected
+            
+            self.last_connection_check = current_time
+            
+            # Try to get account info
+            acct = mt5.account_info()
+            
+            if acct is None:
+                logger.logger.warning("MT5 connection lost - account info unavailable")
+                self.connected = False
+                return False
+            
+            self.connected = True
+            return True
+            
+        except Exception as e:
+            logger.logger.error(f"Connection check failed: {e}")
+            self.connected = False
+            return False
+    
+    def reconnect_if_needed(self) -> bool:
+        """Auto-reconnect if connection is lost"""
+        if not self.connected or not self.check_connection():
+            logger.logger.warning("Connection lost, attempting to reconnect...")
+            
+            try:
+                mt5.shutdown()
+                time.sleep(2)
+                
+                # Try to reconnect
+                self.initialize_with_retry()
+                
+                if self.connected:
+                    logger.logger.info("✅ Successfully reconnected to MT5")
+                    return True
+                else:
+                    logger.logger.error("Failed to reconnect to MT5")
+                    return False
+                    
+            except Exception as e:
+                logger.logger.error(f"Reconnection failed: {e}")
+                logger.log_error("reconnect_if_needed", str(e), "CRITICAL")
+                return False
+        
+        return True
+
+# Initialize connection manager
+connection_manager = ConnectionManager()
+
+# ==================== TRADE TRACKER FOR 70-PIPS-FIRST STRATEGY ====================
+class TradeTracker:
+    """Track individual trades for 70-pips-first SL movement strategy"""
+    
+    def __init__(self):
+        self.trades = {}
+        self.consecutive_losses = 0
+        self.lock = threading.RLock()
+        self.max_loss_per_trade = config.MAX_LOSS_PER_TRADE
+    
+    def add_trade(self, ticket: int, symbol: str, direction: str, 
+                  entry_price: float, sl_price: float, tp_price: float):
+        """Add a new trade to track with safety checks"""
+        with self.lock:
+            # Get symbol info for point value calculation
+            info = mt5.symbol_info(symbol)
+            point = info.point if info else 0.01
+            
+            # Calculate risk per point
+            risk_per_point = self._calculate_risk_per_point(symbol, config.LOT_FIXED)
+            
+            # Calculate potential loss
+            if direction == 'buy':
+                stop_distance_points = (entry_price - sl_price) / point
+                potential_loss = abs(stop_distance_points * risk_per_point)
+            else:
+                stop_distance_points = (sl_price - entry_price) / point
+                potential_loss = abs(stop_distance_points * risk_per_point)
+            
+            # Store trade data
+            self.trades[ticket] = {
+                'symbol': symbol,
+                'direction': direction,
+                'entry_price': entry_price,
+                'original_sl': sl_price,
+                'tp_price': tp_price,
+                'current_sl': sl_price,
+                'point_value': point,
+                'risk_per_point': risk_per_point,
+                'potential_loss': potential_loss,
+                'lot_size': config.LOT_FIXED,
+                'first_move_done': False,
+                'last_move_price': entry_price,
+                'partial_closed': False,
+                'max_loss_exceeded': potential_loss > self.max_loss_per_trade
+            }
+            
+            logger.logger.info(f"Trade {ticket} added to tracker. Potential loss: ${potential_loss:.2f}")
+    
+    def _calculate_risk_per_point(self, symbol: str, lot_size: float) -> float:
+        """Calculate risk per point for the symbol"""
+        # For XAUUSD with 0.01 lot: 1 point ≈ $0.01
+        # Adjust based on your broker's specifications
+        return lot_size * 100 * 0.01
+    
+    def update_consecutive_losses(self, profit: float):
+        """Track consecutive losses for safety pausing"""
+        with self.lock:
+            if profit < 0:
+                self.consecutive_losses += 1
+                logger.logger.warning(f"Consecutive losses: {self.consecutive_losses}/{config.CONSECUTIVE_LOSS_LIMIT}")
+                
+                if self.consecutive_losses >= config.CONSECUTIVE_LOSS_LIMIT:
+                    logger.logger.critical(f"⚠️ PAUSING TRADING: {self.consecutive_losses} consecutive losses!")
+                    logger.log_error("update_consecutive_losses", 
+                                   f"{self.consecutive_losses} consecutive losses - Trading paused",
+                                   "CRITICAL")
+            else:
+                self.consecutive_losses = 0
+    
+    def should_pause_trading(self) -> bool:
+        """Check if trading should be paused due to consecutive losses"""
+        with self.lock:
+            return self.consecutive_losses >= config.CONSECUTIVE_LOSS_LIMIT
+    
+    def calculate_current_profit_usd(self, ticket: int, current_price: float) -> float:
+        """Calculate current profit in USD"""
+        with self.lock:
+            if ticket not in self.trades:
+                return 0.0
+            
+            trade = self.trades[ticket]
+            direction = trade['direction']
+            entry_price = trade['entry_price']
+            
+            if direction == 'buy':
+                points = (current_price - entry_price) / trade['point_value']
+            else:
+                points = (entry_price - current_price) / trade['point_value']
+            
+            profit_usd = points * trade['risk_per_point']
+            return profit_usd
+    
+    def calculate_current_profit_pips(self, ticket: int, current_price: float) -> float:
+        """Calculate current profit in pips"""
+        with self.lock:
+            if ticket not in self.trades:
+                return 0.0
+            
+            trade = self.trades[ticket]
+            direction = trade['direction']
+            entry_price = trade['entry_price']
+            point = trade['point_value']
+            
+            if direction == 'buy':
+                profit_pips = (current_price - entry_price) / point
+            else:
+                profit_pips = (entry_price - current_price) / point
+            
+            return profit_pips
+    
+    def update_trade(self, ticket: int, current_price: float) -> Optional[Tuple[float, str]]:
+        """Update trade and return (new_sl, reason) if needed - 70-PIPS-FIRST STRATEGY"""
+        with self.lock:
+            if ticket not in self.trades:
+                return None
+            
+            trade = self.trades[ticket]
+            direction = trade['direction']
+            entry_price = trade['entry_price']
+            current_sl = trade['current_sl']
+            point = trade['point_value']
+            
+            # Calculate profit in pips and USD
+            profit_pips = self.calculate_current_profit_pips(ticket, current_price)
+            profit_usd = self.calculate_current_profit_usd(ticket, current_price)
+            
+            # STRATEGY 1: FIRST MOVE AFTER 70 PIPS
+            if not trade['first_move_done']:
+                # Check if we have 70 pips profit AND minimum $7 profit
+                if profit_pips >= config.FIRST_MOVE_PIPS and profit_usd >= config.MIN_PROFIT_FOR_FIRST_MOVE:
+                    # Move SL to lock in 20 pips profit
+                    if direction == 'buy':
+                        new_sl = entry_price + (config.BREAKEVEN_PIPS * point)
+                    else:
+                        new_sl = entry_price - (config.BREAKEVEN_PIPS * point)
+                    
+                    # Ensure new SL is better than current SL
+                    if (direction == 'buy' and new_sl > current_sl) or \
+                       (direction == 'sell' and new_sl < current_sl):
+                        trade['current_sl'] = new_sl
+                        trade['first_move_done'] = True
+                        trade['last_move_price'] = current_price
+                        
+                        logger.logger.info(f"First SL move at {profit_pips:.1f} pips profit (${profit_usd:.2f})")
+                        logger.logger.info(f"  Moved SL to lock {config.BREAKEVEN_PIPS} pips profit")
+                        
+                        return (new_sl, f"first_move_{config.FIRST_MOVE_PIPS}_pips")
+                return None
+            
+            # STRATEGY 2: TRAIL BY 70 PIPS AFTER FIRST MOVE
+            # Calculate distance from last move price in pips
+            if direction == 'buy':
+                distance_from_last_move = (current_price - trade['last_move_price']) / point
+            else:
+                distance_from_last_move = (trade['last_move_price'] - current_price) / point
+            
+            # Move SL if price has moved 70 pips from last SL move
+            if distance_from_last_move >= config.TRAIL_DISTANCE_PIPS:
+                if direction == 'buy':
+                    # New SL = current price - 70 pips
+                    new_sl = current_price - (config.TRAIL_DISTANCE_PIPS * point)
+                    # Ensure SL doesn't go below previous SL or below entry+20 pips
+                    min_sl = max(current_sl, entry_price + (config.BREAKEVEN_PIPS * point))
+                    new_sl = max(new_sl, min_sl)
+                else:
+                    # New SL = current price + 70 pips
+                    new_sl = current_price + (config.TRAIL_DISTANCE_PIPS * point)
+                    # Ensure SL doesn't go above previous SL or below entry-20 pips
+                    max_sl = min(current_sl, entry_price - (config.BREAKEVEN_PIPS * point))
+                    new_sl = min(new_sl, max_sl)
+                
+                # Only move if better than current SL
+                if (direction == 'buy' and new_sl > current_sl) or \
+                   (direction == 'sell' and new_sl < current_sl):
+                    trade['current_sl'] = new_sl
+                    trade['last_move_price'] = current_price
+                    
+                    logger.logger.info(f"Trailing SL by {config.TRAIL_DISTANCE_PIPS} pips")
+                    logger.logger.info(f"  New SL: {new_sl:.5f}, Locked profit: {profit_pips:.1f} pips (${profit_usd:.2f})")
+                    
+                    return (new_sl, f"trailing_{config.TRAIL_DISTANCE_PIPS}_pips")
+            
+            # STRATEGY 3: PARTIAL CLOSE AT 50% TP
+            if config.PARTIAL_CLOSE_ENABLED and not trade['partial_closed']:
+                tp_price = trade['tp_price']
+                
+                # Calculate TP progress
+                if direction == 'buy':
+                    tp_distance = tp_price - entry_price
+                    current_distance = current_price - entry_price
+                else:
+                    tp_distance = entry_price - tp_price
+                    current_distance = entry_price - current_price
+                
+                if tp_distance > 0:
+                    tp_progress = current_distance / tp_distance
+                    if tp_progress >= config.PARTIAL_CLOSE_PCT:
+                        trade['partial_closed'] = True
+                        # Return special code for partial close
+                        return (None, "partial_close_triggered")
+            
+            return None
+    
+    def remove_trade(self, ticket: int):
+        with self.lock:
+            if ticket in self.trades:
+                del self.trades[ticket]
+    
+    def get_trade(self, ticket: int):
+        with self.lock:
+            return self.trades.get(ticket)
+
+# Initialize trade tracker
+trade_tracker = TradeTracker()
+
+# ==================== AUTOMATIC SUPERVISOR ====================
+class AutomatedSupervisor:
+    """AUTOMATIC SUPERVISOR: Monitors all bot activities"""
+    
+    def __init__(self):
+        self.running = True
+        self.threads_status = {}
+        self.last_monitor_time = 0
+        self.start_time = time.time()
+        self.performance_data = {
+            'total_trades': 0,
+            'winning_trades': 0,
+            'losing_trades': 0,
+            'total_profit': 0.0,
+            'peak_equity': 0.0,
+            'max_drawdown': 0.0
+        }
+    
+    def monitor_all_threads(self):
+        """Monitor all running threads"""
+        current_time = time.time()
+        
+        if current_time - self.last_monitor_time < 30:  # Check every 30 seconds
+            return
+        
+        self.last_monitor_time = current_time
+        
+        # Check connection
+        if not connection_manager.check_connection():
+            logger.logger.warning("Supervisor: Connection check failed")
+            if config.AUTO_RECONNECT:
+                connection_manager.reconnect_if_needed()
+        
+        # Log thread status
+        for thread in threading.enumerate():
+            if thread.name.startswith("Thread-"):
+                if thread.name not in self.threads_status:
+                    self.threads_status[thread.name] = {
+                        'first_seen': current_time,
+                        'last_seen': current_time
+                    }
+                else:
+                    self.threads_status[thread.name]['last_seen'] = current_time
+        
+        # Check for stalled threads
+        for thread_name, status in list(self.threads_status.items()):
+            if current_time - status['last_seen'] > 300:  # 5 minutes
+                logger.logger.warning(f"Thread {thread_name} appears stalled")
+                logger.log_error("monitor_all_threads", 
+                               f"Thread {thread_name} stalled", 
+                               "WARNING")
+        
+        # Log performance every 30 minutes
+        if current_time - self.start_time > 1800:  # 30 minutes
+            self.log_performance_summary()
+    
+    def log_performance_summary(self):
+        """Log comprehensive performance summary"""
+        try:
+            acct = mt5.account_info()
+            if acct:
+                equity = float(acct.equity)
+                balance = float(acct.balance)
+                
+                # Update peak equity and drawdown
+                if equity > self.performance_data['peak_equity']:
+                    self.performance_data['peak_equity'] = equity
+                
+                if self.performance_data['peak_equity'] > 0:
+                    drawdown = (self.performance_data['peak_equity'] - equity) / self.performance_data['peak_equity'] * 100
+                    self.performance_data['max_drawdown'] = max(self.performance_data['max_drawdown'], drawdown)
+                
+                # Get recent trades
+                history = mt5.history_deals_get(datetime.now() - timedelta(hours=1), datetime.now())
+                if history:
+                    for deal in history:
+                        if getattr(deal, "magic", None) == config.MAGIC:
+                            self.performance_data['total_trades'] += 1
+                            profit = getattr(deal, "profit", 0.0)
+                            self.performance_data['total_profit'] += profit
+                            if profit > 0:
+                                self.performance_data['winning_trades'] += 1
+                            elif profit < 0:
+                                self.performance_data['losing_trades'] += 1
+                
+                win_rate = (self.performance_data['winning_trades'] / self.performance_data['total_trades'] * 100) \
+                          if self.performance_data['total_trades'] > 0 else 0
+                
+                logger.logger.info("=" * 80)
+                logger.logger.info("SUPERVISOR PERFORMANCE REPORT")
+                logger.logger.info("=" * 80)
+                logger.logger.info(f"Uptime: {timedelta(seconds=int(current_time - self.start_time))}")
+                logger.logger.info(f"Active Threads: {threading.active_count()}")
+                logger.logger.info(f"Balance: ${balance:.2f} | Equity: ${equity:.2f}")
+                logger.logger.info(f"Total Trades: {self.performance_data['total_trades']}")
+                logger.logger.info(f"Win Rate: {win_rate:.1f}%")
+                logger.logger.info(f"Total Profit: ${self.performance_data['total_profit']:.2f}")
+                logger.logger.info(f"Max Drawdown: {self.performance_data['max_drawdown']:.2f}%")
+                logger.logger.info(f"Consecutive Losses: {trade_tracker.consecutive_losses}")
+                logger.logger.info(f"Tracked Trades: {len(trade_tracker.trades)}")
+                logger.logger.info("=" * 80)
+                
+        except Exception as e:
+            logger.logger.error(f"Error in performance summary: {e}")
+            logger.log_error("log_performance_summary", str(e), "WARNING")
+    
+    def run(self):
+        """Main supervisor loop"""
+        logger.logger.info("Supervisor thread started")
+        
+        while self.running:
+            try:
+                self.monitor_all_threads()
+                time.sleep(5)  # Check every 5 seconds
+            except Exception as e:
+                logger.logger.error(f"Supervisor error: {e}")
+                logger.log_error("supervisor_run", str(e), "ERROR")
+                time.sleep(10)
+
+# ==================== ENHANCED DATA CACHE ====================
+class EnhancedDataCache:
+    """INTELLIGENT DATA CACHING with automatic retry"""
+    
+    def __init__(self, cache_seconds: int = config.DATA_CACHE_SECONDS):
+        self.cache = {}
+        self.cache_timestamps = {}
+        self.cache_seconds = cache_seconds
+        self.max_retries = 3
+    
+    def get_cached_data(self, symbol: str, timeframe: int, bars_needed: int) -> Optional[pd.DataFrame]:
+        """Get cached data if available and fresh"""
+        key = f"{symbol}_{timeframe}"
+        
+        if key in self.cache:
+            cached_time = self.cache_timestamps.get(key, 0)
+            current_time = time.time()
+            
+            # Check if cache is still valid
+            if current_time - cached_time < self.cache_seconds:
+                cached_df = self.cache[key]
+                if len(cached_df) >= bars_needed:
+                    return cached_df.copy()
+        
+        return None
+    
+    def get_data_with_retry(self, symbol: str, timeframe: int, n: int = 400) -> pd.DataFrame:
+        """Get data with automatic retry on failure"""
+        for attempt in range(self.max_retries):
+            try:
+                cached_data = self.get_cached_data(symbol, timeframe, n)
+                if cached_data is not None:
+                    return cached_data
+                
+                # Fetch fresh data
+                rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, n)
+                if rates is None or len(rates) == 0:
+                    raise ValueError(f"No data returned for {symbol}")
+                
+                df = pd.DataFrame(rates)
+                df['time'] = pd.to_datetime(df['time'], unit='s')
+                
+                # Update cache
+                self.cache[f"{symbol}_{timeframe}"] = df.copy()
+                self.cache_timestamps[f"{symbol}_{timeframe}"] = time.time()
+                
+                logger.logger.debug(f"Data fetched for {symbol} TF{timeframe}, {len(df)} bars")
+                return df
+                
+            except Exception as e:
+                logger.logger.warning(f"Data fetch attempt {attempt + 1} failed for {symbol}: {e}")
+                
+                if attempt < self.max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff
+                    time.sleep(wait_time)
+                else:
+                    logger.logger.error(f"Failed to fetch data for {symbol} after {self.max_retries} attempts")
+                    logger.log_error("get_data_with_retry", str(e), "ERROR", symbol)
+                    return pd.DataFrame()
+        
+        return pd.DataFrame()
+
+# Initialize enhanced data cache
+data_cache = EnhancedDataCache()
+
+# ==================== SOUND SETUP ====================
+_have_winsound = False
+try:
+    import winsound
+    _have_winsound = True
+except Exception:
+    _have_winsound = False
+
+def find_cash_wav():
+    candidates = []
+    candidates.append(os.path.join(os.getcwd(), "cash.wav"))
+    candidates.append(os.path.join(os.path.expanduser("~"), "cash.wav"))
+    try:
+        script_dir = os.path.dirname(os.path.realpath(__file__))
+        candidates.append(os.path.join(script_dir, "cash.wav"))
+    except Exception:
+        pass
+    try:
+        tinfo = mt5.terminal_info()
+        for attr in ("data_path", "path", "common_data_path", "terminal_path"):
+            if hasattr(tinfo, attr):
+                base = getattr(tinfo, attr)
+                candidates.append(os.path.join(base, "MQL5", "Sounds", "cash.wav"))
+                candidates.append(os.path.join(base, "MQL4", "Sounds", "cash.wav"))
+    except Exception:
+        pass
+    return [p for p in candidates if p and os.path.isfile(p)]
+
+def play_wav_or_beep(kind="buy"):
+    candidates = find_cash_wav()
+    if hasattr(logger, 'log_dir'):
+        candidates.append(os.path.join(logger.log_dir, "cash.wav"))
+    for p in candidates:
+        if p and os.path.isfile(p):
+            try:
+                if _have_winsound:
+                    winsound.PlaySound(p, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                    return
+            except Exception:
+                pass
+    if _have_winsound:
+        try:
+            if kind == "buy":
+                winsound.Beep(1400, 70); winsound.Beep(1600, 60); winsound.Beep(1900, 90)
+            elif kind == "sell":
+                winsound.Beep(600, 70); winsound.Beep(520, 60); winsound.Beep(420, 90)
+            else:
+                winsound.Beep(1000, 80)
+        except Exception:
+            pass
+
+def beep_cash_buy():
+    play_wav_or_beep("buy")
+
+def beep_cash_sell():
+    play_wav_or_beep("sell")
+
+def beep_cash_partial():
+    play_wav_or_beep("partial")
+
+def trade_flash(message):
+    try:
+        print("\n" + "="*60)
+        print("💰💰💰  " + message + "  💰💰💰")
+        print("="*60 + "\n")
+    except Exception:
+        pass
+
+# ==================== INITIALIZE MT5 WITH AUTOMATIC RECOVERY ====================
+def initialize_mt5_with_recovery() -> float:
+    """Initialize MT5 with automatic recovery"""
+    logger.logger.info("Initializing MT5 with automatic recovery...")
+    return connection_manager.initialize_with_retry()
+
+STARTING_BALANCE = initialize_mt5_with_recovery()
+
+# ==================== ENHANCED GLOBAL STATE MANAGEMENT ====================
+class EnhancedGlobalState:
+    """Enhanced global state with safety features"""
+    
+    def __init__(self):
+        self.daily_start_date = date.today()
+        self.daily_trades_count = 0
+        self.daily_loss_triggered = False
+        self.last_summary_time = time.time()
+        self.peak_equity = STARTING_BALANCE
+        self.max_drawdown = 0.0
+        self.last_trade_time = {s: 0 for s in config.SYMBOLS}
+        self.last_forced_time = {s: 0 for s in config.SYMBOLS}
+        self.signal_stats = self._load_learning_stats()
+        self.market_regimes = {s: "unknown" for s in config.SYMBOLS}
+        self.consecutive_losses_by_symbol = {s: 0 for s in config.SYMBOLS}
+        self.signal_strength = {s: 0 for s in config.SYMBOLS}
+        self.lock = threading.RLock()
+        self.consecutive_loss_reset_time = {s: 0 for s in config.SYMBOLS}
+    
+    def _load_learning_stats(self):
+        stats = {}
+        learning_file = os.path.join(os.path.expanduser("~"), "Documents", "trade_learning_log.csv")
+        
+        try:
+            if os.path.exists(learning_file):
+                with open(learning_file, 'r', newline='') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        sym = row.get("symbol", "")
+                        sig = row.get("direction", "")
+                        res = (row.get("result") or "").lower()
+                        if not sym or not sig:
+                            continue
+                        
+                        if sym not in stats:
+                            stats[sym] = {}
+                        if sig not in stats[sym]:
+                            stats[sym][sig] = {"wins": 0, "losses": 0, "total": 0}
+                        
+                        if res.startswith("win"):
+                            stats[sym][sig]["wins"] += 1
+                        elif res.startswith("loss"):
+                            stats[sym][sig]["losses"] += 1
+                        
+                        stats[sym][sig]["total"] += 1
+                        
+                logger.logger.info(f"Loaded learning stats for {len(stats)} symbols")
+        except Exception as e:
+            logger.logger.error(f"Error loading learning stats: {e}")
+            logger.log_error("_load_learning_stats", str(e), "WARNING")
+        
+        return stats
+    
+    def update_consecutive_losses(self, symbol: str, profit: float):
+        """Update consecutive losses for a symbol"""
+        with self.lock:
+            if profit < 0:
+                self.consecutive_losses_by_symbol[symbol] += 1
+                self.consecutive_loss_reset_time[symbol] = time.time()
+                logger.logger.warning(f"{symbol}: Consecutive losses: {self.consecutive_losses_by_symbol[symbol]}")
+            else:
+                self.consecutive_losses_by_symbol[symbol] = 0
+    
+    def should_pause_symbol(self, symbol: str) -> bool:
+        """Check if trading should be paused for a symbol"""
+        with self.lock:
+            current_time = time.time()
+            # Check if we've reached loss limit
+            if self.consecutive_losses_by_symbol.get(symbol, 0) >= config.CONSECUTIVE_LOSS_LIMIT:
+                # Check if cooldown period has passed
+                if current_time - self.consecutive_loss_reset_time.get(symbol, 0) > config.CONSECUTIVE_LOSS_COOLDOWN:
+                    # Reset after cooldown
+                    self.consecutive_losses_by_symbol[symbol] = 0
+                    logger.logger.info(f"{symbol}: Consecutive losses reset after cooldown")
+                    return False
+                return True
+            return False
+    
+    def update_learning(self, symbol: str, signal: str, outcome: str):
+        with self.lock:
+            try:
+                if symbol not in self.signal_stats:
+                    self.signal_stats[symbol] = {}
+                if signal not in self.signal_stats[symbol]:
+                    self.signal_stats[symbol][signal] = {"wins": 0, "losses": 0, "total": 0}
+                
+                if outcome == "win":
+                    self.signal_stats[symbol][signal]["wins"] += 1
+                elif outcome == "loss":
+                    self.signal_stats[symbol][signal]["losses"] += 1
+                
+                self.signal_stats[symbol][signal]["total"] += 1
+                
+                learning_file = os.path.join(os.path.expanduser("~"), "Documents", "trade_learning_log.csv")
+                with open(learning_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        datetime.now(),
+                        symbol,
+                        signal,
+                        "", "", "", "", "",
+                        outcome
+                    ])
+                
+            except Exception as e:
+                logger.logger.error(f"Error updating learning: {e}")
+                logger.log_error("update_learning", str(e), "WARNING")
+    
+    def get_signal_win_rate(self, symbol: str, signal: str) -> float:
+        with self.lock:
+            try:
+                if (symbol in self.signal_stats and 
+                    signal in self.signal_stats[symbol] and 
+                    self.signal_stats[symbol][signal]["total"] > 0):
+                    
+                    stats = self.signal_stats[symbol][signal]
+                    return stats["wins"] / stats["total"]
+            except Exception:
+                pass
+            return 0.6
+    
+    def update_signal_strength(self, symbol: str, strength: int):
+        """Update signal strength for a symbol"""
+        with self.lock:
+            self.signal_strength[symbol] = strength
+    
+    def get_signal_strength(self, symbol: str) -> int:
+        """Get current signal strength for a symbol"""
+        with self.lock:
+            return self.signal_strength.get(symbol, 0)
+    
+    def update_daily_stats(self):
+        with self.lock:
+            try:
+                if not connection_manager.check_connection():
+                    return
+                
+                acct = mt5.account_info()
+                if acct:
+                    current_equity = float(acct.equity)
+                    
+                    if current_equity > self.peak_equity:
+                        self.peak_equity = current_equity
+                    
+                    if self.peak_equity > 0:
+                        drawdown = (self.peak_equity - current_equity) / self.peak_equity * 100
+                        self.max_drawdown = max(self.max_drawdown, drawdown)
+                    
+                    current_balance = float(acct.balance)
+                    profit_pct = ((current_balance - STARTING_BALANCE) / STARTING_BALANCE) * 100.0
+                    
+                    if profit_pct <= -config.DAILY_LOSS_PCT:
+                        self.daily_loss_triggered = True
+                        logger.logger.warning(f"Daily loss limit triggered: {profit_pct:.2f}%")
+                        logger.log_error("update_daily_stats", 
+                                       f"Daily loss limit {profit_pct:.2f}% triggered",
+                                       "CRITICAL")
+                    
+                    if self.max_drawdown >= config.MAX_DRAWDOWN_PCT:
+                        self.daily_loss_triggered = True
+                        logger.logger.warning(f"Max drawdown limit triggered: {self.max_drawdown:.2f}%")
+                        logger.log_error("update_daily_stats",
+                                       f"Max drawdown {self.max_drawdown:.2f}% triggered",
+                                       "CRITICAL")
+                    
+            except Exception as e:
+                logger.logger.error(f"Error updating daily stats: {e}")
+                logger.log_error("update_daily_stats", str(e), "WARNING")
+    
+    def reset_daily_stats(self):
+        with self.lock:
+            self.daily_start_date = date.today()
+            self.daily_trades_count = 0
+            self.daily_loss_triggered = False
+            try:
+                acct = mt5.account_info()
+                if acct:
+                    self.peak_equity = float(acct.balance)
+            except:
+                self.peak_equity = STARTING_BALANCE
+            self.max_drawdown = 0.0
+            logger.logger.info("Daily stats reset for new trading day")
+
+global_state = EnhancedGlobalState()
+
+# ==================== ENHANCED UTILITY FUNCTIONS ====================
+def nowstr():
+    return datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+
+def get_bars_enhanced(symbol: str, timeframe: int, n: int = 400) -> pd.DataFrame:
+    """Enhanced data fetching with caching and retry"""
+    return data_cache.get_data_with_retry(symbol, timeframe, n)
+
+def is_in_no_trade_zone() -> bool:
+    t = datetime.now().time()
+    if config.NO_TRADE_START <= config.NO_TRADE_END:
+        return config.NO_TRADE_START <= t <= config.NO_TRADE_END
+    else:
+        return t >= config.NO_TRADE_START or t <= config.NO_TRADE_END
+
+def calc_indicators_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """Safe indicator calculation with error handling"""
+    if df is None or df.empty or len(df) < max(config.EMA_SLOW, config.ATR_PERIOD, config.RSI_PERIOD) + 5:
+        return df
+    
+    df = df.copy()
+    
+    # Calculate indicators with try-except for each
+    indicators_to_calc = [
+        ('ema_fast', lambda: EMAIndicator(df['close'], config.EMA_FAST).ema_indicator()),
+        ('ema_slow', lambda: EMAIndicator(df['close'], config.EMA_SLOW).ema_indicator()),
+        ('atr', lambda: AverageTrueRange(df['high'], df['low'], df['close'], 
+                                        config.ATR_PERIOD).average_true_range()),
+        ('rsi', lambda: RSIIndicator(df['close'], config.RSI_PERIOD).rsi()),
+    ]
+    
+    for name, calc_func in indicators_to_calc:
+        try:
+            df[name] = calc_func()
+        except Exception as e:
+            logger.logger.warning(f"Failed to calculate {name}: {e}")
+            logger.log_error("calc_indicators_safe", f"Failed to calculate {name}: {str(e)}", "WARNING")
+    
+    # Try MACD
+    try:
+        macd = MACD(df['close'])
+        df['macd'] = macd.macd()
+        df['macd_signal'] = macd.macd_signal()
+        df['macd_diff'] = df['macd'] - df['macd_signal']
+    except Exception as e:
+        logger.logger.warning(f"Failed to calculate MACD: {e}")
+    
+    # Try Stochastic
+    try:
+        st = StochasticOscillator(df['high'], df['low'], df['close'])
+        df['stoch_k'] = st.stoch()
+        df['stoch_d'] = st.stoch_signal()
+    except Exception as e:
+        logger.logger.warning(f"Failed to calculate Stochastic: {e}")
+    
+    # Calculate patterns
+    try:
+        df['high_10'] = df['high'].rolling(10).max()
+        df['low_10'] = df['low'].rolling(10).min()
+        
+        df['double_top'] = (df['high'].shift(1).round(2) == df['high'].shift(2).round(2)) & (df['close'] < df['high'].shift(1))
+        df['double_bottom'] = (df['low'].shift(1).round(2) == df['low'].shift(2).round(2)) & (df['close'] > df['low'].shift(1))
+        
+        df['engulfing_bull'] = (df['open'].shift(1) > df['close'].shift(1)) & (df['close'] > df['open']) & (df['close'] > df['open'].shift(1)) & (df['open'] < df['close'].shift(1))
+        df['engulfing_bear'] = (df['open'].shift(1) < df['close'].shift(1)) & (df['close'] < df['open']) & (df['close'] < df['open'].shift(1)) & (df['open'] > df['close'].shift(1))
+        
+        body = (df['close'] - df['open']).abs()
+        upper = df['high'] - df[['close','open']].max(axis=1)
+        lower = df[['close','open']].min(axis=1) - df['low']
+        df['pin_bull'] = (lower > body * 2) & (upper < body * 0.5)
+        df['pin_bear'] = (upper > body * 2) & (lower < body * 0.5)
+        
+    except Exception as e:
+        logger.logger.warning(f"Failed to calculate patterns: {e}")
+        logger.log_error("calc_indicators_safe", f"Pattern calculation failed: {str(e)}", "WARNING")
+    
+    return df
+
+def detect_market_regime_enhanced(df: pd.DataFrame) -> str:
+    """Enhanced market regime detection"""
+    if len(df) < config.MARKET_REGIME_PERIOD:
+        return "unknown"
+    
+    try:
+        close_prices = df['close'].values[-config.MARKET_REGIME_PERIOD:]
+        
+        # Calculate linear regression slope
+        x = np.arange(len(close_prices))
+        slope, _ = np.polyfit(x, close_prices, 1)
+        
+        # Calculate volatility
+        returns = np.diff(np.log(close_prices))
+        volatility = np.std(returns) * np.sqrt(252) if len(returns) > 1 else 0
+        
+        # Calculate ADX-like trend strength
+        high = df['high'].values[-config.MARKET_REGIME_PERIOD:]
+        low = df['low'].values[-config.MARKET_REGIME_PERIOD:]
+        
+        tr1 = np.abs(high - low)
+        tr2 = np.abs(high - np.roll(close_prices, 1))
+        tr3 = np.abs(low - np.roll(close_prices, 1))
+        tr = np.maximum.reduce([tr1, tr2, tr3])[1:]
+        
+        atr = np.mean(tr) if len(tr) > 0 else 0
+        
+        # Determine regime
+        if atr > 0:
+            trend_strength = abs(slope) / atr
+            if trend_strength > config.TRENDING_THRESHOLD:
+                return "trending"
+            elif volatility < config.RANGING_THRESHOLD:
+                return "ranging"
+            else:
+                return "volatile"
+        else:
+            return "unknown"
+            
+    except Exception as e:
+        logger.log_error("detect_market_regime_enhanced", str(e), "WARNING")
+        return "unknown"
+
+def active_positions(symbol: str):
+    try:
+        if not connection_manager.check_connection():
+            return []
+        
+        ps = mt5.positions_get(symbol=symbol)
+        if not ps:
+            return []
+        return [p for p in ps if getattr(p, "magic", None) == config.MAGIC]
+    except Exception as e:
+        logger.log_error("active_positions", str(e), "WARNING", symbol)
+        return []
+
+def latest_our_position(symbol: str):
+    try:
+        if not connection_manager.check_connection():
+            return None
+        
+        ps = mt5.positions_get(symbol=symbol)
+        if not ps:
+            return None
+        our = [p for p in ps if getattr(p, "magic", None) == config.MAGIC]
+        if not our:
+            return None
+        return sorted(our, key=lambda x: getattr(x, "time_update", 0), reverse=True)[0]
+    except Exception as e:
+        logger.log_error("latest_our_position", str(e), "WARNING", symbol)
+        return None
+
+def symbol_min_stop(symbol: str):
+    try:
+        if not connection_manager.check_connection():
+            return None
+        
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            return None
+        point = info.point
+        level = getattr(info, "trade_stops_level", None)
+        if level is None:
+            return point * 10
+        return max(point * level, point)
+    except Exception as e:
+        logger.log_error("symbol_min_stop", str(e), "WARNING", symbol)
+        return None
+
+def round_lot(symbol: str, lot: float) -> float:
+    try:
+        if not connection_manager.check_connection():
+            return round(lot, 2)
+        
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            return round(lot, 2)
+        
+        min_lot = getattr(info, "volume_min", None) or getattr(info, "min_lot", None) or 0.01
+        step = getattr(info, "volume_step", None) or getattr(info, "lot_step", None) or 0.01
+        max_lot = getattr(info, "volume_max", None) or getattr(info, "max_lot", None)
+        
+        if lot < min_lot:
+            lot = min_lot
+        
+        if step > 0:
+            steps = int(round((lot - min_lot) / step))
+            lot_q = min_lot + steps * step
+        else:
+            lot_q = lot
+        
+        if max_lot and lot_q > max_lot:
+            lot_q = max_lot
+        
+        prec = 3 if step < 0.01 else 2
+        return round(lot_q, prec)
+        
+    except Exception as e:
+        logger.log_error("round_lot", str(e), "WARNING", symbol)
+        return round(lot, 2)
+
+# ==================== ENHANCED ORDER MANAGEMENT ====================
+def market_entry_safe(symbol: str, direction: str, lot: float, comment: str = None):
+    """Safe market entry with connection check"""
+    try:
+        if not connection_manager.check_connection():
+            logger.logger.warning(f"{nowstr()} {symbol}: No connection for market entry")
+            return None
+        
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            logger.logger.warning(f"{nowstr()} {symbol}: no tick for market_entry")
+            return None
+        
+        order_type = mt5.ORDER_TYPE_BUY if direction == 'buy' else mt5.ORDER_TYPE_SELL
+        price = float(tick.ask) if direction == 'buy' else float(tick.bid)
+        
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": lot,
+            "type": order_type,
+            "price": price,
+            "sl": 0.0,
+            "tp": 0.0,
+            "deviation": 50,
+            "magic": config.MAGIC,
+            "comment": (comment or f"{config.MODE}_{direction}")[:31],
+            "type_filling": mt5.ORDER_FILLING_IOC
+        }
+        
+        res = mt5.order_send(req)
+        
+        if res is None:
+            logger.logger.error(f"{nowstr()} {symbol}: market_entry returned None mt5.last_error={mt5.last_error()}")
+            logger.log_error("market_entry_safe", f"Order send returned None for {symbol}", "ERROR", symbol)
+            return None
+        
+        logger.log_trade({
+            'symbol': symbol,
+            'direction': direction,
+            'entry_price': price,
+            'volume': lot,
+            'status': 'executed',
+            'reason': comment or direction,
+            'ticket': res.order if hasattr(res, 'order') else 0,
+            'magic': config.MAGIC,
+            'consecutive_losses': trade_tracker.consecutive_losses
+        })
+        
+        try:
+            if direction == 'buy':
+                beep_cash_buy()
+            else:
+                beep_cash_sell()
+            trade_flash(f"{symbol} {direction.upper()} executed via market_entry")
+        except Exception:
+            pass
+        
+        return res
+        
+    except Exception as e:
+        logger.logger.error(f"{nowstr()} {symbol}: market_entry_safe exception: {e}")
+        logger.log_error("market_entry_safe", str(e), "ERROR", symbol)
+        return None
+
+def attach_sl_tp_safe(symbol: str, sl_price: float, tp_price: float, attempt: int = 1):
+    """Safe SL/TP attachment with retry"""
+    try:
+        if not connection_manager.check_connection():
+            return None
+        
+        pos = latest_our_position(symbol)
+        if pos is None:
+            logger.logger.warning(f"{nowstr()} {symbol}: attach_sl_tp_safe - no our position found")
+            return None
+        
+        ticket = int(pos.ticket)
+        req = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": ticket,
+            "symbol": symbol,
+            "sl": float(sl_price) if sl_price else 0.0,
+            "tp": float(tp_price) if tp_price else 0.0
+        }
+        
+        res = mt5.order_send(req)
+        
+        if res is None:
+            logger.logger.error(f"{nowstr()} {symbol}: attach_sl_tp_safe returned None mt5.last_error={mt5.last_error()}")
+            
+            if attempt == 1:
+                info = mt5.symbol_info(symbol)
+                tick = mt5.symbol_info_tick(symbol)
+                if info is None or tick is None:
+                    return None
+                
+                min_stop = symbol_min_stop(symbol) or info.point * 10
+                
+                if pos.type == 0:
+                    sl_new = tick.bid - max(min_stop * 2, abs(tick.bid - (sl_price or tick.bid)))
+                    tp_new = tick.bid + max(min_stop * 2, abs((tp_price or tick.bid) - tick.bid))
+                else:
+                    sl_new = tick.ask + max(min_stop * 2, abs((sl_price or tick.ask) - tick.ask))
+                    tp_new = tick.ask - max(min_stop * 2, abs(tick.ask - (tp_price or tick.ask)))
+                
+                logger.logger.info(f"{nowstr()} {symbol}: retry attach_sl_tp_safe with expanded stops")
+                return attach_sl_tp_safe(symbol, sl_new, tp_new, attempt=2)
+            return None
+        
+        logger.logger.info(f"{nowstr()} {symbol}: SL/TP attached ticket={ticket} sl={req['sl']} tp={req['tp']}")
+        
+        # Add to trade tracker
+        try:
+            direction = 'buy' if pos.type == 0 else 'sell'
+            trade_tracker.add_trade(ticket, symbol, direction, 
+                                  pos.price_open, sl_price, tp_price)
+            logger.logger.info(f"{nowstr()} {symbol}: Trade {ticket} added to tracker")
+        except Exception as e:
+            logger.logger.error(f"Error adding trade to tracker: {e}")
+            logger.log_error("attach_sl_tp_safe", str(e), "WARNING", symbol)
+        
+        return res
+        
+    except Exception as e:
+        logger.logger.error(f"{nowstr()} {symbol}: attach_sl_tp_safe exception: {e}")
+        logger.log_error("attach_sl_tp_safe", str(e), "ERROR", symbol)
+        return None
+
+def close_partial_position_safe(symbol: str, pct: float = config.PARTIAL_CLOSE_PCT):
+    """Safe partial position close"""
+    try:
+        if not connection_manager.check_connection():
+            return None
+        
+        pos = latest_our_position(symbol)
+        if pos is None:
+            return None
+        
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            return None
+        
+        step = getattr(info, "volume_step", None) or getattr(info, "lot_step", None) or 0.01
+        min_lot = getattr(info, "volume_min", None) or getattr(info, "min_lot", None) or 0.01
+        current_vol = float(pos.volume)
+        
+        if current_vol <= min_lot:
+            return None
+        
+        if step > 0:
+            target = max(min_lot, round(current_vol * pct / step) * step)
+        else:
+            target = max(min_lot, round(current_vol * pct, 2))
+        
+        close_vol = min(target, current_vol - min_lot)
+        
+        if close_vol < min_lot:
+            return None
+        
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return None
+        
+        close_type = mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY
+        close_price = float(tick.bid) if close_type == mt5.ORDER_TYPE_SELL else float(tick.ask)
+        
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": close_vol,
+            "type": close_type,
+            "price": close_price,
+            "deviation": 50,
+            "magic": config.MAGIC,
+            "comment": (f"PartialClose_{symbol}")[:31],
+            "type_filling": mt5.ORDER_FILLING_IOC
+        }
+        
+        res = mt5.order_send(req)
+        
+        if res is None:
+            logger.logger.error(f"{nowstr()} {symbol}: close_partial_position_safe returned None mt5.last_error={mt5.last_error()}")
+            return None
+        
+        logger.logger.info(f"{nowstr()} {symbol}: partial close executed vol={close_vol:.3f}")
+        
+        try:
+            beep_cash_partial()
+            trade_flash(f"{symbol} PARTIAL CLOSE executed vol={close_vol}")
+        except Exception:
+            pass
+        
+        return res
+        
+    except Exception as e:
+        logger.logger.error(f"{nowstr()} {symbol}: close_partial_position_safe exception: {e}")
+        logger.log_error("close_partial_position_safe", str(e), "ERROR", symbol)
+        return None
+
+def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp_price: float, reason: str):
+    """Safe trade execution with comprehensive logging"""
+    comment = f"{config.MODE}_{direction}_{reason}"[:31]
+    
+    try:
+        if not connection_manager.check_connection():
+            logger.logger.warning(f"{nowstr()} {symbol}: No connection for trade")
+            return None
+        
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            logger.logger.warning(f"{nowstr()} {symbol}: no tick in send_trade_safe")
+            return None
+        
+        price = float(tick.ask) if direction == 'buy' else float(tick.bid)
+        order_type = mt5.ORDER_TYPE_BUY if direction == 'buy' else mt5.ORDER_TYPE_SELL
+        
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": lot,
+            "type": order_type,
+            "price": price,
+            "sl": float(sl_price) if sl_price else 0.0,
+            "tp": float(tp_price) if tp_price else 0.0,
+            "deviation": 50,
+            "magic": config.MAGIC,
+            "comment": comment,
+            "type_filling": mt5.ORDER_FILLING_IOC
+        }
+        
+        res = mt5.order_send(request)
+        
+        if res is None:
+            logger.logger.warning(f"{nowstr()} {symbol}: initial order_send returned None -> fallback market_entry")
+            entry = market_entry_safe(symbol, direction, lot, comment=comment)
+            
+            if entry is None:
+                logger.logger.error(f"{nowstr()} {symbol}: market entry failed, giving up")
+                return None
+            
+            time.sleep(0.25)
+            attach = attach_sl_tp_safe(symbol, sl_price, tp_price)
+            
+            if attach:
+                try:
+                    if direction == 'buy':
+                        beep_cash_buy()
+                    else:
+                        beep_cash_sell()
+                    trade_flash(f"{symbol} {direction.upper()} executed via fallback! SL={sl_price:.2f} TP={tp_price:.2f}")
+                except Exception:
+                    pass
+            
+            return attach
+        
+        rc = getattr(res, "retcode", None)
+        logger.logger.info(f"{nowstr()} {symbol}: order_send returned res.retcode={rc}")
+        
+        if rc is None or (isinstance(rc, int) and rc != 10009 and rc != 0):
+            logger.logger.warning(f"{nowstr()} {symbol}: order_send retcode suggests failure - attempting attach fallback")
+            
+            entry = market_entry_safe(symbol, direction, lot, comment=comment)
+            if entry is None:
+                return None
+            
+            time.sleep(0.25)
+            attach = attach_sl_tp_safe(symbol, sl_price, tp_price)
+            
+            if attach:
+                try:
+                    if direction == 'buy':
+                        beep_cash_buy()
+                    else:
+                        beep_cash_sell()
+                    trade_flash(f"{symbol} {direction.upper()} executed via fallback! SL={sl_price:.2f} TP={tp_price:.2f}")
+                except Exception:
+                    pass
+            
+            return attach
+        
+        try:
+            if direction == 'buy':
+                beep_cash_buy()
+            else:
+                beep_cash_sell()
+            trade_flash(f"{symbol} {direction.upper()} executed! SL={sl_price:.2f} TP={tp_price:.2f}")
+        except Exception:
+            pass
+        
+        # Log the trade
+        trade_data = {
+            'symbol': symbol,
+            'direction': direction.upper(),
+            'entry_price': round(price, 3),
+            'sl_price': round(sl_price, 3) if sl_price else 0,
+            'tp_price': round(tp_price, 3) if tp_price else 0,
+            'volume': lot,
+            'reason': reason,
+            'status': 'executed',
+            'ticket': res.order if hasattr(res, 'order') else 0,
+            'magic': config.MAGIC,
+            'consecutive_losses': trade_tracker.consecutive_losses
+        }
+        
+        logger.log_trade(trade_data)
+        
+        return res
+        
+    except Exception as e:
+        logger.logger.error(f"{nowstr()} {symbol}: ERROR in send_trade_safe: {e}")
+        logger.log_error("send_trade_safe", str(e), "ERROR", symbol)
+        return None
+
+# ==================== ENHANCED SIGNAL GENERATION ====================
+def detect_patterns_with_confidence(df: pd.DataFrame) -> List[Tuple[str, str, float]]:
+    """Detect patterns with confidence scores"""
+    if df is None or df.empty:
+        return []
+    
+    last = df.iloc[-1]
+    res = []
+    
+    # Pattern detection with confidence
+    patterns = [
+        ('double_bottom', 'buy', 'DoubleBottom', 0.7),
+        ('double_top', 'sell', 'DoubleTop', 0.7),
+        ('engulfing_bull', 'buy', 'EngulfingBull', 0.8),
+        ('engulfing_bear', 'sell', 'EngulfingBear', 0.8),
+        ('pin_bull', 'buy', 'PinBarBull', 0.75),
+        ('pin_bear', 'sell', 'PinBarBear', 0.75)
+    ]
+    
+    for pattern_field, direction, pattern_name, base_confidence in patterns:
+        if last.get(pattern_field, False):
+            # Adjust confidence based on volume
+            volume_confidence = 1.0
+            if 'volume' in last:
+                avg_volume = df['volume'].rolling(20).mean().iloc[-1]
+                if last['volume'] > avg_volume * 1.5:
+                    volume_confidence = 1.2
+                elif last['volume'] < avg_volume * 0.5:
+                    volume_confidence = 0.8
+            
+            final_confidence = base_confidence * volume_confidence
+            res.append((direction, pattern_name, final_confidence))
+    
+    return res
+
+def build_signals_enhanced(symbol: str) -> Tuple[List[Tuple[str, str, float]], pd.DataFrame]:
+    """Enhanced signal detection with confluence checking"""
+    df = calc_indicators_safe(get_bars_enhanced(symbol, config.ENTRY_TF, 400))
+    df_htf = calc_indicators_safe(get_bars_enhanced(symbol, config.HTF_TF, 250))
+    
+    if df.empty or df_htf.empty:
+        return [], None
+    
+    bar = df.iloc[-1]
+    bar_htf = df_htf.iloc[-1]
+    
+    # Detect market regime
+    global_state.market_regimes[symbol] = detect_market_regime_enhanced(df)
+    
+    signals = []
+    signal_strength = 0
+    
+    # Log debug data
+    debug_data = {
+        'symbol': symbol,
+        'price': float(bar['close']),
+        'ema_fast': float(bar.get('ema_fast', 0)),
+        'ema_slow': float(bar.get('ema_slow', 0)),
+        'rsi': float(bar.get('rsi', 0)),
+        'atr': float(bar.get('atr', 0)),
+        'market_regime': global_state.market_regimes[symbol],
+        'signals_detected': '',
+        'volume': float(bar.get('volume', 0)),
+        'spread': 0,
+        'data_points': len(df)
+    }
+    
+    try:
+        info = mt5.symbol_info(symbol)
+        if info:
+            debug_data['spread'] = info.spread
+    except:
+        pass
+    
+    logger.log_debug(debug_data)
+    
+    # 1. Trend Following Signals (require HTF confirmation)
+    if global_state.market_regimes[symbol] == "trending":
+        try:
+            macd_ok_buy = bar.get('macd', 0) > bar.get('macd_signal', 0)
+            macd_ok_sell = bar.get('macd', 0) < bar.get('macd_signal', 0)
+            
+            # Buy signal with HTF confirmation
+            if (bar['ema_fast'] > bar['ema_slow']) and (bar_htf['ema_fast'] > bar_htf['ema_slow']) and macd_ok_buy:
+                if bar['close'] > bar['open']:  # Bullish candle
+                    signals.append(('buy', 'EMA_Trend_HTF', 0.8))
+                    signal_strength += 1
+            
+            # Sell signal with HTF confirmation
+            if (bar['ema_fast'] < bar['ema_slow']) and (bar_htf['ema_fast'] < bar_htf['ema_slow']) and macd_ok_sell:
+                if bar['close'] < bar['open']:  # Bearish candle
+                    signals.append(('sell', 'EMA_Trend_HTF', 0.8))
+                    signal_strength += 1
+                    
+        except Exception as e:
+            logger.logger.warning(f"Trend signal error for {symbol}: {e}")
+    
+    # 2. Momentum Signals (RSI + Stochastic)
+    try:
+        rsi_val = float(bar['rsi'])
+        stoch_k = float(bar.get('stoch_k', 50))
+        stoch_d = float(bar.get('stoch_d', 50))
+        
+        # Oversold with bullish divergence
+        if rsi_val <= config.RSI_OS and stoch_k > stoch_d:
+            if bar['close'] > bar['open']:  # Bullish candle
+                signals.append(('buy', 'RSI+Stoch_OS', 0.75))
+                signal_strength += 1
+        
+        # Overbought with bearish divergence
+        if rsi_val >= config.RSI_OB and stoch_k < stoch_d:
+            if bar['close'] < bar['open']:  # Bearish candle
+                signals.append(('sell', 'RSI+Stoch_OB', 0.75))
+                signal_strength += 1
+    except Exception:
+        pass
+    
+    # 3. Support/Resistance Bounce (for ranging markets)
+    if global_state.market_regimes[symbol] == "ranging":
+        try:
+            # Support bounce
+            if bar['low'] <= bar['low_10'] and (bar['low_10'] - bar['low']) <= bar['atr']:
+                if bar['close'] > bar['open']:  # Bullish reversal
+                    signals.append(('buy', 'SR_Bounce_Support', 0.7))
+                    signal_strength += 1
+            
+            # Resistance bounce
+            if bar['high'] >= bar['high_10'] and (bar['high'] - bar['high_10']) <= bar['atr']:
+                if bar['close'] < bar['open']:  # Bearish reversal
+                    signals.append(('sell', 'SR_Bounce_Resistance', 0.7))
+                    signal_strength += 1
+        except Exception:
+            pass
+    
+    # 4. Breakout Signals (for trending/volatile markets)
+    if global_state.market_regimes[symbol] in ["trending", "volatile"]:
+        try:
+            rh = float(df['high'][-6:-1].max())
+            rl = float(df['low'][-6:-1].min())
+            current_atr = float(bar['atr'])
+            
+            # Bullish breakout
+            if bar['close'] > rh and (bar['close'] - rh) > (current_atr * 0.2):
+                if bar['close'] > bar['open']:  # Bullish candle
+                    signals.append(('buy', 'Breakout_Up', 0.8))
+                    signal_strength += 1
+            
+            # Bearish breakout
+            if bar['close'] < rl and (rl - bar['close']) > (current_atr * 0.2):
+                if bar['close'] < bar['open']:  # Bearish candle
+                    signals.append(('sell', 'Breakout_Down', 0.8))
+                    signal_strength += 1
+        except Exception:
+            pass
+    
+    # 5. Pattern Signals
+    patterns = detect_patterns_with_confidence(df)
+    signals.extend(patterns)
+    signal_strength += len(patterns)
+    
+    # Update signal strength
+    global_state.update_signal_strength(symbol, signal_strength)
+    
+    # Log all signals
+    for direction, signal_type, confidence in signals:
+        logger.log_signal({
+            'symbol': symbol,
+            'signal_direction': direction,
+            'signal_type': signal_type,
+            'confidence': confidence,
+            'price': float(bar['close']),
+            'rsi': float(bar.get('rsi', 0)),
+            'ema_alignment': 'bullish' if bar.get('ema_fast', 0) > bar.get('ema_slow', 0) else 'bearish',
+            'volume_confirmation': bar.get('volume', 0) > df['volume'].rolling(20).mean().iloc[-1] if len(df) >= 20 else False,
+            'market_regime': global_state.market_regimes[symbol],
+            'confluence_count': signal_strength,
+            'action_taken': 'monitoring'
+        })
+    
+    # Check ATR minimum
+    try:
+        if float(bar['atr']) < config.MIN_ATR:
+            logger.logger.debug(f"{nowstr()} {symbol}: ATR {float(bar['atr']):.5f} < MIN_ATR {config.MIN_ATR:.5f} -> skipping low volatility")
+            return [], df
+    except Exception:
+        pass
+    
+    return signals, df
+
+# ==================== ENHANCED 70-PIPS-FIRST SL MANAGEMENT ====================
+def manage_trailing_stop_70_pips(symbol: str):
+    """70-pips-first trailing stop management"""
+    if not connection_manager.check_connection():
+        return
+    
+    pos = latest_our_position(symbol)
+    if pos is None:
+        return
+    
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return
+    
+    # Get current price based on position type
+    if pos.type == 0:  # BUY
+        current_price = tick.bid
+    else:  # SELL
+        current_price = tick.ask
+    
+    # Update trade tracker and get new SL if needed
+    ticket = pos.ticket
+    result = trade_tracker.update_trade(ticket, current_price)
+    
+    if result is not None:
+        new_sl, move_reason = result
+        
+        # Handle partial close signal
+        if move_reason == "partial_close_triggered":
+            try:
+                close_result = close_partial_position_safe(symbol, pct=config.PARTIAL_CLOSE_PCT)
+                if close_result:
+                    logger.logger.info(f"{nowstr()} {symbol}: Partial close executed for trade {ticket}")
+                return
+            except Exception as e:
+                logger.logger.error(f"{nowstr()} {symbol}: Partial close error: {e}")
+                return
+        
+        # Get trade info for logging
+        trade_info = trade_tracker.get_trade(ticket)
+        if trade_info:
+            # Calculate profit in pips and USD
+            profit_pips = trade_tracker.calculate_current_profit_pips(ticket, current_price)
+            profit_usd = trade_tracker.calculate_current_profit_usd(ticket, current_price)
+            
+            # Update SL
+            old_sl = pos.sl
+            if old_sl != new_sl:
+                try:
+                    result = mt5.order_send({
+                        "action": mt5.TRADE_ACTION_SLTP,
+                        "position": ticket,
+                        "sl": new_sl,
+                        "tp": pos.tp
+                    })
+                    
+                    if result:
+                        logger.logger.info(f"{nowstr()} {symbol}: SL moved from {old_sl:.5f} to {new_sl:.5f}")
+                        logger.logger.info(f"  Reason: {move_reason}, Profit: {profit_pips:.1f} pips (${profit_usd:.2f})")
+                        
+                        # Log SL movement
+                        sl_data = {
+                            'ticket': ticket,
+                            'symbol': symbol,
+                            'direction': 'buy' if pos.type == 0 else 'sell',
+                            'entry_price': pos.price_open,
+                            'current_price': current_price,
+                            'old_sl': old_sl,
+                            'new_sl': new_sl,
+                            'profit_pips': profit_pips,
+                            'profit_usd': profit_usd,
+                            'reason': move_reason,
+                            'move_type': 'trailing'
+                        }
+                        
+                        logger.log_sl_movement(sl_data)
+                    else:
+                        logger.logger.error(f"{nowstr()} {symbol}: Failed to move SL to {new_sl}")
+                        logger.log_error("manage_trailing_stop_70_pips", 
+                                       f"Failed to move SL for ticket {ticket}", 
+                                       "ERROR", symbol)
+                except Exception as e:
+                    logger.logger.error(f"{nowstr()} {symbol}: Error moving SL: {e}")
+                    logger.log_error("manage_trailing_stop_70_pips", str(e), "ERROR", symbol)
+
+def check_closed_trades_enhanced():
+    """Enhanced closed trade checking with learning updates"""
+    try:
+        if not connection_manager.check_connection():
+            return
+        
+        positions = mt5.positions_get()
+        active_tickets = set()
+        
+        if positions:
+            for pos in positions:
+                if getattr(pos, "magic", None) == config.MAGIC:
+                    active_tickets.add(pos.ticket)
+        
+        tickets_to_remove = []
+        for ticket in list(trade_tracker.trades.keys()):
+            if ticket not in active_tickets:
+                tickets_to_remove.append(ticket)
+        
+        # Get history for learning
+        for ticket in tickets_to_remove:
+            trade_info = trade_tracker.get_trade(ticket)
+            if trade_info:
+                symbol = trade_info['symbol']
+                
+                # Get deal info for learning
+                deals = mt5.history_deals_get(datetime.now() - timedelta(hours=1), datetime.now())
+                if deals:
+                    for deal in deals:
+                        if getattr(deal, "ticket", 0) == ticket:
+                            profit = getattr(deal, "profit", 0.0)
+                            comment = getattr(deal, "comment", "")
+                            
+                            # Extract signal type from comment
+                            signal_type = "unknown"
+                            parts = comment.split("_")
+                            if len(parts) >= 3:
+                                signal_type = parts[2]
+                            
+                            # Update learning stats
+                            outcome = "win" if profit > 0 else "loss"
+                            global_state.update_learning(symbol, signal_type, outcome)
+                            
+                            # Update consecutive losses
+                            global_state.update_consecutive_losses(symbol, profit)
+                            trade_tracker.update_consecutive_losses(profit)
+                            
+                            logger.logger.info(f"Trade {ticket} closed: ${profit:.2f} ({outcome})")
+                            break
+            
+            trade_tracker.remove_trade(ticket)
+            logger.logger.debug(f"Removed closed trade {ticket} from tracker")
+            
+    except Exception as e:
+        logger.logger.error(f"Error in check_closed_trades_enhanced: {e}")
+        logger.log_error("check_closed_trades_enhanced", str(e), "ERROR")
+
+# ==================== ENHANCED PERFORMANCE MONITORING ====================
+def print_daily_summary_enhanced():
+    """Enhanced daily performance summary"""
+    try:
+        if not connection_manager.check_connection():
+            logger.logger.warning("print_daily_summary_enhanced: No connection")
+            return
+        
+        acct = mt5.account_info()
+        if acct is None:
+            logger.logger.warning("print_daily_summary_enhanced: no account info")
+            return
+        
+        balance = float(acct.balance)
+        equity = float(acct.equity) if hasattr(acct, 'equity') else balance
+        used = float(acct.margin) if hasattr(acct, 'margin') else 0.0
+        free = balance - used
+        
+        open_positions = mt5.positions_get()
+        my_open = []
+        if open_positions:
+            my_open = [p for p in open_positions if getattr(p, "magic", None) == config.MAGIC]
+        
+        floating = sum(getattr(p, "profit", 0.0) for p in my_open)
+        
+        # Get today's deals
+        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        history = mt5.history_deals_get(today_start, datetime.now())
+        win_count = 0
+        loss_count = 0
+        total_profit = 0
+        total_loss = 0
+        
+        if history:
+            for deal in history:
+                if getattr(deal, "magic", None) == config.MAGIC:
+                    profit = getattr(deal, "profit", 0.0)
+                    if profit > 0:
+                        win_count += 1
+                        total_profit += profit
+                    elif profit < 0:
+                        loss_count += 1
+                        total_loss += abs(profit)
+        
+        total_trades = win_count + loss_count
+        win_rate = (win_count / total_trades * 100) if total_trades > 0 else 0
+        profit_factor = (total_profit / total_loss) if total_loss > 0 else float('inf')
+        daily_pnl = total_profit - total_loss
+        
+        logger.logger.info("=" * 80)
+        logger.logger.info("DAILY PERFORMANCE SUMMARY - 70-PIPS-FIRST STRATEGY")
+        logger.logger.info("=" * 80)
+        logger.logger.info(f"Balance: ${balance:.2f}")
+        logger.logger.info(f"Equity: ${equity:.2f}")
+        logger.logger.info(f"Free Margin: ${free:.2f}")
+        logger.logger.info(f"Floating P/L: ${floating:.2f}")
+        logger.logger.info(f"Open Trades: {len(my_open)}")
+        logger.logger.info(f"Daily Trades: {global_state.daily_trades_count}/{config.MAX_DAILY_TRADES}")
+        logger.logger.info(f"Win Rate: {win_rate:.1f}% ({win_count}/{total_trades})")
+        logger.logger.info(f"Profit Factor: {profit_factor:.2f}")
+        logger.logger.info(f"Daily P/L: ${daily_pnl:.2f}")
+        logger.logger.info(f"Max Drawdown: {global_state.max_drawdown:.2f}%")
+        logger.logger.info(f"Consecutive Losses: {trade_tracker.consecutive_losses}/{config.CONSECUTIVE_LOSS_LIMIT}")
+        logger.logger.info(f"Tracked Trades: {len(trade_tracker.trades)}")
+        logger.logger.info("=" * 80)
+        logger.logger.info("SL STRATEGY STATUS:")
+        logger.logger.info(f"  First Move: {config.FIRST_MOVE_PIPS} pips profit")
+        logger.logger.info(f"  Trail Distance: {config.TRAIL_DISTANCE_PIPS} pips")
+        logger.logger.info(f"  Breakeven Lock: {config.BREAKEVEN_PIPS} pips")
+        logger.logger.info("=" * 80)
+        
+        # Log performance data
+        logger.log_performance({
+            'timestamp': datetime.now().isoformat(),
+            'date': datetime.now().date().isoformat(),
+            'balance': balance,
+            'equity': equity,
+            'floating_pnl': floating,
+            'total_trades': total_trades,
+            'win_rate': win_rate,
+            'profit_factor': profit_factor,
+            'max_drawdown': global_state.max_drawdown,
+            'daily_trades': global_state.daily_trades_count,
+            'daily_pnl': daily_pnl,
+            'consecutive_losses': trade_tracker.consecutive_losses
+        })
+        
+    except Exception as e:
+        logger.logger.error(f"print_daily_summary_enhanced error: {e}")
+        logger.log_error("print_daily_summary_enhanced", str(e), "ERROR")
+
+# ==================== ENHANCED MAIN TRADING LOOP ====================
+def trade_symbol_enhanced(symbol: str):
+    """Enhanced trading loop for a symbol with 70-pips-first strategy"""
+    logger.logger.info(f"{nowstr()} Trading thread started for {symbol}")
+    last_bar_time = None
+    
+    while True:
+        try:
+            # Check connection
+            if not connection_manager.reconnect_if_needed():
+                logger.logger.warning(f"{symbol}: Connection issues, waiting...")
+                time.sleep(10)
+                continue
+            
+            # Daily reset check
+            if date.today() != global_state.daily_start_date:
+                global_state.reset_daily_stats()
+            
+            # Update daily stats
+            global_state.update_daily_stats()
+            
+            # Performance summary
+            if time.time() - global_state.last_summary_time > config.SUMMARY_INTERVAL:
+                print_daily_summary_enhanced()
+                global_state.last_summary_time = time.time()
+            
+            # Check trading restrictions
+            if is_in_no_trade_zone():
+                logger.logger.debug(f"{nowstr()} {symbol}: inside no-trade zone; skipping")
+                time.sleep(30)
+                continue
+            
+            # Check daily limits
+            if global_state.daily_trades_count >= config.MAX_DAILY_TRADES:
+                logger.logger.warning(f"{nowstr()} {symbol}: reached MAX_DAILY_TRADES")
+                time.sleep(60)
+                continue
+            
+            # Check daily loss/drawdown limits
+            if global_state.daily_loss_triggered:
+                logger.logger.warning(f"{nowstr()} {symbol}: daily limit triggered - pausing")
+                time.sleep(60)
+                continue
+            
+            # Check consecutive losses
+            if trade_tracker.should_pause_trading():
+                logger.logger.critical(f"{nowstr()} {symbol}: Consecutive loss limit reached - PAUSED")
+                time.sleep(60)
+                continue
+            
+            # Check symbol-specific consecutive losses
+            if global_state.should_pause_symbol(symbol):
+                logger.logger.warning(f"{nowstr()} {symbol}: Symbol consecutive loss limit reached")
+                time.sleep(60)
+                continue
+            
+            # Check total positions
+            total_positions = 0
+            for sym in config.SYMBOLS:
+                total_positions += len(active_positions(sym))
+            
+            if total_positions >= config.MAX_POSITIONS_TOTAL:
+                logger.logger.debug(f"{nowstr()} {symbol}: max total positions reached ({total_positions})")
+                time.sleep(10)
+                continue
+            
+            # Get signals
+            signals, df = build_signals_enhanced(symbol)
+            
+            if df is None or df.empty:
+                time.sleep(1)
+                continue
+            
+            bar = df.iloc[-1]
+            
+            # Group signals by direction
+            buy_signals = [(d, t, c) for d, t, c in signals if d == 'buy']
+            sell_signals = [(d, t, c) for d, t, c in signals if d == 'sell']
+            
+            # Calculate total confidence for each direction
+            buy_confidence = sum(c for _, _, c in buy_signals)
+            sell_confidence = sum(c for _, _, c in sell_signals)
+            
+            sigs_text = f"Buy: {len(buy_signals)} (conf: {buy_confidence:.2f}), Sell: {len(sell_signals)} (conf: {sell_confidence:.2f})"
+            
+            # Log current market state
+            try:
+                rsi_val = float(bar.get('rsi', math.nan))
+                atr_val = float(bar.get('atr', math.nan))
+                ema_fast_val = float(bar.get('ema_fast', math.nan))
+                ema_slow_val = float(bar.get('ema_slow', math.nan))
+            except Exception:
+                rsi_val = atr_val = ema_fast_val = ema_slow_val = math.nan
+            
+            logger.logger.info(f"{nowstr()} {symbol} | Price={bar['close']:.2f} | "
+                             f"EMAfast={ema_fast_val:.3f} | EMAslow={ema_slow_val:.3f} | "
+                             f"RSI={rsi_val:.2f} | ATR={atr_val:.4f} | "
+                             f"Regime={global_state.market_regimes[symbol]} | {sigs_text}")
+            
+            # Check if new bar
+            if last_bar_time is not None and bar['time'] == last_bar_time:
+                manage_trailing_stop_70_pips(symbol)
+                check_closed_trades_enhanced()
+                time.sleep(0.2)
+                continue
+            
+            last_bar_time = bar['time']
+            
+            # Check cooldown
+            if time.time() - global_state.last_trade_time.get(symbol, 0) < config.COOLDOWN:
+                manage_trailing_stop_70_pips(symbol)
+                check_closed_trades_enhanced()
+                time.sleep(0.2)
+                continue
+            
+            # Check existing positions for this symbol
+            opened = active_positions(symbol)
+            
+            # Determine trade direction based on confluence
+            chosen_dir = None
+            chosen_reasons = []
+            
+            # Adjust required signals based on consecutive losses
+            required_signals = config.MIN_CONFIRMING_SIGNALS
+            if global_state.consecutive_losses_by_symbol.get(symbol, 0) > 0:
+                required_signals += 1
+            
+            # Choose direction with strongest signals
+            if len(buy_signals) >= required_signals and buy_confidence > sell_confidence:
+                chosen_dir = 'buy'
+                chosen_reasons = [t for _, t, _ in buy_signals[:3]]
+            elif len(sell_signals) >= required_signals and sell_confidence > buy_confidence:
+                chosen_dir = 'sell'
+                chosen_reasons = [t for _, t, _ in sell_signals[:3]]
+            
+            # Force trade if no signals for a while (ORIGINAL FAST-TRADING LOGIC)
+            if (chosen_dir is None and 
+                time.time() - global_state.last_forced_time.get(symbol, 0) >= config.FORCE_TRADE_EVERY and
+                len(opened) < config.MAX_TRADES_PER_SYMBOL):
+                
+                # Determine direction based on EMA alignment
+                if bar.get('ema_fast', 0) > bar.get('ema_slow', 0):
+                    chosen_dir = 'buy'
+                    chosen_reasons = ['FallbackEMA']
+                else:
+                    chosen_dir = 'sell'
+                    chosen_reasons = ['FallbackEMA']
+                
+                global_state.last_forced_time[symbol] = time.time()
+                logger.logger.info(f"{nowstr()} {symbol}: forced fallback -> {chosen_dir}")
+            
+            # Execute trade if conditions met
+            if (chosen_dir and 
+                len(opened) < config.MAX_TRADES_PER_SYMBOL and 
+                not global_state.daily_loss_triggered and
+                not trade_tracker.should_pause_trading() and
+                not global_state.should_pause_symbol(symbol)):
+                
+                info = mt5.symbol_info(symbol)
+                if info is None:
+                    time.sleep(0.2)
+                    continue
+                
+                tick = mt5.symbol_info_tick(symbol)
+                if tick is None:
+                    time.sleep(0.2)
+                    continue
+                
+                entry_price = float(tick.ask) if chosen_dir == 'buy' else float(tick.bid)
+                atr = float(bar['atr']) if not pd.isna(bar.get('atr')) else info.point * 50
+                sl_dist = atr * config.SL_ATR_MULT
+                tp_dist = atr * config.TP_ATR_MULT
+                
+                if chosen_dir == 'buy':
+                    sl_price = entry_price - sl_dist
+                    tp_price = entry_price + tp_dist
+                else:
+                    sl_price = entry_price + sl_dist
+                    tp_price = entry_price - tp_dist
+                
+                # Ensure minimum stop distance
+                min_stop = symbol_min_stop(symbol) or info.point * 10
+                if chosen_dir == 'buy' and (entry_price - sl_price) < min_stop:
+                    sl_price = entry_price - min_stop
+                if chosen_dir == 'sell' and (sl_price - entry_price) < min_stop:
+                    sl_price = entry_price + min_stop
+                
+                # Calculate lot size
+                lot = round_lot(symbol, config.LOT_FIXED)
+                
+                # Check potential loss
+                if chosen_dir == 'buy':
+                    potential_loss_points = (entry_price - sl_price) / info.point
+                else:
+                    potential_loss_points = (sl_price - entry_price) / info.point
+                
+                # Calculate approximate loss in USD (adjust for your broker)
+                potential_loss_usd = potential_loss_points * 0.02
+                
+                if potential_loss_usd > config.MAX_LOSS_PER_TRADE:
+                    logger.logger.warning(f"{symbol}: Potential loss ${potential_loss_usd:.2f} > max ${config.MAX_LOSS_PER_TRADE}")
+                    # Adjust lot size to respect max loss
+                    max_allowed_points = config.MAX_LOSS_PER_TRADE / 0.02
+                    if potential_loss_points > max_allowed_points:
+                        adjustment = max_allowed_points / potential_loss_points
+                        lot = round_lot(symbol, lot * adjustment)
+                        logger.logger.info(f"{symbol}: Adjusted lot from {config.LOT_FIXED} to {lot}")
+                
+                logger.logger.info(f"{nowstr()} {symbol} ATTEMPT {chosen_dir} lot={lot:.3f} "
+                                 f"entry={entry_price:.5f} sl={sl_price:.5f} tp={tp_price:.5f} "
+                                 f"reasons={chosen_reasons} potential_loss=${potential_loss_usd:.2f}")
+                
+                res = send_trade_safe(symbol, chosen_dir, lot, sl_price, tp_price, "&".join(chosen_reasons))
+                
+                if res is None:
+                    logger.logger.warning(f"{nowstr()} {symbol}: trade attempt failed")
+                else:
+                    logger.logger.info(f"{nowstr()} {symbol}: TRADE EXECUTED ✅ direction={chosen_dir} reasons={chosen_reasons}")
+                    
+                    try:
+                        if chosen_dir == 'buy':
+                            beep_cash_buy()
+                        else:
+                            beep_cash_sell()
+                    except Exception:
+                        pass
+                    
+                    global_state.daily_trades_count += 1
+                    global_state.last_trade_time[symbol] = time.time()
+            
+            # Manage existing trades
+            manage_trailing_stop_70_pips(symbol)
+            check_closed_trades_enhanced()
+            time.sleep(0.2)
+            
+        except Exception as e:
+            logger.logger.error(f"{nowstr()} {symbol} enhanced loop exception: {e}")
+            logger.log_error("trade_symbol_enhanced", str(e), "ERROR", symbol)
+            time.sleep(2)
+
+# ==================== ENHANCED MAIN EXECUTION ====================
+def main_enhanced():
+    """Enhanced main execution with 70-pips-first strategy"""
+    try:
+        logger.logger.info("=" * 80)
+        logger.logger.info("SAFE CONFLUENCE XAU BOT - 70-PIPS-FIRST STRATEGY v16")
+        logger.logger.info("=" * 80)
+        logger.logger.info(f"Run ID: {logger.run_timestamp}")
+        logger.logger.info(f"Log Directory: {logger.log_dir}")
+        logger.logger.info(f"Starting with symbols: {config.SYMBOLS}")
+        logger.logger.info(f"Starting balance: ${STARTING_BALANCE:.2f}")
+        logger.logger.info("=" * 80)
+        logger.logger.info("70-PIPS-FIRST SL STRATEGY CONFIGURATION:")
+        logger.logger.info(f"  • First SL move after: {config.FIRST_MOVE_PIPS} pips profit")
+        logger.logger.info(f"  • Minimum profit for first move: ${config.MIN_PROFIT_FOR_FIRST_MOVE}")
+        logger.logger.info(f"  • Trail distance: {config.TRAIL_DISTANCE_PIPS} pips")
+        logger.logger.info(f"  • Breakeven lock: {config.BREAKEVEN_PIPS} pips")
+        logger.logger.info(f"  • Partial close at: {config.PARTIAL_CLOSE_PCT*100}% of TP")
+        logger.logger.info("=" * 80)
+        logger.logger.info("ORIGINAL FAST-TRADING LOGIC RESTORED:")
+        logger.logger.info(f"  • Force trade every: {config.FORCE_TRADE_EVERY} seconds")
+        logger.logger.info(f"  • Cooldown between trades: {config.COOLDOWN} seconds")
+        logger.logger.info(f"  • Lot size: {config.LOT_FIXED}")
+        logger.logger.info(f"  • Max trades per symbol: {config.MAX_TRADES_PER_SYMBOL}")
+        logger.logger.info("=" * 80)
+        logger.logger.info("AUTOMATION FEATURES:")
+        logger.logger.info("  ✅ Automatic logging (7 log files)")
+        logger.logger.info("  ✅ Automatic connection recovery")
+        logger.logger.info("  ✅ Intelligent data caching")
+        logger.logger.info("  ✅ Automatic supervisor monitoring")
+        logger.logger.info("  ✅ 70-pips-first SL movement strategy")
+        logger.logger.info("  ✅ Original fast-trading logic restored")
+        logger.logger.info("=" * 80)
+        
+        # Start supervisor
+        supervisor = AutomatedSupervisor()
+        supervisor_thread = threading.Thread(target=supervisor.run, name="Supervisor", daemon=True)
+        supervisor_thread.start()
+        logger.logger.info("Supervisor thread started")
+        
+        # Start trading threads
+        threads = []
+        for symbol in config.SYMBOLS:
+            t = threading.Thread(target=trade_symbol_enhanced, args=(symbol,), 
+                               name=f"Trader_{symbol}", daemon=True)
+            t.start()
+            threads.append(t)
+            time.sleep(0.5)
+            logger.logger.info(f"Trading thread started for {symbol}")
+        
+        logger.logger.info("✅ ALL SYSTEMS INITIALIZED AND RUNNING")
+        logger.logger.info("=" * 80)
+        
+        # Main monitoring loop
+        while True:
+            try:
+                # Check connection
+                if not connection_manager.reconnect_if_needed():
+                    logger.logger.warning("Main loop: Connection issues detected")
+                    time.sleep(10)
+                    continue
+                
+                # Performance summary
+                if time.time() - global_state.last_summary_time > config.SUMMARY_INTERVAL:
+                    print_daily_summary_enhanced()
+                    global_state.last_summary_time = time.time()
+                
+                time.sleep(10)
+                
+            except KeyboardInterrupt:
+                logger.logger.info("Bot stopped by user (KeyboardInterrupt)")
+                break
+            except Exception as e:
+                logger.logger.error(f"Main supervisor loop exception: {e}")
+                logger.log_error("main_enhanced", str(e), "CRITICAL")
+                time.sleep(5)
+                
+    except KeyboardInterrupt:
+        logger.logger.info("Bot stopped by user (KeyboardInterrupt)")
+    except Exception as e:
+        logger.logger.critical(f"Critical error in main_enhanced: {e}")
+        logger.log_error("main_enhanced", str(e), "CRITICAL")
+    finally:
+        try:
+            logger.logger.info("Shutting down bot...")
+            logger.logger.info("=" * 80)
+            logger.logger.info("FINAL SUMMARY")
+            logger.logger.info("=" * 80)
+            print_daily_summary_enhanced()
+            
+            # Save final state
+            logger.logger.info(f"Logs saved to: {logger.log_dir}")
+            logger.logger.info("Shutting down MT5...")
+            mt5.shutdown()
+            logger.logger.info("MT5 shutdown complete")
+            logger.logger.info("=" * 80)
+        except Exception as e:
+            logger.logger.error(f"Shutdown error: {e}")
+
+if __name__ == "__main__":
+    main_enhanced()
