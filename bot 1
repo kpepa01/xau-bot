@@ -26,9 +26,19 @@ from ta.volatility import AverageTrueRange, BollingerBands
 from ta.momentum import RSIIndicator, StochasticOscillator
 from dotenv import load_dotenv
 from itertools import product
+from types import SimpleNamespace
 
 # Load environment variables
 load_dotenv()
+
+# =========================
+# ENVIRONMENT HELPERS
+# =========================
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 # =========================
 # AUTO-CREATE FILES FUNCTION
@@ -874,6 +884,26 @@ class BotConfig:
     DATA_CACHE_SECONDS: int = 60
     VALIDATE_SYMBOLS_ON_STARTUP: bool = True
 
+    # ==== Trade Quality Filters ====
+    MAX_SPREAD_POINTS: float = 30.0
+    MIN_RISK_REWARD: float = 1.5
+    MAX_TRADE_DURATION_MINUTES: int = 240
+
+    # ==== Paper Trading & Backtesting ====
+    PAPER_TRADING_ENABLED: bool = env_bool("PAPER_TRADING_ENABLED", False)
+    PAPER_INITIAL_BALANCE: float = float(os.getenv("PAPER_INITIAL_BALANCE", "10000"))
+    PAPER_CONTRACT_SIZE: float = float(os.getenv("PAPER_CONTRACT_SIZE", "100"))
+    PAPER_SPREAD_PIPS: float = float(os.getenv("PAPER_SPREAD_PIPS", "0.2"))
+    PAPER_SLIPPAGE_PIPS: float = float(os.getenv("PAPER_SLIPPAGE_PIPS", "0.1"))
+    PAPER_COMMISSION_PER_LOT: float = float(os.getenv("PAPER_COMMISSION_PER_LOT", "0"))
+
+    BACKTEST_MODE: bool = env_bool("BACKTEST_MODE", False)
+    BACKTEST_INITIAL_BALANCE: float = float(os.getenv("BACKTEST_INITIAL_BALANCE", "10000"))
+    BACKTEST_DATA_FILES: Dict[str, str] = field(default_factory=lambda: {
+        "XAUUSD": os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "historical_xau_h1.csv"),
+        "XAUJPY": os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "historical_xau_h1.csv")
+    })
+
     # ==== NEW: FVG SETTINGS ====
     FVG_ENABLED: bool = True
     FVG_MIN_STRENGTH: float = 0.6
@@ -989,6 +1019,57 @@ from fvg_detector import FVGStrategy, FVGConfig, detect_fvg, clean_fvg_zones, va
 from fvg_utils import confluence_fvg_signals, FVGConfluence
 
 config = BotConfig()
+
+def validate_config_or_exit(bot_config: BotConfig) -> None:
+    """Validate configuration values on startup."""
+    errors = []
+
+    if not bot_config.SYMBOLS:
+        errors.append("SYMBOLS must contain at least one symbol.")
+    if bot_config.LOT_FIXED <= 0:
+        errors.append("LOT_FIXED must be greater than 0.")
+    if bot_config.MAX_TRADES_PER_SYMBOL < 1:
+        errors.append("MAX_TRADES_PER_SYMBOL must be at least 1.")
+    if bot_config.MAX_POSITIONS_TOTAL < 1:
+        errors.append("MAX_POSITIONS_TOTAL must be at least 1.")
+    if bot_config.SL_ATR_MULT <= 0:
+        errors.append("SL_ATR_MULT must be greater than 0.")
+    if bot_config.TP_ATR_MULT <= 0:
+        errors.append("TP_ATR_MULT must be greater than 0.")
+    if bot_config.MIN_CONFLUENCE_SCORE < 1:
+        errors.append("MIN_CONFLUENCE_SCORE must be at least 1.")
+    if not (0 <= bot_config.DAILY_LOSS_PCT <= 100):
+        errors.append("DAILY_LOSS_PCT must be between 0 and 100.")
+    if not (0 <= bot_config.DAILY_PROFIT_PCT <= 100):
+        errors.append("DAILY_PROFIT_PCT must be between 0 and 100.")
+    if not (0 <= bot_config.MAX_DRAWDOWN_PCT <= 100):
+        errors.append("MAX_DRAWDOWN_PCT must be between 0 and 100.")
+    if bot_config.PAPER_TRADING_ENABLED:
+        if bot_config.PAPER_INITIAL_BALANCE <= 0:
+            errors.append("PAPER_INITIAL_BALANCE must be greater than 0.")
+        if bot_config.PAPER_CONTRACT_SIZE <= 0:
+            errors.append("PAPER_CONTRACT_SIZE must be greater than 0.")
+    if bot_config.MAX_SPREAD_POINTS <= 0:
+        errors.append("MAX_SPREAD_POINTS must be greater than 0.")
+    if bot_config.MIN_RISK_REWARD <= 0:
+        errors.append("MIN_RISK_REWARD must be greater than 0.")
+    if bot_config.MAX_TRADE_DURATION_MINUTES <= 0:
+        errors.append("MAX_TRADE_DURATION_MINUTES must be greater than 0.")
+    if bot_config.BACKTEST_MODE:
+        missing_files = [
+            sym for sym, path in bot_config.BACKTEST_DATA_FILES.items()
+            if not os.path.exists(path)
+        ]
+        if missing_files:
+            errors.append(f"Missing backtest data files for symbols: {', '.join(missing_files)}.")
+    if bot_config.PAPER_TRADING_ENABLED and bot_config.BACKTEST_MODE:
+        errors.append("PAPER_TRADING_ENABLED and BACKTEST_MODE cannot both be enabled.")
+
+    if errors:
+        formatted = "\n".join(f"- {err}" for err in errors)
+        raise SystemExit(f"Configuration validation failed:\n{formatted}")
+
+validate_config_or_exit(config)
 
 # ==================== AUTOMATED LOGGING SETUP ====================
 class AutomatedLogger:
@@ -1132,7 +1213,7 @@ class AutomatedLogger:
             writer = csv.writer(f)
             writer.writerow([
                 'timestamp', 'date', 'balance', 'equity', 'floating_pnl',
-                'total_trades', 'win_rate', 'profit_factor', 'max_drawdown',
+                'total_trades', 'win_rate', 'profit_factor', 'sharpe_ratio', 'max_drawdown',
                 'daily_trades', 'daily_pnl', 'consecutive_losses'
             ])
         
@@ -1281,6 +1362,7 @@ class AutomatedLogger:
                     performance_data.get('total_trades', 0),
                     performance_data.get('win_rate', 0),
                     performance_data.get('profit_factor', 0),
+                    performance_data.get('sharpe_ratio', 0),
                     performance_data.get('max_drawdown', 0),
                     performance_data.get('daily_trades', 0),
                     performance_data.get('daily_pnl', 0),
@@ -1647,8 +1729,65 @@ def debug_mt5_error():
     
     return error_code, error_desc
 
+def is_recoverable_mt5_error(error_code: int) -> bool:
+    recoverable_codes = {
+        -10004,  # requote
+        -10006,  # no connection
+        -10009,  # invalid price
+        -10014,  # trade timeout
+        -10021,  # market closed
+        -10027,  # order expired
+    }
+    return error_code in recoverable_codes
+
+def mt5_order_send_with_recovery(request: Dict[str, Any], context: str, max_attempts: int = 3):
+    """Order send with MT5-specific recovery handling."""
+    for attempt in range(1, max_attempts + 1):
+        res = mt5.order_send(request)
+        if res is not None and getattr(res, "retcode", None) in {
+            mt5.TRADE_RETCODE_DONE,
+            mt5.TRADE_RETCODE_DONE_PARTIAL,
+            mt5.TRADE_RETCODE_PLACED,
+        }:
+            return res
+
+        error_code, error_desc = mt5.last_error()
+        logger.logger.warning(f"{context}: order_send attempt {attempt} failed "
+                             f"retcode={getattr(res, 'retcode', None)} "
+                             f"error={error_code} {error_desc}")
+        logger.log_error("mt5_order_send_with_recovery",
+                         f"{context} failed: {error_code} {error_desc}",
+                         "WARNING")
+
+        if is_recoverable_mt5_error(error_code):
+            connection_manager.reconnect_if_needed()
+            time.sleep(0.5 * attempt)
+            continue
+
+        break
+
+    debug_mt5_error()
+    return None
+
 def nowstr():
     return datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+
+def get_account_info_safe():
+    if config.PAPER_TRADING_ENABLED:
+        return paper_engine.get_account_info()
+    return mt5.account_info()
+
+def get_positions_safe(symbol: Optional[str] = None):
+    if config.PAPER_TRADING_ENABLED:
+        return paper_engine.get_positions_as_mt5(symbol)
+    return mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
+
+def get_spread_points(symbol: str) -> Optional[float]:
+    tick = mt5.symbol_info_tick(symbol)
+    info = mt5.symbol_info(symbol)
+    if tick is None or info is None:
+        return None
+    return (tick.ask - tick.bid) / info.point if info.point else None
 
 # Initialize logger FIRST
 logger = AutomatedLogger()
@@ -1659,6 +1798,13 @@ connection_manager = ConnectionManager()
 # ==================== INITIALIZE MT5 WITH AUTOMATIC RECOVERY ====================
 def initialize_mt5_with_recovery() -> float:
     """Initialize MT5 with automatic recovery"""
+    if config.BACKTEST_MODE:
+        logger.logger.info("Backtest mode enabled - skipping MT5 initialization")
+        return config.BACKTEST_INITIAL_BALANCE
+    if config.PAPER_TRADING_ENABLED:
+        logger.logger.info("Paper trading mode enabled - initializing MT5 data connection")
+        connection_manager.initialize_with_retry()
+        return config.PAPER_INITIAL_BALANCE
     logger.logger.info("Initializing MT5 with automatic recovery...")
     return connection_manager.initialize_with_retry()
 
@@ -2345,7 +2491,7 @@ class TradeTracker:
                   confluence_score: int = 0, fvg_signal: bool = False):
         """Add a new trade to track with safety checks"""
         with self.lock:
-            info = mt5.symbol_info(symbol)
+            info = None if config.PAPER_TRADING_ENABLED else mt5.symbol_info(symbol)
             point = info.point if info else 0.01
             pip_value = point * 10
             
@@ -2372,6 +2518,7 @@ class TradeTracker:
                 'original_sl': sl_price,
                 'tp_price': tp_price,
                 'current_sl': sl_price,
+                'open_time': datetime.now(),
                 'last_move_pips': 0.0,
                 'last_move_profit_usd': 0.0,
                 'pip_thresholds': self._calculate_pip_thresholds(entry_price, direction, pip_value),
@@ -2560,6 +2707,296 @@ class TradeTracker:
 # Initialize trade tracker
 trade_tracker = TradeTracker()
 
+# ==================== PERFORMANCE METRICS ====================
+class PerformanceTracker:
+    """Tracks performance metrics like Sharpe ratio, drawdown, and win rate."""
+
+    def __init__(self, starting_balance: float):
+        self.starting_balance = starting_balance
+        self.equity_curve = [starting_balance]
+        self.returns = []
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.total_profit = 0.0
+        self.total_loss = 0.0
+        self.max_drawdown = 0.0
+        self.lock = threading.RLock()
+
+    def record_equity(self, equity: float) -> None:
+        with self.lock:
+            if equity <= 0:
+                return
+            last_equity = self.equity_curve[-1]
+            if last_equity > 0:
+                ret = (equity - last_equity) / last_equity
+                self.returns.append(ret)
+            self.equity_curve.append(equity)
+            peak = max(self.equity_curve)
+            if peak > 0:
+                drawdown = (peak - equity) / peak * 100
+                self.max_drawdown = max(self.max_drawdown, drawdown)
+
+    def record_trade(self, profit: float) -> None:
+        with self.lock:
+            self.total_trades += 1
+            if profit > 0:
+                self.winning_trades += 1
+                self.total_profit += profit
+            elif profit < 0:
+                self.losing_trades += 1
+                self.total_loss += abs(profit)
+
+    def win_rate(self) -> float:
+        with self.lock:
+            if self.total_trades == 0:
+                return 0.0
+            return (self.winning_trades / self.total_trades) * 100
+
+    def profit_factor(self) -> float:
+        with self.lock:
+            if self.total_loss == 0:
+                return float('inf') if self.total_profit > 0 else 0.0
+            return self.total_profit / self.total_loss
+
+    def sharpe_ratio(self) -> float:
+        with self.lock:
+            if len(self.returns) < 2:
+                return 0.0
+            avg = float(np.mean(self.returns))
+            std = float(np.std(self.returns, ddof=1))
+            if std == 0:
+                return 0.0
+            return (avg / std) * math.sqrt(252)
+
+# ==================== PAPER TRADING ENGINE ====================
+@dataclass
+class PaperAccountInfo:
+    balance: float
+    equity: float
+    margin: float
+
+class PaperTradingEngine:
+    """Simulated execution engine for paper trading and backtesting."""
+
+    def __init__(self, starting_balance: float):
+        self.balance = starting_balance
+        self.equity = starting_balance
+        self.margin = 0.0
+        self.positions: Dict[int, Dict[str, Any]] = {}
+        self.closed_deals = deque()
+        self.latest_prices: Dict[str, Dict[str, float]] = {}
+        self.next_ticket = 1
+        self.lock = threading.RLock()
+
+    def update_price(self, symbol: str, bid: float, ask: float) -> None:
+        with self.lock:
+            self.latest_prices[symbol] = {"bid": bid, "ask": ask}
+            self._revalue_positions()
+
+    def _revalue_positions(self) -> None:
+        equity = self.balance
+        for position in self.positions.values():
+            symbol = position["symbol"]
+            price = self._current_price(symbol, position["direction"])
+            if price is None:
+                continue
+            pnl = self._calc_profit(position, price)
+            equity += pnl
+            position["profit"] = pnl
+        self.equity = equity
+
+    def _current_price(self, symbol: str, direction: str) -> Optional[float]:
+        price_info = self.latest_prices.get(symbol)
+        if not price_info:
+            return None
+        return price_info["bid"] if direction == "sell" else price_info["ask"]
+
+    def _calc_profit(self, position: Dict[str, Any], price: float) -> float:
+        diff = price - position["entry_price"]
+        if position["direction"] == "sell":
+            diff = -diff
+        return diff * position["volume"] * config.PAPER_CONTRACT_SIZE
+
+    def open_position(self, symbol: str, direction: str, volume: float,
+                      entry_price: float, sl_price: float, tp_price: float,
+                      comment: str) -> Dict[str, Any]:
+        with self.lock:
+            ticket = self.next_ticket
+            self.next_ticket += 1
+            self.positions[ticket] = {
+                "ticket": ticket,
+                "symbol": symbol,
+                "direction": direction,
+                "volume": volume,
+                "entry_price": entry_price,
+                "sl": sl_price,
+                "tp": tp_price,
+                "comment": comment,
+                "open_time": datetime.now()
+            }
+            self._revalue_positions()
+            return {"retcode": mt5.TRADE_RETCODE_DONE, "order": ticket}
+
+    def close_position(self, ticket: int, price: float, reason: str) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            position = self.positions.pop(ticket, None)
+            if not position:
+                return None
+            profit = self._calc_profit(position, price)
+            commission = config.PAPER_COMMISSION_PER_LOT * position["volume"]
+            profit -= commission
+            self.balance += profit
+            deal = {
+                "ticket": ticket,
+                "symbol": position["symbol"],
+                "profit": profit,
+                "comment": position["comment"],
+                "reason": reason,
+                "close_time": datetime.now()
+            }
+            self.closed_deals.append(deal)
+            self._revalue_positions()
+            return deal
+
+    def partial_close(self, ticket: int, volume: float, price: float, reason: str) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            position = self.positions.get(ticket)
+            if not position or volume <= 0 or volume > position["volume"]:
+                return None
+            temp_position = position.copy()
+            temp_position["volume"] = volume
+            profit = self._calc_profit(temp_position, price)
+            commission = config.PAPER_COMMISSION_PER_LOT * volume
+            profit -= commission
+            self.balance += profit
+            position["volume"] -= volume
+            deal = {
+                "ticket": ticket,
+                "symbol": position["symbol"],
+                "profit": profit,
+                "comment": position["comment"],
+                "reason": reason,
+                "close_time": datetime.now()
+            }
+            self.closed_deals.append(deal)
+            if position["volume"] <= 0:
+                self.positions.pop(ticket, None)
+            self._revalue_positions()
+            return deal
+
+    def evaluate_positions(self) -> List[Dict[str, Any]]:
+        closed = []
+        for ticket, position in list(self.positions.items()):
+            price = self._current_price(position["symbol"], position["direction"])
+            if price is None:
+                continue
+            sl = position.get("sl", 0.0) or 0.0
+            tp = position.get("tp", 0.0) or 0.0
+            if position["direction"] == "buy":
+                if sl and price <= sl:
+                    closed.append(self.close_position(ticket, sl, "stop_loss"))
+                elif tp and price >= tp:
+                    closed.append(self.close_position(ticket, tp, "take_profit"))
+            else:
+                if sl and price >= sl:
+                    closed.append(self.close_position(ticket, sl, "stop_loss"))
+                elif tp and price <= tp:
+                    closed.append(self.close_position(ticket, tp, "take_profit"))
+        self._revalue_positions()
+        return [c for c in closed if c]
+
+    def get_positions(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self.lock:
+            positions = list(self.positions.values())
+            if symbol:
+                return [p for p in positions if p["symbol"] == symbol]
+            return positions
+
+    def get_positions_as_mt5(self, symbol: Optional[str] = None):
+        positions = self.get_positions(symbol)
+        mt5_positions = []
+        for p in positions:
+            mt5_positions.append(SimpleNamespace(
+                ticket=p["ticket"],
+                symbol=p["symbol"],
+                type=0 if p["direction"] == "buy" else 1,
+                price_open=p["entry_price"],
+                sl=p.get("sl", 0.0),
+                tp=p.get("tp", 0.0),
+                volume=p["volume"],
+                magic=config.MAGIC,
+                profit=p.get("profit", 0.0),
+                time_update=p.get("open_time").timestamp() if p.get("open_time") else 0
+            ))
+        return mt5_positions
+
+    def get_account_info(self) -> PaperAccountInfo:
+        with self.lock:
+            return PaperAccountInfo(balance=self.balance, equity=self.equity, margin=self.margin)
+
+    def get_closed_deals(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            deals = list(self.closed_deals)
+            self.closed_deals.clear()
+            return deals
+
+# ==================== THREAD MANAGEMENT ====================
+class ThreadManager:
+    """Track thread health and clean up resources for failed threads."""
+
+    def __init__(self):
+        self.threads: Dict[str, threading.Thread] = {}
+        self.heartbeats: Dict[str, float] = {}
+        self.symbol_map: Dict[str, str] = {}
+        self.lock = threading.RLock()
+        self.stop_event = threading.Event()
+
+    def register_thread(self, name: str, thread: threading.Thread, symbol: Optional[str] = None) -> None:
+        with self.lock:
+            self.threads[name] = thread
+            self.heartbeats[name] = time.time()
+            if symbol:
+                self.symbol_map[name] = symbol
+
+    def heartbeat(self, name: str) -> None:
+        with self.lock:
+            if name in self.heartbeats:
+                self.heartbeats[name] = time.time()
+
+    def cleanup_stale_threads(self, timeout: float = 300) -> None:
+        with self.lock:
+            current = time.time()
+            for name, last_seen in list(self.heartbeats.items()):
+                thread = self.threads.get(name)
+                if thread and not thread.is_alive():
+                    self._cleanup_resources(name, reason="thread_dead")
+                elif current - last_seen > timeout:
+                    self._cleanup_resources(name, reason="heartbeat_timeout")
+
+    def _cleanup_resources(self, name: str, reason: str) -> None:
+        symbol = self.symbol_map.get(name)
+        logger.logger.warning(f"Thread {name} cleanup triggered ({reason})")
+        if symbol:
+            for ticket, trade in list(trade_tracker.trades.items()):
+                if trade.get("symbol") == symbol:
+                    trade_tracker.remove_trade(ticket)
+            if config.PAPER_TRADING_ENABLED:
+                for position in list(paper_engine.positions.values()):
+                    if position.get("symbol") == symbol:
+                        price = paper_engine._current_price(symbol, position["direction"]) or position["entry_price"]
+                        paper_engine.close_position(position["ticket"], price, "thread_cleanup")
+        self.threads.pop(name, None)
+        self.heartbeats.pop(name, None)
+        self.symbol_map.pop(name, None)
+
+    def stop_all(self) -> None:
+        self.stop_event.set()
+
+performance_tracker = PerformanceTracker(STARTING_BALANCE)
+paper_engine = PaperTradingEngine(config.PAPER_INITIAL_BALANCE)
+thread_manager = ThreadManager()
+
 # ==================== AUTOMATIC SUPERVISOR ====================
 class AutomatedSupervisor:
     """AUTOMATIC SUPERVISOR: Monitors all bot activities"""
@@ -2587,7 +3024,7 @@ class AutomatedSupervisor:
         
         self.last_monitor_time = current_time
         
-        if not connection_manager.check_connection():
+        if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
             logger.logger.warning("Supervisor: Connection check failed")
             if config.AUTO_RECONNECT:
                 connection_manager.reconnect_if_needed()
@@ -2608,6 +3045,8 @@ class AutomatedSupervisor:
                 logger.log_error("monitor_all_threads", 
                                f"Thread {thread_name} stalled", 
                                "WARNING")
+
+        thread_manager.cleanup_stale_threads(timeout=300)
         
         if current_time - self.start_time > 1800:
             self.log_performance_summary()
@@ -2615,7 +3054,8 @@ class AutomatedSupervisor:
     def log_performance_summary(self):
         """Log comprehensive performance summary"""
         try:
-            acct = mt5.account_info()
+            current_time = time.time()
+            acct = get_account_info_safe()
             if acct:
                 equity = float(acct.equity)
                 balance = float(acct.balance)
@@ -2627,20 +3067,29 @@ class AutomatedSupervisor:
                     drawdown = (self.performance_data['peak_equity'] - equity) / self.performance_data['peak_equity'] * 100
                     self.performance_data['max_drawdown'] = max(self.performance_data['max_drawdown'], drawdown)
                 
-                history = mt5.history_deals_get(datetime.now() - timedelta(hours=1), datetime.now())
-                if history:
-                    for deal in history:
-                        if getattr(deal, "magic", None) == config.MAGIC:
-                            self.performance_data['total_trades'] += 1
-                            profit = getattr(deal, "profit", 0.0)
-                            self.performance_data['total_profit'] += profit
-                            if profit > 0:
-                                self.performance_data['winning_trades'] += 1
-                            elif profit < 0:
-                                self.performance_data['losing_trades'] += 1
+                if not config.PAPER_TRADING_ENABLED:
+                    history = mt5.history_deals_get(datetime.now() - timedelta(hours=1), datetime.now())
+                    if history:
+                        for deal in history:
+                            if getattr(deal, "magic", None) == config.MAGIC:
+                                self.performance_data['total_trades'] += 1
+                                profit = getattr(deal, "profit", 0.0)
+                                self.performance_data['total_profit'] += profit
+                                if profit > 0:
+                                    self.performance_data['winning_trades'] += 1
+                                elif profit < 0:
+                                    self.performance_data['losing_trades'] += 1
                 
-                win_rate = (self.performance_data['winning_trades'] / self.performance_data['total_trades'] * 100) \
-                          if self.performance_data['total_trades'] > 0 else 0
+                if config.PAPER_TRADING_ENABLED and performance_tracker:
+                    win_rate = performance_tracker.win_rate()
+                    total_trades = performance_tracker.total_trades
+                    total_profit = performance_tracker.total_profit - performance_tracker.total_loss
+                else:
+                    win_rate = (self.performance_data['winning_trades'] / self.performance_data['total_trades'] * 100) \
+                              if self.performance_data['total_trades'] > 0 else 0
+                    total_trades = self.performance_data['total_trades']
+                    total_profit = self.performance_data['total_profit']
+                sharpe = performance_tracker.sharpe_ratio() if performance_tracker else 0.0
                 
                 logger.logger.info("=" * 80)
                 logger.logger.info("SUPERVISOR PERFORMANCE REPORT")
@@ -2648,9 +3097,10 @@ class AutomatedSupervisor:
                 logger.logger.info(f"Uptime: {timedelta(seconds=int(current_time - self.start_time))}")
                 logger.logger.info(f"Active Threads: {threading.active_count()}")
                 logger.logger.info(f"Balance: ${balance:.2f} | Equity: ${equity:.2f}")
-                logger.logger.info(f"Total Trades: {self.performance_data['total_trades']}")
+                logger.logger.info(f"Total Trades: {total_trades}")
                 logger.logger.info(f"Win Rate: {win_rate:.1f}%")
-                logger.logger.info(f"Total Profit: ${self.performance_data['total_profit']:.2f}")
+                logger.logger.info(f"Sharpe Ratio: {sharpe:.2f}")
+                logger.logger.info(f"Total Profit: ${total_profit:.2f}")
                 logger.logger.info(f"Max Drawdown: {self.performance_data['max_drawdown']:.2f}%")
                 logger.logger.info(f"Consecutive Losses: {trade_tracker.consecutive_losses}")
                 logger.logger.info(f"Tracked Trades: {len(trade_tracker.trades)}")
@@ -2666,6 +3116,8 @@ class AutomatedSupervisor:
         
         while self.running:
             try:
+                if thread_manager.stop_event.is_set():
+                    break
                 self.monitor_all_threads()
                 time.sleep(5)
             except Exception as e:
@@ -2708,6 +3160,8 @@ class EnhancedDataCache:
                 
                 rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, n)
                 if rates is None or len(rates) == 0:
+                    if not config.PAPER_TRADING_ENABLED:
+                        connection_manager.reconnect_if_needed()
                     raise ValueError(f"No data returned for {symbol}")
                 
                 df = pd.DataFrame(rates)
@@ -3185,12 +3639,14 @@ class EnhancedGlobalState:
     def update_daily_stats(self):
         with self.lock:
             try:
-                if not connection_manager.check_connection():
+                if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
                     return
                 
-                acct = mt5.account_info()
+                acct = get_account_info_safe()
                 if acct:
                     current_equity = float(acct.equity)
+                    if performance_tracker:
+                        performance_tracker.record_equity(current_equity)
                     
                     if current_equity > self.peak_equity:
                         self.peak_equity = current_equity
@@ -3198,6 +3654,8 @@ class EnhancedGlobalState:
                     if self.peak_equity > 0:
                         drawdown = (self.peak_equity - current_equity) / self.peak_equity * 100
                         self.max_drawdown = max(self.max_drawdown, drawdown)
+                        if performance_tracker:
+                            self.max_drawdown = max(self.max_drawdown, performance_tracker.max_drawdown)
                     
                     current_balance = float(acct.balance)
                     profit_pct = ((current_balance - STARTING_BALANCE) / STARTING_BALANCE) * 100.0
@@ -3226,7 +3684,7 @@ class EnhancedGlobalState:
             self.daily_trades_count = 0
             self.daily_loss_triggered = False
             try:
-                acct = mt5.account_info()
+                acct = get_account_info_safe()
                 if acct:
                     self.peak_equity = float(acct.balance)
             except:
@@ -3289,10 +3747,10 @@ def calc_indicators_safe(df: pd.DataFrame) -> pd.DataFrame:
 
 def active_positions(symbol: str):
     try:
-        if not connection_manager.check_connection():
+        if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
             return []
         
-        ps = mt5.positions_get(symbol=symbol)
+        ps = get_positions_safe(symbol)
         if not ps:
             return []
         return [p for p in ps if getattr(p, "magic", None) == config.MAGIC]
@@ -3302,10 +3760,10 @@ def active_positions(symbol: str):
 
 def latest_our_position(symbol: str):
     try:
-        if not connection_manager.check_connection():
+        if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
             return None
         
-        ps = mt5.positions_get(symbol=symbol)
+        ps = get_positions_safe(symbol)
         if not ps:
             return None
         our = [p for p in ps if getattr(p, "magic", None) == config.MAGIC]
@@ -3318,6 +3776,8 @@ def latest_our_position(symbol: str):
 
 def symbol_min_stop(symbol: str):
     try:
+        if config.PAPER_TRADING_ENABLED:
+            return config.MIN_ATR
         if not connection_manager.check_connection():
             return None
         
@@ -3335,6 +3795,8 @@ def symbol_min_stop(symbol: str):
 
 def round_lot(symbol: str, lot: float) -> float:
     try:
+        if config.PAPER_TRADING_ENABLED:
+            return round(lot, 2)
         if not connection_manager.check_connection():
             return round(lot, 2)
         
@@ -3430,7 +3892,7 @@ def get_trend_signals(df: pd.DataFrame, df_htf: pd.DataFrame, market_regime: str
 def market_entry_safe(symbol: str, direction: str, lot: float, comment: str = None):
     """Safe market entry with connection check"""
     try:
-        if not connection_manager.check_connection():
+        if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
             logger.logger.warning(f"{nowstr()} {symbol}: No connection for market entry")
             return None
         
@@ -3438,6 +3900,16 @@ def market_entry_safe(symbol: str, direction: str, lot: float, comment: str = No
         if tick is None:
             logger.logger.warning(f"{nowstr()} {symbol}: no tick for market_entry")
             return None
+
+        if config.PAPER_TRADING_ENABLED:
+            entry_price = float(tick.ask) if direction == 'buy' else float(tick.bid)
+            slippage = config.PAPER_SLIPPAGE_PIPS * (1 if direction == 'buy' else -1)
+            entry_price += slippage
+            paper_engine.update_price(symbol, float(tick.bid), float(tick.ask))
+            safe_comment = sanitize_comment(comment or f"{config.MODE}_{direction}")
+            res = paper_engine.open_position(symbol, direction, lot, entry_price, 0.0, 0.0, safe_comment)
+            logger.logger.info(f"{nowstr()} {symbol}: Paper market entry executed, ticket {res.get('order')}")
+            return SimpleNamespace(**res)
         
         order_type = mt5.ORDER_TYPE_BUY if direction == 'buy' else mt5.ORDER_TYPE_SELL
         price = float(tick.ask) if direction == 'buy' else float(tick.bid)
@@ -3461,7 +3933,7 @@ def market_entry_safe(symbol: str, direction: str, lot: float, comment: str = No
         
         logger.logger.debug(f"Market entry request for {symbol}: {req}")
         
-        res = mt5.order_send(req)
+        res = mt5_order_send_with_recovery(req, f"market_entry_safe {symbol}")
         
         if res is None:
             logger.logger.error(f"{nowstr()} {symbol}: market_entry returned None mt5.last_error={mt5.last_error()}, comment='{safe_comment}'")
@@ -3509,13 +3981,21 @@ def market_entry_safe(symbol: str, direction: str, lot: float, comment: str = No
 def attach_sl_tp_safe(symbol: str, sl_price: float, tp_price: float, attempt: int = 1):
     """Safe SL/TP attachment with retry"""
     try:
-        if not connection_manager.check_connection():
+        if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
             return None
         
         pos = latest_our_position(symbol)
         if pos is None:
             logger.logger.warning(f"{nowstr()} {symbol}: attach_sl_tp_safe - no our position found")
             return None
+
+        if config.PAPER_TRADING_ENABLED:
+            for position in paper_engine.positions.values():
+                if position["symbol"] == symbol and position["ticket"] == pos.ticket:
+                    position["sl"] = float(sl_price) if sl_price else 0.0
+                    position["tp"] = float(tp_price) if tp_price else 0.0
+                    logger.logger.info(f"{nowstr()} {symbol}: Paper SL/TP attached ticket={pos.ticket}")
+                    return SimpleNamespace(retcode=mt5.TRADE_RETCODE_DONE, order=pos.ticket)
         
         ticket = int(pos.ticket)
         req = {
@@ -3526,7 +4006,7 @@ def attach_sl_tp_safe(symbol: str, sl_price: float, tp_price: float, attempt: in
             "tp": float(tp_price) if tp_price else 0.0
         }
         
-        res = mt5.order_send(req)
+        res = mt5_order_send_with_recovery(req, f"attach_sl_tp_safe {symbol}")
         
         if res is None:
             logger.logger.error(f"{nowstr()} {symbol}: attach_sl_tp_safe returned None mt5.last_error={mt5.last_error()}")
@@ -3572,7 +4052,7 @@ def attach_sl_tp_safe(symbol: str, sl_price: float, tp_price: float, attempt: in
 def close_partial_position_safe(symbol: str, pct: float = config.PARTIAL_CLOSE_PCT):
     """Safe partial position close"""
     try:
-        if not connection_manager.check_connection():
+        if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
             return None
         
         pos = latest_our_position(symbol)
@@ -3603,6 +4083,14 @@ def close_partial_position_safe(symbol: str, pct: float = config.PARTIAL_CLOSE_P
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             return None
+
+        if config.PAPER_TRADING_ENABLED:
+            close_price = float(tick.bid) if pos.type == 0 else float(tick.ask)
+            deal = paper_engine.partial_close(pos.ticket, close_vol, close_price, "partial_close")
+            if deal:
+                logger.logger.info(f"{nowstr()} {symbol}: paper partial close executed vol={close_vol:.3f}")
+                return SimpleNamespace(retcode=mt5.TRADE_RETCODE_DONE, order=pos.ticket)
+            return None
         
         close_type = mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY
         close_price = float(tick.bid) if close_type == mt5.ORDER_TYPE_SELL else float(tick.ask)
@@ -3619,7 +4107,7 @@ def close_partial_position_safe(symbol: str, pct: float = config.PARTIAL_CLOSE_P
             "type_filling": mt5.ORDER_FILLING_IOC
         }
         
-        res = mt5.order_send(req)
+        res = mt5_order_send_with_recovery(req, f"close_partial_position_safe {symbol}")
         
         if res is None:
             logger.logger.error(f"{nowstr()} {symbol}: close_partial_position_safe returned None mt5.last_error={mt5.last_error()}")
@@ -3640,6 +4128,45 @@ def close_partial_position_safe(symbol: str, pct: float = config.PARTIAL_CLOSE_P
         logger.log_error("close_partial_position_safe", str(e), "ERROR", symbol)
         return None
 
+def close_position_safe(symbol: str, reason: str = "timeout"):
+    """Safe full position close for latest position."""
+    try:
+        pos = latest_our_position(symbol)
+        if pos is None:
+            return None
+
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return None
+
+        if config.PAPER_TRADING_ENABLED:
+            close_price = float(tick.bid) if pos.type == 0 else float(tick.ask)
+            deal = paper_engine.close_position(pos.ticket, close_price, reason)
+            if deal:
+                return SimpleNamespace(retcode=mt5.TRADE_RETCODE_DONE, order=pos.ticket)
+            return None
+
+        close_type = mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY
+        close_price = float(tick.bid) if close_type == mt5.ORDER_TYPE_SELL else float(tick.ask)
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "position": pos.ticket,
+            "volume": float(pos.volume),
+            "type": close_type,
+            "price": close_price,
+            "deviation": 50,
+            "magic": config.MAGIC,
+            "comment": sanitize_comment(f"Close_{reason}"),
+            "type_filling": mt5.ORDER_FILLING_IOC
+        }
+        return mt5_order_send_with_recovery(req, f"close_position_safe {symbol}")
+
+    except Exception as e:
+        logger.logger.error(f"{nowstr()} {symbol}: close_position_safe exception: {e}")
+        logger.log_error("close_position_safe", str(e), "ERROR", symbol)
+        return None
+
 def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp_price: float, reason: str, confluence_score: int = 0, fvg_signal: bool = False):
     """Safe trade execution with comprehensive logging"""
     comment_base = f"{config.MODE}_{direction}_{reason}"
@@ -3647,7 +4174,7 @@ def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp
     logger.logger.debug(f"Sanitized comment: '{comment_base}' -> '{comment}'")
     
     try:
-        if not connection_manager.check_connection():
+        if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
             logger.logger.warning(f"{nowstr()} {symbol}: No connection for trade")
             return None
         
@@ -3655,6 +4182,32 @@ def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp
         if tick is None:
             logger.logger.warning(f"{nowstr()} {symbol}: no tick in send_trade_safe")
             return None
+
+        if config.PAPER_TRADING_ENABLED:
+            price = float(tick.ask) if direction == 'buy' else float(tick.bid)
+            slippage = config.PAPER_SLIPPAGE_PIPS * (1 if direction == 'buy' else -1)
+            price += slippage
+            paper_engine.update_price(symbol, float(tick.bid), float(tick.ask))
+            res = paper_engine.open_position(symbol, direction, lot, price, sl_price, tp_price, comment)
+            ticket = res.get("order", 0)
+            trade_tracker.add_trade(ticket, symbol, direction, price, sl_price, tp_price, confluence_score, fvg_signal)
+            logger.log_trade({
+                'symbol': symbol,
+                'direction': direction.upper(),
+                'entry_price': round(price, 3),
+                'sl_price': round(sl_price, 3) if sl_price else 0,
+                'tp_price': round(tp_price, 3) if tp_price else 0,
+                'volume': lot,
+                'reason': reason,
+                'status': 'paper_executed',
+                'ticket': ticket,
+                'magic': config.MAGIC,
+                'consecutive_losses': trade_tracker.consecutive_losses,
+                'confluence_score': confluence_score,
+                'fvg_signal': fvg_signal
+            })
+            logger.logger.info(f"{nowstr()} {symbol}: Paper trade executed ticket {ticket}")
+            return SimpleNamespace(**res)
         
         price = float(tick.ask) if direction == 'buy' else float(tick.bid)
         order_type = mt5.ORDER_TYPE_BUY if direction == 'buy' else mt5.ORDER_TYPE_SELL
@@ -3675,7 +4228,7 @@ def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp
         
         logger.logger.debug(f"Trade request for {symbol}: {request}")
         
-        res = mt5.order_send(request)
+        res = mt5_order_send_with_recovery(request, f"send_trade_safe {symbol}")
         
         if res is None:
             logger.logger.warning(f"{nowstr()} {symbol}: initial order_send returned None -> fallback market_entry, comment='{comment}'")
@@ -3776,7 +4329,7 @@ def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp
 # ==================== ENHANCED HYBRID SL MANAGEMENT ====================
 def manage_hybrid_trailing_enhanced(symbol: str):
     """Enhanced trailing stop management with safety checks"""
-    if not connection_manager.check_connection():
+    if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
         return
     
     pos = latest_our_position(symbol)
@@ -3821,12 +4374,18 @@ def manage_hybrid_trailing_enhanced(symbol: str):
             old_sl = pos.sl
             if old_sl != new_sl:
                 try:
-                    result = mt5.order_send({
-                        "action": mt5.TRADE_ACTION_SLTP,
-                        "position": ticket,
-                        "sl": new_sl,
-                        "tp": pos.tp
-                    })
+                    if config.PAPER_TRADING_ENABLED:
+                        for position in paper_engine.positions.values():
+                            if position["ticket"] == ticket:
+                                position["sl"] = new_sl
+                        result = True
+                    else:
+                        result = mt5_order_send_with_recovery({
+                            "action": mt5.TRADE_ACTION_SLTP,
+                            "position": ticket,
+                            "sl": new_sl,
+                            "tp": pos.tp
+                        }, f"manage_hybrid_trailing_enhanced {symbol}")
                     
                     if result:
                         logger.logger.info(f"{nowstr()} {symbol}: SL moved from {old_sl:.5f} to {new_sl:.5f} "
@@ -3857,6 +4416,13 @@ def manage_hybrid_trailing_enhanced(symbol: str):
                 except Exception as e:
                     logger.logger.error(f"{nowstr()} {symbol}: Error moving SL: {e}")
                     logger.log_error("manage_hybrid_trailing_enhanced", str(e), "ERROR", symbol)
+
+    trade_info = trade_tracker.get_trade(ticket)
+    if trade_info and trade_info.get('open_time'):
+        age_minutes = (datetime.now() - trade_info['open_time']).total_seconds() / 60
+        if age_minutes >= config.MAX_TRADE_DURATION_MINUTES:
+            logger.logger.warning(f"{nowstr()} {symbol}: closing trade {ticket} due to max duration")
+            close_position_safe(symbol, reason="max_duration")
     
     if config.PARTIAL_CLOSE_ENABLED and pos.tp and pos.tp != 0:
         trade_info = trade_tracker.get_trade(ticket)
@@ -3888,10 +4454,10 @@ def manage_hybrid_trailing_enhanced(symbol: str):
 def check_closed_trades_enhanced():
     """Enhanced closed trade checking with learning updates"""
     try:
-        if not connection_manager.check_connection():
+        if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
             return
         
-        positions = mt5.positions_get()
+        positions = get_positions_safe()
         active_tickets = set()
         
         if positions:
@@ -3909,12 +4475,13 @@ def check_closed_trades_enhanced():
             if trade_info:
                 symbol = trade_info['symbol']
                 
-                deals = mt5.history_deals_get(datetime.now() - timedelta(hours=1), datetime.now())
+                deals = paper_engine.get_closed_deals() if config.PAPER_TRADING_ENABLED else mt5.history_deals_get(datetime.now() - timedelta(hours=1), datetime.now())
                 if deals:
                     for deal in deals:
-                        if getattr(deal, "ticket", 0) == ticket:
-                            profit = getattr(deal, "profit", 0.0)
-                            comment = getattr(deal, "comment", "")
+                        deal_ticket = getattr(deal, "ticket", None) if not isinstance(deal, dict) else deal.get("ticket")
+                        if deal_ticket == ticket:
+                            profit = getattr(deal, "profit", 0.0) if not isinstance(deal, dict) else deal.get("profit", 0.0)
+                            comment = getattr(deal, "comment", "") if not isinstance(deal, dict) else deal.get("comment", "")
                             
                             signal_type = "unknown"
                             parts = comment.split("_")
@@ -3926,6 +4493,8 @@ def check_closed_trades_enhanced():
                             
                             global_state.update_consecutive_losses(symbol, profit)
                             trade_tracker.update_consecutive_losses(profit)
+                            if performance_tracker:
+                                performance_tracker.record_trade(profit)
                             
                             logger.logger.info(f"Trade {ticket} closed: ${profit:.2f} ({outcome})")
                             break
@@ -3941,11 +4510,11 @@ def check_closed_trades_enhanced():
 def print_daily_summary_enhanced():
     """Enhanced daily performance summary"""
     try:
-        if not connection_manager.check_connection():
+        if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
             logger.logger.warning("print_daily_summary_enhanced: No connection")
             return
         
-        acct = mt5.account_info()
+        acct = get_account_info_safe()
         if acct is None:
             logger.logger.warning("print_daily_summary_enhanced: no account info")
             return
@@ -3955,15 +4524,18 @@ def print_daily_summary_enhanced():
         used = float(acct.margin) if hasattr(acct, 'margin') else 0.0
         free = balance - used
         
-        open_positions = mt5.positions_get()
+        open_positions = get_positions_safe()
         my_open = []
         if open_positions:
-            my_open = [p for p in open_positions if getattr(p, "magic", None) == config.MAGIC]
+            if config.PAPER_TRADING_ENABLED:
+                my_open = open_positions
+            else:
+                my_open = [p for p in open_positions if getattr(p, "magic", None) == config.MAGIC]
         
         floating = sum(getattr(p, "profit", 0.0) for p in my_open)
         
         today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        history = mt5.history_deals_get(today_start, datetime.now())
+        history = [] if config.PAPER_TRADING_ENABLED else mt5.history_deals_get(today_start, datetime.now())
         win_count = 0
         loss_count = 0
         total_profit = 0
@@ -3980,10 +4552,17 @@ def print_daily_summary_enhanced():
                         loss_count += 1
                         total_loss += abs(profit)
         
-        total_trades = win_count + loss_count
-        win_rate = (win_count / total_trades * 100) if total_trades > 0 else 0
-        profit_factor = (total_profit / total_loss) if total_loss > 0 else float('inf')
-        daily_pnl = total_profit - total_loss
+        if config.PAPER_TRADING_ENABLED and performance_tracker:
+            total_trades = performance_tracker.total_trades
+            win_rate = performance_tracker.win_rate()
+            profit_factor = performance_tracker.profit_factor()
+            daily_pnl = performance_tracker.total_profit - performance_tracker.total_loss
+        else:
+            total_trades = win_count + loss_count
+            win_rate = (win_count / total_trades * 100) if total_trades > 0 else 0
+            profit_factor = (total_profit / total_loss) if total_loss > 0 else float('inf')
+            daily_pnl = total_profit - total_loss
+        sharpe = performance_tracker.sharpe_ratio() if performance_tracker else 0.0
         
         logger.logger.info("=" * 80)
         logger.logger.info("ENHANCED DAILY PERFORMANCE SUMMARY")
@@ -3996,6 +4575,7 @@ def print_daily_summary_enhanced():
         logger.logger.info(f"Daily Trades: {global_state.daily_trades_count}/{config.MAX_DAILY_TRADES}")
         logger.logger.info(f"Win Rate: {win_rate:.1f}% ({win_count}/{total_trades})")
         logger.logger.info(f"Profit Factor: {profit_factor:.2f}")
+        logger.logger.info(f"Sharpe Ratio: {sharpe:.2f}")
         logger.logger.info(f"Daily P/L: ${daily_pnl:.2f}")
         logger.logger.info(f"Max Drawdown: {global_state.max_drawdown:.2f}%")
         logger.logger.info(f"Consecutive Losses: {trade_tracker.consecutive_losses}/{config.CONSECUTIVE_LOSS_LIMIT}")
@@ -4011,6 +4591,7 @@ def print_daily_summary_enhanced():
             'total_trades': total_trades,
             'win_rate': win_rate,
             'profit_factor': profit_factor,
+            'sharpe_ratio': sharpe,
             'max_drawdown': global_state.max_drawdown,
             'daily_trades': global_state.daily_trades_count,
             'daily_pnl': daily_pnl,
@@ -4021,19 +4602,119 @@ def print_daily_summary_enhanced():
         logger.logger.error(f"print_daily_summary_enhanced error: {e}")
         logger.log_error("print_daily_summary_enhanced", str(e), "ERROR")
 
+# ==================== BACKTESTING FRAMEWORK ====================
+class BacktestEngine:
+    """Lightweight backtesting engine using historical CSV data."""
+
+    def __init__(self, data_files: Dict[str, str], starting_balance: float):
+        self.data_files = data_files
+        self.starting_balance = starting_balance
+
+    def run(self):
+        logger.logger.info("Backtest mode active - starting simulation")
+        results = {}
+
+        for symbol, path in self.data_files.items():
+            if not os.path.exists(path):
+                logger.logger.warning(f"Backtest file missing for {symbol}: {path}")
+                continue
+
+            df = pd.read_csv(path)
+            if "time" in df.columns:
+                df["time"] = pd.to_datetime(df["time"])
+            df = calc_indicators_safe(df)
+
+            balance = self.starting_balance
+            equity = balance
+            tracker = PerformanceTracker(balance)
+            open_position = None
+            wins = 0
+            losses = 0
+
+            warmup = max(config.EMA_SLOW, config.ATR_PERIOD, config.RSI_PERIOD) + 5
+            for idx in range(warmup, len(df)):
+                bar = df.iloc[idx]
+                price = float(bar["close"])
+                tracker.record_equity(balance)
+
+                if open_position:
+                    direction = open_position["direction"]
+                    sl = open_position["sl"]
+                    tp = open_position["tp"]
+                    if (direction == "buy" and ((sl and price <= sl) or (tp and price >= tp))) or \
+                       (direction == "sell" and ((sl and price >= sl) or (tp and price <= tp))):
+                        exit_price = sl if sl and ((direction == "buy" and price <= sl) or (direction == "sell" and price >= sl)) else tp
+                        diff = exit_price - open_position["entry_price"]
+                        if direction == "sell":
+                            diff = -diff
+                        profit = diff * open_position["volume"] * config.PAPER_CONTRACT_SIZE
+                        balance += profit
+                        tracker.record_trade(profit)
+                        if profit > 0:
+                            wins += 1
+                        else:
+                            losses += 1
+                        open_position = None
+
+                if open_position is None:
+                    df_slice = df.iloc[:idx + 1]
+                    market_regime = global_state.confluence_manager.detect_market_regime(df_slice)
+                    trend_signals = get_trend_signals(df_slice, df_slice, market_regime)
+                    confluence = global_state.confluence_manager.analyze_confluence(
+                        symbol, df_slice, trend_signals, market_regime
+                    )
+                    direction = confluence.get("direction")
+                    if direction:
+                        atr = float(bar.get("atr", 0))
+                        if atr <= 0:
+                            continue
+                        sl = price - (config.SL_ATR_MULT * atr) if direction == "buy" else price + (config.SL_ATR_MULT * atr)
+                        tp = price + (config.TP_ATR_MULT * atr) if direction == "buy" else price - (config.TP_ATR_MULT * atr)
+                        open_position = {
+                            "direction": direction,
+                            "entry_price": price,
+                            "sl": sl,
+                            "tp": tp,
+                            "volume": config.LOT_FIXED
+                        }
+
+            results[symbol] = {
+                "ending_balance": balance,
+                "win_rate": (wins / (wins + losses) * 100) if wins + losses > 0 else 0.0,
+                "profit_factor": tracker.profit_factor(),
+                "sharpe_ratio": tracker.sharpe_ratio(),
+                "max_drawdown": tracker.max_drawdown
+            }
+
+        logger.logger.info("Backtest results:")
+        for symbol, stats in results.items():
+            logger.logger.info(f"{symbol}: Balance={stats['ending_balance']:.2f}, "
+                             f"WinRate={stats['win_rate']:.1f}%, "
+                             f"Sharpe={stats['sharpe_ratio']:.2f}, "
+                             f"MaxDD={stats['max_drawdown']:.2f}%")
+        return results
+
 # ==================== ENHANCED MAIN TRADING LOOP WITH FVG AND LIQUIDITY ====================
-def trade_symbol_enhanced(symbol: str):
+def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
     """Enhanced trading loop for a symbol with FVG and Liquidity integration"""
     logger.logger.info(f"{nowstr()} Enhanced thread started for {symbol}")
     last_bar_time = None
     
-    while True:
+    while not stop_event.is_set():
         try:
             if not connection_manager.reconnect_if_needed():
                 logger.logger.warning(f"{symbol}: Connection issues, waiting...")
                 time.sleep(10)
                 continue
+
+            if config.PAPER_TRADING_ENABLED:
+                tick = mt5.symbol_info_tick(symbol)
+                if tick:
+                    paper_engine.update_price(symbol, float(tick.bid), float(tick.ask))
+                    paper_engine.evaluate_positions()
             
+            thread_manager.heartbeat(threading.current_thread().name)
+
             if date.today() != global_state.daily_start_date:
                 global_state.reset_daily_stats()
             
@@ -4085,6 +4766,9 @@ def trade_symbol_enhanced(symbol: str):
                 continue
             
             bar = df.iloc[-1]
+            if float(bar.get('atr', 0)) < config.MIN_ATR:
+                time.sleep(1)
+                continue
             
             market_regime = global_state.confluence_manager.detect_market_regime(df)
             global_state.market_regimes[symbol] = market_regime
@@ -4192,6 +4876,12 @@ def trade_symbol_enhanced(symbol: str):
                 if tick is None:
                     time.sleep(0.2)
                     continue
+
+                spread_points = get_spread_points(symbol)
+                if spread_points is not None and spread_points > config.MAX_SPREAD_POINTS:
+                    logger.logger.info(f"{nowstr()} {symbol}: spread {spread_points:.1f} > max {config.MAX_SPREAD_POINTS}, skipping")
+                    time.sleep(0.2)
+                    continue
                 
                 entry_price = float(tick.ask) if chosen_dir == 'buy' else float(tick.bid)
                 atr = float(bar['atr']) if not pd.isna(bar.get('atr')) else info.point * 50
@@ -4253,6 +4943,14 @@ def trade_symbol_enhanced(symbol: str):
                     sl_price = entry_price - min_stop
                 if chosen_dir == 'sell' and (sl_price - entry_price) < min_stop:
                     sl_price = entry_price + min_stop
+
+                risk = abs(entry_price - sl_price)
+                reward = abs(tp_price - entry_price)
+                rr = (reward / risk) if risk > 0 else 0
+                if rr < config.MIN_RISK_REWARD:
+                    logger.logger.info(f"{nowstr()} {symbol}: R:R {rr:.2f} below minimum {config.MIN_RISK_REWARD}, skipping")
+                    time.sleep(0.2)
+                    continue
                 
                 lot = round_lot(symbol, config.LOT_FIXED)
                 
@@ -4342,6 +5040,11 @@ def trade_symbol_enhanced(symbol: str):
 def main_enhanced():
     """Enhanced main execution with full automation"""
     try:
+        if config.BACKTEST_MODE:
+            backtester = BacktestEngine(config.BACKTEST_DATA_FILES, STARTING_BALANCE)
+            backtester.run()
+            return
+
         logger.logger.info("=" * 80)
         logger.logger.info("SAFE CONFLUENCE XAU BOT v16 + FVG + LIQUIDITY SMC - COMPLETE INTEGRATION")
         logger.logger.info("TREND + CRT + SNR + FVG + LIQUIDITY - PROFESSIONAL EDITION")
@@ -4350,6 +5053,8 @@ def main_enhanced():
         logger.logger.info(f"Log Directory: {logger.log_dir}")
         logger.logger.info(f"Starting with symbols: {config.SYMBOLS}")
         logger.logger.info(f"Starting balance: ${STARTING_BALANCE:.2f}")
+        if config.PAPER_TRADING_ENABLED:
+            logger.logger.info("Paper trading mode: ENABLED (simulated execution)")
         logger.logger.info("=" * 80)
         logger.logger.info("SAFETY CONFIGURATION:")
         logger.logger.info(f"  • Lot size: {config.LOT_FIXED}")
@@ -4396,15 +5101,17 @@ def main_enhanced():
         supervisor_thread = threading.Thread(target=supervisor.run, name="Supervisor", daemon=True)
         supervisor_thread.start()
         logger.logger.info("Supervisor thread started")
+        thread_manager.register_thread("Supervisor", supervisor_thread)
         
         threads = []
         for symbol in config.SYMBOLS:
-            t = threading.Thread(target=trade_symbol_enhanced, args=(symbol,), 
+            t = threading.Thread(target=trade_symbol_enhanced, args=(symbol, thread_manager.stop_event), 
                                name=f"Trader_{symbol}", daemon=True)
             t.start()
             threads.append(t)
             time.sleep(0.5)
             logger.logger.info(f"Trading thread started for {symbol}")
+            thread_manager.register_thread(t.name, t, symbol)
         
         logger.logger.info("✅ ALL SYSTEMS INITIALIZED AND RUNNING")
         logger.logger.info("=" * 80)
@@ -4423,6 +5130,7 @@ def main_enhanced():
                 active_threads = threading.active_count()
                 if active_threads < len(config.SYMBOLS) + 2:
                     logger.logger.warning(f"Thread count low: {active_threads}")
+                    thread_manager.cleanup_stale_threads(timeout=300)
                 
                 time.sleep(10)
                 
@@ -4442,15 +5150,21 @@ def main_enhanced():
     finally:
         try:
             logger.logger.info("Shutting down bot...")
+            thread_manager.stop_all()
+            for thread in threading.enumerate():
+                if thread.name.startswith("Trader_"):
+                    thread.join(timeout=2)
             logger.logger.info("=" * 80)
             logger.logger.info("FINAL SUMMARY")
             logger.logger.info("=" * 80)
-            print_daily_summary_enhanced()
+            if not config.BACKTEST_MODE:
+                print_daily_summary_enhanced()
             
             logger.logger.info(f"Logs saved to: {logger.log_dir}")
-            logger.logger.info("Shutting down MT5...")
-            mt5.shutdown()
-            logger.logger.info("MT5 shutdown complete")
+            if not config.BACKTEST_MODE:
+                logger.logger.info("Shutting down MT5...")
+                mt5.shutdown()
+                logger.logger.info("MT5 shutdown complete")
             logger.logger.info("=" * 80)
         except Exception as e:
             logger.logger.error(f"Shutdown error: {e}")
