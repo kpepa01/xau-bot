@@ -131,7 +131,8 @@ class AutomatedLogger:
     def __init__(self):
         # Create timestamped folder for this run
         self.run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_dir = os.path.expanduser(fr"C:\Users\klajd\Documents\XAU_Bot_Logs\Run_{self.run_timestamp}")
+        base_log_dir = os.getenv("XAU_BOT_LOG_DIR", os.path.join(os.path.expanduser("~"), "XAU_Bot_Logs"))
+        self.log_dir = os.path.join(base_log_dir, f"Run_{self.run_timestamp}")
         
         # Create directory if it doesn't exist
         os.makedirs(self.log_dir, exist_ok=True)
