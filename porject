@@ -848,6 +848,7 @@ class BotConfig:
     MARKET_REGIME_PERIOD: int = 50
     TRENDING_THRESHOLD: float = 0.55
     RANGING_THRESHOLD: float = 0.25
+    MARKET_VOLATILITY_MAX: float = 0.03
 
     MIN_CONFIRMING_SIGNALS: int = 2
     CONSECUTIVE_LOSS_LIMIT: int = 3
@@ -1020,6 +1021,18 @@ from fvg_utils import confluence_fvg_signals, FVGConfluence
 
 config = BotConfig()
 
+def validate_fvg_config(bot_config: BotConfig) -> List[str]:
+    """Validate FVG-specific configuration."""
+    errors = []
+    if bot_config.FVG_ENABLED:
+        if not 0 <= bot_config.FVG_MIN_STRENGTH <= 1:
+            errors.append("FVG_MIN_STRENGTH must be between 0 and 1.")
+        if bot_config.FVG_SL_BREAKER_MULTIPLIER <= 0:
+            errors.append("FVG_SL_BREAKER_MULTIPLIER must be > 0.")
+        if bot_config.FVG_MIN_STOP_ATR_MULTIPLIER <= 0:
+            errors.append("FVG_MIN_STOP_ATR_MULTIPLIER must be > 0.")
+    return errors
+
 def validate_config_or_exit(bot_config: BotConfig) -> None:
     """Validate configuration values on startup."""
     errors = []
@@ -1064,6 +1077,8 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
             errors.append(f"Missing backtest data files for symbols: {', '.join(missing_files)}.")
     if bot_config.PAPER_TRADING_ENABLED and bot_config.BACKTEST_MODE:
         errors.append("PAPER_TRADING_ENABLED and BACKTEST_MODE cannot both be enabled.")
+
+    errors.extend(validate_fvg_config(bot_config))
 
     if errors:
         formatted = "\n".join(f"- {err}" for err in errors)
@@ -1791,6 +1806,36 @@ def get_spread_points(symbol: str) -> Optional[float]:
 
 # Initialize logger FIRST
 logger = AutomatedLogger()
+
+def safe_strategy_execution(strategy_func, *args, default=None, **kwargs):
+    """Execute strategy with error isolation."""
+    try:
+        return strategy_func(*args, **kwargs)
+    except Exception as e:
+        logger.log_error("strategy_execution", f"{strategy_func.__name__}: {e}", "WARNING")
+        if default is None:
+            return []
+        return default
+
+def should_trade_in_current_conditions(symbol: str, market_regime: str, volatility: float) -> bool:
+    """Check if conditions are suitable for trading."""
+    if market_regime == 'unknown':
+        return False
+    if market_regime == 'volatile':
+        return False
+    if volatility > config.MARKET_VOLATILITY_MAX:
+        return False
+    return True
+
+def calculate_normalized_volatility(df: pd.DataFrame, lookback: int = 20) -> float:
+    """Calculate normalized volatility using log returns."""
+    if df.empty or len(df) < lookback + 1:
+        return 0.0
+    close_prices = df['close'].values[-(lookback + 1):]
+    returns = np.diff(np.log(close_prices))
+    if len(returns) == 0:
+        return 0.0
+    return float(np.std(returns))
 
 # Initialize connection manager
 connection_manager = ConnectionManager()
@@ -2708,6 +2753,36 @@ class TradeTracker:
 trade_tracker = TradeTracker()
 
 # ==================== PERFORMANCE METRICS ====================
+class StrategyPerformance:
+    """Track performance of individual strategies."""
+
+    def __init__(self):
+        self.strategy_stats = {
+            'trend': {'wins': 0, 'losses': 0, 'total_pnl': 0.0},
+            'crt': {'wins': 0, 'losses': 0, 'total_pnl': 0.0},
+            'snr': {'wins': 0, 'losses': 0, 'total_pnl': 0.0},
+            'fvg': {'wins': 0, 'losses': 0, 'total_pnl': 0.0},
+            'liquidity': {'wins': 0, 'losses': 0, 'total_pnl': 0.0}
+        }
+        self.lock = threading.RLock()
+
+    def record_trade(self, strategy: str, pnl: float) -> None:
+        """Record a trade outcome for a given strategy."""
+        if strategy not in self.strategy_stats:
+            return
+        with self.lock:
+            stats = self.strategy_stats[strategy]
+            if pnl > 0:
+                stats['wins'] += 1
+            else:
+                stats['losses'] += 1
+            stats['total_pnl'] += pnl
+
+    def summary(self) -> Dict[str, Dict[str, float]]:
+        """Return a snapshot summary of strategy performance."""
+        with self.lock:
+            return {k: v.copy() for k, v in self.strategy_stats.items()}
+
 class PerformanceTracker:
     """Tracks performance metrics like Sharpe ratio, drawdown, and win rate."""
 
@@ -3365,27 +3440,41 @@ class ConfluenceManager:
         
         crt_signals = []
         if self.crt_strategy:
-            crt_signals = self.crt_strategy.detect_all_patterns(
-                df, trend_direction, current_price, atr, symbol
+            crt_signals = safe_strategy_execution(
+                self.crt_strategy.detect_all_patterns,
+                df, trend_direction, current_price, atr, symbol,
+                default=[]
             )
         
         snr_signals = []
         if self.snr_strategy:
-            snr_signals = self.snr_strategy.get_trade_signals(
-                df, current_price, atr, trend_direction, symbol
+            snr_signals = safe_strategy_execution(
+                self.snr_strategy.get_trade_signals,
+                df, current_price, atr, trend_direction, symbol,
+                default=[]
             )
         
         fvg_signals = []
         fvg_confluence = FVGConfluence()
         if self.fvg_strategy and config.FVG_ENABLED:
-            fvg_zones = self.fvg_strategy.detect_fvg(df, symbol)
+            fvg_zones = safe_strategy_execution(
+                self.fvg_strategy.detect_fvg,
+                df, symbol,
+                default=[]
+            )
             
             snr_levels = {}
             if self.snr_strategy:
-                snr_levels = self.snr_strategy.identify_key_levels(df, current_price, atr)
+                snr_levels = safe_strategy_execution(
+                    self.snr_strategy.identify_key_levels,
+                    df, current_price, atr,
+                    default={}
+                )
             
-            fvg_signals = self.fvg_strategy.get_fvg_trade_signals(
-                symbol, df, current_price, atr, trend_direction, snr_levels
+            fvg_signals = safe_strategy_execution(
+                self.fvg_strategy.get_fvg_trade_signals,
+                symbol, df, current_price, atr, trend_direction, snr_levels,
+                default=[]
             )
             
             for fvg_signal in fvg_signals:
@@ -3412,7 +3501,11 @@ class ConfluenceManager:
         
         liquidity_signals = []
         if self.liquidity_smc_strategy and config.LIQUIDITY_SMC_ENABLED:
-            liquidity_signals = self.liquidity_smc_strategy.generate_signals(symbol, df, current_price)
+            liquidity_signals = safe_strategy_execution(
+                self.liquidity_smc_strategy.generate_signals,
+                symbol, df, current_price,
+                default=[]
+            )
         
         buy_signals = {
             'trend': [s for s in trend_signals if s['direction'] == 'buy'],
@@ -3532,6 +3625,7 @@ class EnhancedGlobalState:
         self.market_regimes = {s: "unknown" for s in config.SYMBOLS}
         self.consecutive_losses_by_symbol = {s: 0 for s in config.SYMBOLS}
         self.signal_strength = {s: 0 for s in config.SYMBOLS}
+        self.strategy_performance = StrategyPerformance()
         self.confluence_manager = ConfluenceManager()
         self.lock = threading.RLock()
     
@@ -4451,6 +4545,26 @@ def manage_hybrid_trailing_enhanced(symbol: str):
                         logger.logger.error(f"{nowstr()} {symbol}: Partial close error: {e}")
                         logger.log_error("manage_hybrid_trailing_enhanced", str(e), "WARNING", symbol)
 
+def _infer_strategy_from_comment(comment: str) -> Optional[str]:
+    """Infer strategy name from trade comment."""
+    if not comment:
+        return None
+    parts = comment.split("_")
+    if len(parts) < 3:
+        return None
+    reason = "_".join(parts[2:]).upper()
+    if reason.startswith("FVG"):
+        return "fvg"
+    if reason.startswith("LIQ") or "LIQUIDITY" in reason:
+        return "liquidity"
+    if "CRT" in reason:
+        return "crt"
+    if "SNR" in reason:
+        return "snr"
+    if "EMA" in reason or "RSI" in reason or "TREND" in reason:
+        return "trend"
+    return None
+
 def check_closed_trades_enhanced():
     """Enhanced closed trade checking with learning updates"""
     try:
@@ -4490,7 +4604,11 @@ def check_closed_trades_enhanced():
                             
                             outcome = "win" if profit > 0 else "loss"
                             global_state.update_learning(symbol, signal_type, outcome)
-                            
+
+                            inferred_strategy = _infer_strategy_from_comment(comment)
+                            if inferred_strategy:
+                                global_state.strategy_performance.record_trade(inferred_strategy, profit)
+
                             global_state.update_consecutive_losses(symbol, profit)
                             trade_tracker.update_consecutive_losses(profit)
                             if performance_tracker:
@@ -4659,7 +4777,14 @@ class BacktestEngine:
                 if open_position is None:
                     df_slice = df.iloc[:idx + 1]
                     market_regime = global_state.confluence_manager.detect_market_regime(df_slice)
-                    trend_signals = get_trend_signals(df_slice, df_slice, market_regime)
+                    volatility = calculate_normalized_volatility(df_slice)
+                    if not should_trade_in_current_conditions(symbol, market_regime, volatility):
+                        continue
+                    trend_signals = safe_strategy_execution(
+                        get_trend_signals,
+                        df_slice, df_slice, market_regime,
+                        default=[]
+                    )
                     confluence = global_state.confluence_manager.analyze_confluence(
                         symbol, df_slice, trend_signals, market_regime
                     )
@@ -4772,8 +4897,21 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             
             market_regime = global_state.confluence_manager.detect_market_regime(df)
             global_state.market_regimes[symbol] = market_regime
+
+            volatility = calculate_normalized_volatility(df)
+            if not should_trade_in_current_conditions(symbol, market_regime, volatility):
+                logger.logger.debug(
+                    f"{nowstr()} {symbol}: market conditions not suitable "
+                    f"(regime={market_regime}, volatility={volatility:.4f})"
+                )
+                time.sleep(0.5)
+                continue
             
-            trend_signals = get_trend_signals(df, df_htf, market_regime)
+            trend_signals = safe_strategy_execution(
+                get_trend_signals,
+                df, df_htf, market_regime,
+                default=[]
+            )
             
             confluence_result = global_state.confluence_manager.analyze_confluence(
                 symbol, df, trend_signals, market_regime
