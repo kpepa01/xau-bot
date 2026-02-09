@@ -1004,7 +1004,7 @@ class BotConfig:
         'NEW_YORK': {'start': dt_time(13, 0), 'end': dt_time(21, 0)},
         'ASIA': {'start': dt_time(0, 0), 'end': dt_time(8, 0)}
     })
-    PREFERRED_SESSION: str = 'LONDON'
+    PREFERRED_SESSION: str = 'ALL_DAY'
 
     # ==== Correlation Filter ====
     CORRELATION_PAIRS: Dict[str, List[str]] = field(default_factory=lambda: {
@@ -3886,6 +3886,8 @@ def is_in_no_trade_zone() -> bool:
         return t >= config.NO_TRADE_START or t <= config.NO_TRADE_END
 
 def is_in_trading_session(session_name: str) -> bool:
+    if not session_name or session_name.upper() in {"ALL", "ALL_DAY", "ANY"}:
+        return True
     session = config.TRADING_SESSIONS.get(session_name)
     if not session:
         return True
