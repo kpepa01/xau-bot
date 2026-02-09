@@ -5194,6 +5194,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             
             chosen_dir = confluence_result['direction']
             confluence_score = confluence_result.get('confluence_score', 0)
+            forced_trade = False
             
             chosen_reasons = []
             fvg_signal_active = False
@@ -5244,6 +5245,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 
                 global_state.last_forced_time[symbol] = time.time()
                 logger.logger.info(f"{nowstr()} {symbol}: FORCE TRADE -> {chosen_dir}")
+                forced_trade = True
             
             if chosen_dir:
                 global_state.last_trade_attempt[symbol] = time.time()
@@ -5253,15 +5255,15 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     global_state.last_signal_time[symbol] = coerce_timestamp(bar['time'])
                     global_state.last_signal_dir[symbol] = chosen_dir
 
-                if config.ENTRY_DELAY_BARS > 0:
+                if config.ENTRY_DELAY_BARS > 0 and not forced_trade:
                     required_delay = config.ENTRY_DELAY_BARS * timeframe_seconds(config.ENTRY_TF)
                     last_signal_ts = global_state.last_signal_time.get(symbol)
                     if last_signal_ts and (coerce_timestamp(bar['time']) - last_signal_ts) < required_delay:
                         logger.logger.debug(f"{nowstr()} {symbol}: waiting entry delay bars")
                         time.sleep(0.2)
                         continue
-
-                if config.MOMENTUM_CONFIRMATION_REQUIRED:
+                
+                if config.MOMENTUM_CONFIRMATION_REQUIRED and not forced_trade:
                     confirmed, strength = calculate_momentum_strength(df, chosen_dir)
                     min_momentum = config.RELAX_MIN_MOMENTUM if relax_mode else config.MIN_MOMENTUM_STRENGTH
                     if not confirmed or strength < min_momentum:
@@ -5386,16 +5388,17 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     "last_signal_time": global_state.last_trade_time.get(symbol, 0),
                     "rr_ratio": rr
                 }
-                if not global_state.trade_filter.filter_trade(
-                    {"direction": chosen_dir},
-                    market_data,
-                    min_trend_strength=(config.RELAX_MIN_TREND_STRENGTH if relax_mode else None),
-                    max_spread_multiplier=(config.RELAX_MAX_SPREAD_MULTIPLIER if relax_mode else None),
-                    min_rr_ratio=min_rr
-                ):
-                    logger.logger.info(f"{nowstr()} {symbol}: trade filter blocked entry")
-                    time.sleep(0.2)
-                    continue
+                if not forced_trade:
+                    if not global_state.trade_filter.filter_trade(
+                        {"direction": chosen_dir},
+                        market_data,
+                        min_trend_strength=(config.RELAX_MIN_TREND_STRENGTH if relax_mode else None),
+                        max_spread_multiplier=(config.RELAX_MAX_SPREAD_MULTIPLIER if relax_mode else None),
+                        min_rr_ratio=min_rr
+                    ):
+                        logger.logger.info(f"{nowstr()} {symbol}: trade filter blocked entry")
+                        time.sleep(0.2)
+                        continue
 
                 if config.DYNAMIC_POSITION_SIZING:
                     lot = calculate_position_size(symbol, entry_price, sl_price)
