@@ -790,8 +790,9 @@ def _check_conflicts(fvg_signal: Dict, trend_signals: List[Dict],
     
     print("✅ All files created successfully!")
 
-# Run file creation
-create_file_structure()
+# Run file creation unless disabled
+if env_bool("XAU_BOT_BOOTSTRAP_FILES", True):
+    create_file_structure()
 
 # ======================= BOT CONFIG PRO+ WITH FVG =======================
 @dataclass
@@ -903,6 +904,32 @@ class BotConfig:
         "XAUUSD": os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "historical_xau_h1.csv"),
         "XAUJPY": os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "historical_xau_h1.csv")
     })
+    BACKTEST_COMPARE_ENABLED: bool = env_bool("BACKTEST_COMPARE_ENABLED", False)
+    BACKTEST_COMPARE_OUTPUT: str = os.getenv("BACKTEST_COMPARE_OUTPUT", "reports/backtest_comparison.csv")
+    WALK_FORWARD_ENABLED: bool = env_bool("WALK_FORWARD_ENABLED", False)
+    WALK_FORWARD_WINDOW_BARS: int = int(os.getenv("WALK_FORWARD_WINDOW_BARS", "300"))
+    WALK_FORWARD_STEP_BARS: int = int(os.getenv("WALK_FORWARD_STEP_BARS", "150"))
+
+    # ==== ML Weight Optimization ====
+    ML_WEIGHT_OPTIMIZATION_ENABLED: bool = env_bool("ML_WEIGHT_OPTIMIZATION_ENABLED", True)
+    ML_WEIGHT_LEARNING_RATE: float = float(os.getenv("ML_WEIGHT_LEARNING_RATE", "0.15"))
+    ML_WEIGHT_DECAY: float = float(os.getenv("ML_WEIGHT_DECAY", "0.02"))
+    ML_WEIGHT_MIN: float = float(os.getenv("ML_WEIGHT_MIN", "0.05"))
+    ML_WEIGHT_MAX: float = float(os.getenv("ML_WEIGHT_MAX", "0.6"))
+    ML_WEIGHT_UPDATE_INTERVAL_TRADES: int = int(os.getenv("ML_WEIGHT_UPDATE_INTERVAL_TRADES", "8"))
+
+    # ==== Telemetry Dashboard ====
+    TELEMETRY_ENABLED: bool = env_bool("TELEMETRY_ENABLED", True)
+    TELEMETRY_OUTPUT_DIR: str = os.getenv("TELEMETRY_OUTPUT_DIR", "reports")
+    TELEMETRY_REFRESH_SECONDS: int = int(os.getenv("TELEMETRY_REFRESH_SECONDS", "60"))
+
+    # ==== Error Simulation (Paper/Backtest) ====
+    PAPER_ERROR_SIMULATION_ENABLED: bool = env_bool("PAPER_ERROR_SIMULATION_ENABLED", True)
+    PAPER_ERROR_REJECT_RATE: float = float(os.getenv("PAPER_ERROR_REJECT_RATE", "0.02"))
+    PAPER_ERROR_PARTIAL_FILL_RATE: float = float(os.getenv("PAPER_ERROR_PARTIAL_FILL_RATE", "0.08"))
+    PAPER_ERROR_LATENCY_MS: int = int(os.getenv("PAPER_ERROR_LATENCY_MS", "20"))
+    PAPER_ERROR_SLIPPAGE_STD_PIPS: float = float(os.getenv("PAPER_ERROR_SLIPPAGE_STD_PIPS", "0.08"))
+    PAPER_ERROR_PRICE_GAP_RATE: float = float(os.getenv("PAPER_ERROR_PRICE_GAP_RATE", "0.01"))
 
     # ==== NEW: FVG SETTINGS ====
     FVG_ENABLED: bool = True
@@ -1546,6 +1573,79 @@ class AutomatedLogger:
             except Exception as e:
                 self.logger.error(f"Failed to archive error log: {e}")
 
+
+class TelemetryDashboard:
+    """Generate a lightweight HTML/JSON dashboard from latest performance data."""
+
+    def __init__(self, output_dir: str, logger_instance: AutomatedLogger):
+        self.logger_instance = logger_instance
+        self.output_dir = self._resolve_output_dir(output_dir)
+        self.snapshot_path = os.path.join(self.output_dir, "telemetry_snapshot.json")
+        self.html_path = os.path.join(self.output_dir, "telemetry_dashboard.html")
+
+    def _resolve_output_dir(self, output_dir: str) -> str:
+        candidates = [output_dir]
+        if self.logger_instance and getattr(self.logger_instance, "log_dir", None):
+            candidates.append(os.path.join(self.logger_instance.log_dir, "telemetry"))
+        candidates.append(os.path.join(os.path.expanduser("~"), "xau_bot_reports"))
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                os.makedirs(candidate, exist_ok=True)
+                return candidate
+            except PermissionError:
+                continue
+            except OSError:
+                continue
+
+        fallback = os.path.join(os.getcwd(), "telemetry_reports")
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+
+    def update_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        try:
+            snapshot["generated_at"] = datetime.now().isoformat()
+            with open(self.snapshot_path, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, indent=2)
+            self._write_html(snapshot)
+        except Exception as e:
+            if self.logger_instance.logger:
+                self.logger_instance.logger.error(f"Telemetry update failed: {e}")
+
+    def _write_html(self, snapshot: Dict[str, Any]) -> None:
+        metrics = snapshot.get("metrics", {})
+        rows = "\n".join(
+            f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in metrics.items()
+        )
+        html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>XAU Bot Telemetry</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 24px; background: #0b0f14; color: #e3e8ef; }}
+    h1 {{ margin-bottom: 6px; }}
+    table {{ border-collapse: collapse; width: 100%; max-width: 720px; }}
+    td, th {{ border: 1px solid #2a3340; padding: 8px; }}
+    th {{ background: #111827; text-align: left; }}
+    .meta {{ color: #9aa4b2; margin-bottom: 16px; }}
+  </style>
+</head>
+<body>
+  <h1>XAU Bot Telemetry Dashboard</h1>
+  <div class="meta">Generated: {snapshot.get("generated_at", "N/A")}</div>
+  <table>
+    <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</body>
+</html>
+"""
+        with open(self.html_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
 # ==================== AUTOMATIC CONNECTION MANAGER ====================
 class ConnectionManager:
     """AUTOMATIC CONNECTION MANAGEMENT with exponential backoff"""
@@ -1791,6 +1891,7 @@ def get_spread_points(symbol: str) -> Optional[float]:
 
 # Initialize logger FIRST
 logger = AutomatedLogger()
+telemetry_dashboard = TelemetryDashboard(config.TELEMETRY_OUTPUT_DIR, logger) if config.TELEMETRY_ENABLED else None
 
 # Initialize connection manager
 connection_manager = ConnectionManager()
@@ -2488,7 +2589,8 @@ class TradeTracker:
     
     def add_trade(self, ticket: int, symbol: str, direction: str, 
                   entry_price: float, sl_price: float, tp_price: float,
-                  confluence_score: int = 0, fvg_signal: bool = False):
+                  confluence_score: int = 0, fvg_signal: bool = False,
+                  strategy_context: Optional[Dict[str, Any]] = None):
         """Add a new trade to track with safety checks"""
         with self.lock:
             info = None if config.PAPER_TRADING_ENABLED else mt5.symbol_info(symbol)
@@ -2531,7 +2633,8 @@ class TradeTracker:
                 'lot_size': lot_size,
                 'max_loss_exceeded': potential_loss > self.max_loss_per_trade,
                 'confluence_score': confluence_score,
-                'fvg_signal': fvg_signal
+                'fvg_signal': fvg_signal,
+                'strategy_context': strategy_context or {}
             }
             
             logger.logger.info(f"Trade {ticket} added to tracker. Potential loss: ${potential_loss:.2f}")
@@ -2789,6 +2892,30 @@ class PaperTradingEngine:
         self.next_ticket = 1
         self.lock = threading.RLock()
 
+    def _pip_to_price(self, pips: float) -> float:
+        return pips * 0.01
+
+    def _simulate_execution(self, volume: float, price: float) -> Tuple[float, float, bool]:
+        if not config.PAPER_ERROR_SIMULATION_ENABLED:
+            return volume, price, False
+
+        if config.PAPER_ERROR_LATENCY_MS > 0:
+            time.sleep(config.PAPER_ERROR_LATENCY_MS / 1000)
+
+        if random.random() < config.PAPER_ERROR_REJECT_RATE:
+            return volume, price, True
+
+        if random.random() < config.PAPER_ERROR_PARTIAL_FILL_RATE:
+            volume = max(volume * random.uniform(0.4, 0.8), 0.01)
+
+        if random.random() < config.PAPER_ERROR_PRICE_GAP_RATE:
+            gap = self._pip_to_price(random.uniform(0.2, 1.2))
+            price += gap if random.random() > 0.5 else -gap
+
+        slip = random.gauss(0, config.PAPER_ERROR_SLIPPAGE_STD_PIPS)
+        price += self._pip_to_price(slip)
+        return volume, price, False
+
     def update_price(self, symbol: str, bid: float, ask: float) -> None:
         with self.lock:
             self.latest_prices[symbol] = {"bid": bid, "ask": ask}
@@ -2822,6 +2949,10 @@ class PaperTradingEngine:
                       entry_price: float, sl_price: float, tp_price: float,
                       comment: str) -> Dict[str, Any]:
         with self.lock:
+            volume, entry_price, rejected = self._simulate_execution(volume, entry_price)
+            if rejected:
+                return {"retcode": getattr(mt5, "TRADE_RETCODE_REJECT", -1), "order": 0}
+
             ticket = self.next_ticket
             self.next_ticket += 1
             self.positions[ticket] = {
@@ -2940,6 +3071,28 @@ class PaperTradingEngine:
             deals = list(self.closed_deals)
             self.closed_deals.clear()
             return deals
+
+
+class ErrorSimulationHarness:
+    """Run controlled error simulation scenarios for paper trading."""
+
+    def __init__(self, engine: PaperTradingEngine):
+        self.engine = engine
+
+    def run_smoke_test(self, symbol: str, direction: str, price: float, runs: int = 25) -> Dict[str, int]:
+        results = {"accepted": 0, "rejected": 0, "partial": 0}
+        for _ in range(runs):
+            res = self.engine.open_position(symbol, direction, 0.1, price, 0.0, 0.0, "sim_test")
+            if res.get("order"):
+                results["accepted"] += 1
+                ticket = res["order"]
+                position = self.engine.positions.get(ticket, {})
+                if position.get("volume", 0) < 0.1:
+                    results["partial"] += 1
+                self.engine.close_position(ticket, price, "sim_test_close")
+            else:
+                results["rejected"] += 1
+        return results
 
 # ==================== THREAD MANAGEMENT ====================
 class ThreadManager:
@@ -3261,6 +3414,46 @@ def trade_flash(message):
     except Exception:
         pass
 
+# ==================== ML WEIGHT OPTIMIZATION ====================
+class MLWeightOptimizer:
+    """Adaptive weight optimizer based on recent trade outcomes."""
+
+    def __init__(self, learning_rate: float, decay: float, min_weight: float, max_weight: float):
+        self.learning_rate = learning_rate
+        self.decay = decay
+        self.min_weight = min_weight
+        self.max_weight = max_weight
+        self.stats = defaultdict(lambda: defaultdict(lambda: {"wins": 0, "losses": 0}))
+        self.trade_counter = defaultdict(int)
+
+    def record_trade(self, market_regime: str, contributions: Dict[str, float], outcome: str) -> None:
+        for strategy, weight in contributions.items():
+            if weight <= 0:
+                continue
+            bucket = self.stats[market_regime][strategy]
+            if outcome == "win":
+                bucket["wins"] += 1
+            else:
+                bucket["losses"] += 1
+        self.trade_counter[market_regime] += 1
+
+    def adjust_weights(self, base_weights: Dict[str, float], market_regime: str) -> Dict[str, float]:
+        stats = self.stats.get(market_regime, {})
+        adjusted = {}
+        for strategy, base_weight in base_weights.items():
+            record = stats.get(strategy, {"wins": 0, "losses": 0})
+            total = record["wins"] + record["losses"]
+            if total == 0:
+                score = 0.0
+            else:
+                score = (record["wins"] - record["losses"]) / total
+            weight = base_weight * (1 + self.learning_rate * score)
+            weight = max(self.min_weight, min(self.max_weight, weight))
+            adjusted[strategy] = weight
+
+        total_weight = sum(adjusted.values()) or 1.0
+        return {k: v / total_weight for k, v in adjusted.items()}
+
 # ==================== CONFLUENCE MANAGER WITH FVG AND LIQUIDITY ====================
 class ConfluenceManager:
     """Manage strategy confluence and signal weighting with FVG and Liquidity"""
@@ -3283,6 +3476,13 @@ class ConfluenceManager:
             MIN_STOP_DISTANCE_ATR_MULTIPLIER=config.FVG_MIN_STOP_ATR_MULTIPLIER
         )) if config.FVG_ENABLED else None
         self.liquidity_smc_strategy = LiquiditySMCStrategy() if config.LIQUIDITY_SMC_ENABLED else None
+        self.weight_optimizer = MLWeightOptimizer(
+            config.ML_WEIGHT_LEARNING_RATE,
+            config.ML_WEIGHT_DECAY,
+            config.ML_WEIGHT_MIN,
+            config.ML_WEIGHT_MAX
+        ) if config.ML_WEIGHT_OPTIMIZATION_ENABLED else None
+        self.weight_overrides: Optional[Dict[str, Dict[str, float]]] = None
         logger.logger.info("Confluence Manager initialized with CRT, SNR, FVG, and Liquidity SMC strategies")
     
     def calculate_trend_direction(self, df: pd.DataFrame) -> str:
@@ -3346,14 +3546,35 @@ class ConfluenceManager:
     
     def get_strategy_weights(self, market_regime: str) -> Dict[str, float]:
         """Get strategy weights based on market regime"""
+        override = self.weight_overrides or {}
         if market_regime == "trending":
-            return config.WEIGHTS_TRENDING
+            base = override.get("trending", config.WEIGHTS_TRENDING)
         elif market_regime == "ranging":
-            return config.WEIGHTS_RANGING
+            base = override.get("ranging", config.WEIGHTS_RANGING)
         elif market_regime == "volatile":
-            return config.WEIGHTS_VOLATILE
+            base = override.get("volatile", config.WEIGHTS_VOLATILE)
         else:
-            return {'trend_following': 0.25, 'crt': 0.25, 'snr': 0.25, 'fvg': 0.15, 'liquidity': 0.1}
+            base = override.get("default", {
+                'trend_following': 0.25,
+                'crt': 0.25,
+                'snr': 0.25,
+                'fvg': 0.15,
+                'liquidity': 0.1
+            })
+
+        if self.weight_optimizer:
+            return self.weight_optimizer.adjust_weights(base, market_regime)
+        return base
+
+    def set_weight_overrides(self, overrides: Optional[Dict[str, Dict[str, float]]]) -> None:
+        self.weight_overrides = overrides
+
+    def update_weights_from_trade(self, trade_context: Dict[str, Any], outcome: str) -> None:
+        if not self.weight_optimizer or not trade_context:
+            return
+        market_regime = trade_context.get("market_regime", "unknown")
+        contributions = trade_context.get("strategy_votes", {})
+        self.weight_optimizer.record_trade(market_regime, contributions, outcome)
     
     def analyze_confluence(self, symbol: str, df: pd.DataFrame, 
                           trend_signals: List[Dict], market_regime: str) -> Dict:
@@ -4035,8 +4256,8 @@ def attach_sl_tp_safe(symbol: str, sl_price: float, tp_price: float, attempt: in
         try:
             direction = 'buy' if pos.type == 0 else 'sell'
             fvg_signal = False
-            trade_tracker.add_trade(ticket, symbol, direction, 
-                                  pos.price_open, sl_price, tp_price, 0, fvg_signal)
+            trade_tracker.add_trade(ticket, symbol, direction,
+                                  pos.price_open, sl_price, tp_price, 0, fvg_signal, None)
             logger.logger.info(f"{nowstr()} {symbol}: Trade {ticket} added to tracker")
         except Exception as e:
             logger.logger.error(f"Error adding trade to tracker: {e}")
@@ -4167,7 +4388,7 @@ def close_position_safe(symbol: str, reason: str = "timeout"):
         logger.log_error("close_position_safe", str(e), "ERROR", symbol)
         return None
 
-def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp_price: float, reason: str, confluence_score: int = 0, fvg_signal: bool = False):
+def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp_price: float, reason: str, confluence_score: int = 0, fvg_signal: bool = False, strategy_context: Optional[Dict[str, Any]] = None):
     """Safe trade execution with comprehensive logging"""
     comment_base = f"{config.MODE}_{direction}_{reason}"
     comment = sanitize_comment(comment_base)
@@ -4190,7 +4411,7 @@ def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp
             paper_engine.update_price(symbol, float(tick.bid), float(tick.ask))
             res = paper_engine.open_position(symbol, direction, lot, price, sl_price, tp_price, comment)
             ticket = res.get("order", 0)
-            trade_tracker.add_trade(ticket, symbol, direction, price, sl_price, tp_price, confluence_score, fvg_signal)
+            trade_tracker.add_trade(ticket, symbol, direction, price, sl_price, tp_price, confluence_score, fvg_signal, strategy_context)
             logger.log_trade({
                 'symbol': symbol,
                 'direction': direction.upper(),
@@ -4316,7 +4537,7 @@ def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp
         
         ticket = getattr(res, 'order', 0)
         if ticket > 0:
-            trade_tracker.add_trade(ticket, symbol, direction, price, sl_price, tp_price, confluence_score, fvg_signal)
+            trade_tracker.add_trade(ticket, symbol, direction, price, sl_price, tp_price, confluence_score, fvg_signal, strategy_context)
         
         return res
         
@@ -4490,6 +4711,10 @@ def check_closed_trades_enhanced():
                             
                             outcome = "win" if profit > 0 else "loss"
                             global_state.update_learning(symbol, signal_type, outcome)
+                            global_state.confluence_manager.update_weights_from_trade(
+                                trade_info.get("strategy_context", {}),
+                                outcome
+                            )
                             
                             global_state.update_consecutive_losses(symbol, profit)
                             trade_tracker.update_consecutive_losses(profit)
@@ -4597,6 +4822,22 @@ def print_daily_summary_enhanced():
             'daily_pnl': daily_pnl,
             'consecutive_losses': trade_tracker.consecutive_losses
         })
+
+        if telemetry_dashboard:
+            telemetry_dashboard.update_snapshot({
+                "metrics": {
+                    "balance": round(balance, 2),
+                    "equity": round(equity, 2),
+                    "floating_pnl": round(floating, 2),
+                    "win_rate": round(win_rate, 2),
+                    "profit_factor": round(profit_factor, 2),
+                    "sharpe_ratio": round(sharpe, 2),
+                    "max_drawdown_pct": round(global_state.max_drawdown, 2),
+                    "daily_trades": global_state.daily_trades_count,
+                    "daily_pnl": round(daily_pnl, 2),
+                    "consecutive_losses": trade_tracker.consecutive_losses
+                }
+            })
         
     except Exception as e:
         logger.logger.error(f"print_daily_summary_enhanced error: {e}")
@@ -4610,22 +4851,43 @@ class BacktestEngine:
         self.data_files = data_files
         self.starting_balance = starting_balance
 
-    def run(self):
+    def run(self, weight_overrides: Optional[Dict[str, Dict[str, float]]] = None):
         logger.logger.info("Backtest mode active - starting simulation")
         results = {}
+        original_overrides = global_state.confluence_manager.weight_overrides
+        global_state.confluence_manager.set_weight_overrides(weight_overrides)
 
-        for symbol, path in self.data_files.items():
-            if not os.path.exists(path):
-                logger.logger.warning(f"Backtest file missing for {symbol}: {path}")
+        try:
+            dataframes = {}
+            for symbol, path in self.data_files.items():
+                if not os.path.exists(path):
+                    logger.logger.warning(f"Backtest file missing for {symbol}: {path}")
+                    continue
+
+                df = pd.read_csv(path)
+                if "time" in df.columns:
+                    df["time"] = pd.to_datetime(df["time"])
+                df = calc_indicators_safe(df)
+                dataframes[symbol] = df
+
+            results = self.run_on_dataframes(dataframes)
+            logger.logger.info("Backtest results:")
+            for symbol, stats in results.items():
+                logger.logger.info(f"{symbol}: Balance={stats['ending_balance']:.2f}, "
+                                 f"WinRate={stats['win_rate']:.1f}%, "
+                                 f"Sharpe={stats['sharpe_ratio']:.2f}, "
+                                 f"MaxDD={stats['max_drawdown']:.2f}%")
+            return results
+        finally:
+            global_state.confluence_manager.set_weight_overrides(original_overrides)
+
+    def run_on_dataframes(self, dataframes: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, float]]:
+        results = {}
+        for symbol, df in dataframes.items():
+            if df is None or df.empty:
                 continue
 
-            df = pd.read_csv(path)
-            if "time" in df.columns:
-                df["time"] = pd.to_datetime(df["time"])
-            df = calc_indicators_safe(df)
-
             balance = self.starting_balance
-            equity = balance
             tracker = PerformanceTracker(balance)
             open_position = None
             wins = 0
@@ -4641,9 +4903,10 @@ class BacktestEngine:
                     direction = open_position["direction"]
                     sl = open_position["sl"]
                     tp = open_position["tp"]
-                    if (direction == "buy" and ((sl and price <= sl) or (tp and price >= tp))) or \
-                       (direction == "sell" and ((sl and price >= sl) or (tp and price <= tp))):
-                        exit_price = sl if sl and ((direction == "buy" and price <= sl) or (direction == "sell" and price >= sl)) else tp
+                    hit_sl = sl and ((direction == "buy" and price <= sl) or (direction == "sell" and price >= sl))
+                    hit_tp = tp and ((direction == "buy" and price >= tp) or (direction == "sell" and price <= tp))
+                    if hit_sl or hit_tp:
+                        exit_price = sl if hit_sl else tp
                         diff = exit_price - open_position["entry_price"]
                         if direction == "sell":
                             diff = -diff
@@ -4685,14 +4948,79 @@ class BacktestEngine:
                 "sharpe_ratio": tracker.sharpe_ratio(),
                 "max_drawdown": tracker.max_drawdown
             }
-
-        logger.logger.info("Backtest results:")
-        for symbol, stats in results.items():
-            logger.logger.info(f"{symbol}: Balance={stats['ending_balance']:.2f}, "
-                             f"WinRate={stats['win_rate']:.1f}%, "
-                             f"Sharpe={stats['sharpe_ratio']:.2f}, "
-                             f"MaxDD={stats['max_drawdown']:.2f}%")
         return results
+
+
+class WalkForwardTester:
+    """Walk-forward testing framework with rolling windows."""
+
+    def __init__(self, data_files: Dict[str, str], starting_balance: float):
+        self.data_files = data_files
+        self.starting_balance = starting_balance
+
+    def run(self, window_bars: int, step_bars: int) -> Dict[str, List[Dict[str, Any]]]:
+        results = {}
+        for symbol, path in self.data_files.items():
+            if not os.path.exists(path):
+                logger.logger.warning(f"Walk-forward file missing for {symbol}: {path}")
+                continue
+
+            df = pd.read_csv(path)
+            if "time" in df.columns:
+                df["time"] = pd.to_datetime(df["time"])
+            df = calc_indicators_safe(df)
+            symbol_results = []
+
+            start = 0
+            while start + window_bars < len(df):
+                train_end = start + window_bars
+                test_end = min(train_end + step_bars, len(df))
+                test_df = df.iloc[train_end:test_end].reset_index(drop=True)
+                if test_df.empty:
+                    break
+
+                engine = BacktestEngine({}, self.starting_balance)
+                window_result = engine.run_on_dataframes({symbol: test_df})
+                if symbol in window_result:
+                    summary = window_result[symbol]
+                    summary.update({
+                        "train_start": int(start),
+                        "train_end": int(train_end),
+                        "test_end": int(test_end)
+                    })
+                    symbol_results.append(summary)
+                start += step_bars
+
+            results[symbol] = symbol_results
+        return results
+
+
+class StrategyBacktestComparer:
+    """Compare multiple strategy weight presets in backtest."""
+
+    def __init__(self, engine: BacktestEngine):
+        self.engine = engine
+
+    def compare(self, presets: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None) -> Dict[str, Dict[str, Dict[str, float]]]:
+        if presets is None:
+            presets = {
+                "baseline": {},
+                "trend_heavy": {
+                    "trending": {'trend_following': 0.45, 'crt': 0.2, 'snr': 0.2, 'fvg': 0.1, 'liquidity': 0.05}
+                },
+                "mean_reversion": {
+                    "ranging": {'trend_following': 0.15, 'crt': 0.35, 'snr': 0.35, 'fvg': 0.1, 'liquidity': 0.05}
+                },
+                "liquidity_focus": {
+                    "volatile": {'trend_following': 0.2, 'crt': 0.2, 'snr': 0.25, 'fvg': 0.15, 'liquidity': 0.2}
+                }
+            }
+
+        comparisons = {}
+        for name, override in presets.items():
+            result = self.engine.run(weight_overrides=override or None)
+            comparisons[name] = result
+        return comparisons
 
 # ==================== ENHANCED MAIN TRADING LOOP WITH FVG AND LIQUIDITY ====================
 def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
@@ -4999,8 +5327,22 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 if liquidity_signal_active:
                     confluence_score += config.LIQUIDITY_CONFLUENCE_WEIGHT
                 
-                res = send_trade_safe(symbol, chosen_dir, lot, sl_price, tp_price, 
-                                    short_reason, confluence_score, fvg_signal_active)
+                signals_key = 'buy_signals' if chosen_dir == 'buy' else 'sell_signals'
+                signal_sets = confluence_result.get(signals_key, {})
+                strategy_votes = {
+                    'trend_following': sum(s.get('confidence', 0.5) for s in signal_sets.get('trend', [])),
+                    'crt': sum(s.get('confidence', 0.0) for s in signal_sets.get('crt', [])),
+                    'snr': sum(s.get('confidence', 0.0) for s in signal_sets.get('snr', [])),
+                    'fvg': sum(s.get('confidence', 0.0) for s in signal_sets.get('fvg', [])),
+                    'liquidity': sum(s.get('confidence', 0.0) for s in signal_sets.get('liquidity', []))
+                }
+                strategy_context = {
+                    "market_regime": market_regime,
+                    "strategy_votes": strategy_votes
+                }
+
+                res = send_trade_safe(symbol, chosen_dir, lot, sl_price, tp_price,
+                                    short_reason, confluence_score, fvg_signal_active, strategy_context)
                 
                 if res is None:
                     logger.logger.warning(f"{nowstr()} {symbol}: trade attempt failed. mt5.last_error={mt5.last_error()}")
@@ -5042,6 +5384,32 @@ def main_enhanced():
     try:
         if config.BACKTEST_MODE:
             backtester = BacktestEngine(config.BACKTEST_DATA_FILES, STARTING_BALANCE)
+            if config.WALK_FORWARD_ENABLED:
+                wf_tester = WalkForwardTester(config.BACKTEST_DATA_FILES, STARTING_BALANCE)
+                results = wf_tester.run(config.WALK_FORWARD_WINDOW_BARS, config.WALK_FORWARD_STEP_BARS)
+                logger.logger.info(f"Walk-forward results: {results}")
+                return
+            if config.BACKTEST_COMPARE_ENABLED:
+                comparer = StrategyBacktestComparer(backtester)
+                results = comparer.compare()
+                output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), config.BACKTEST_COMPARE_OUTPUT)
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                with open(output_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["preset", "symbol", "ending_balance", "win_rate", "profit_factor", "sharpe_ratio", "max_drawdown"])
+                    for preset, preset_results in results.items():
+                        for symbol, stats in preset_results.items():
+                            writer.writerow([
+                                preset,
+                                symbol,
+                                stats.get("ending_balance"),
+                                stats.get("win_rate"),
+                                stats.get("profit_factor"),
+                                stats.get("sharpe_ratio"),
+                                stats.get("max_drawdown")
+                            ])
+                logger.logger.info(f"Backtest comparison saved to {output_path}")
+                return
             backtester.run()
             return
 
