@@ -844,6 +844,13 @@ class BotConfig:
     MOMENTUM_CONFIRMATION_REQUIRED: bool = True
     MIN_MOMENTUM_STRENGTH: float = 0.6
     ENTRY_DELAY_BARS: int = 2
+    AUTO_RELAX_FILTERS: bool = True
+    NO_TRADE_RELAX_MINUTES: int = 30
+    RELAX_MIN_RR_RATIO: float = 1.6
+    RELAX_MIN_MOMENTUM: float = 0.45
+    RELAX_MIN_ATR_PCT: float = 0.85
+    RELAX_MAX_SPREAD_MULTIPLIER: float = 2.5
+    RELAX_MIN_TREND_STRENGTH: float = 0.45
 
     # ==== HTF Confirmation ====
     HTF_H4_TF: int = mt5.TIMEFRAME_H4
@@ -1088,6 +1095,12 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("MIN_RISK_REWARD must be greater than 0.")
     if bot_config.MIN_RR_RATIO <= 0:
         errors.append("MIN_RR_RATIO must be greater than 0.")
+    if bot_config.RELAX_MIN_RR_RATIO <= 0:
+        errors.append("RELAX_MIN_RR_RATIO must be greater than 0.")
+    if not (0 < bot_config.RELAX_MIN_ATR_PCT <= 1.0):
+        errors.append("RELAX_MIN_ATR_PCT must be between 0 and 1.")
+    if not (0 <= bot_config.RELAX_MIN_TREND_STRENGTH <= 1.0):
+        errors.append("RELAX_MIN_TREND_STRENGTH must be between 0 and 1.")
     if not (0 < bot_config.RISK_PER_TRADE_PCT <= 100):
         errors.append("RISK_PER_TRADE_PCT must be between 0 and 100.")
     if bot_config.MAX_TRADE_DURATION_MINUTES <= 0:
@@ -3567,13 +3580,16 @@ class TradeFilter:
         self.max_spread_multiplier = 2.0
         self.time_since_last_signal = 300
     
-    def filter_trade(self, signal: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
+    def filter_trade(self, signal: Dict[str, Any], market_data: Dict[str, Any],
+                     min_trend_strength: Optional[float] = None,
+                     max_spread_multiplier: Optional[float] = None,
+                     min_rr_ratio: Optional[float] = None) -> bool:
         filters = [
             self._check_volume(signal, market_data),
-            self._check_trend_alignment(signal, market_data),
-            self._check_spread(signal, market_data),
+            self._check_trend_alignment(signal, market_data, min_trend_strength),
+            self._check_spread(signal, market_data, max_spread_multiplier),
             self._check_time_filter(signal, market_data),
-            self._check_risk_reward(signal, market_data)
+            self._check_risk_reward(signal, market_data, min_rr_ratio)
         ]
         return all(filters)
     
@@ -3581,16 +3597,20 @@ class TradeFilter:
         volume_ratio = market_data.get("volume_ratio", 1.0)
         return volume_ratio >= self.min_volume_ratio
     
-    def _check_trend_alignment(self, signal: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
+    def _check_trend_alignment(self, signal: Dict[str, Any], market_data: Dict[str, Any],
+                               min_trend_strength: Optional[float]) -> bool:
         trend_strength = market_data.get("trend_strength", 0.0)
-        return trend_strength >= self.min_trend_strength
+        threshold = self.min_trend_strength if min_trend_strength is None else min_trend_strength
+        return trend_strength >= threshold
     
-    def _check_spread(self, signal: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
+    def _check_spread(self, signal: Dict[str, Any], market_data: Dict[str, Any],
+                      max_spread_multiplier: Optional[float]) -> bool:
         spread_points = market_data.get("spread_points", 0.0)
         avg_spread = market_data.get("avg_spread_points", spread_points)
         if avg_spread == 0:
             return True
-        return spread_points <= avg_spread * self.max_spread_multiplier
+        multiplier = self.max_spread_multiplier if max_spread_multiplier is None else max_spread_multiplier
+        return spread_points <= avg_spread * multiplier
     
     def _check_time_filter(self, signal: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
         last_signal_time = market_data.get("last_signal_time")
@@ -3598,9 +3618,11 @@ class TradeFilter:
             return True
         return (time.time() - last_signal_time) >= self.time_since_last_signal
     
-    def _check_risk_reward(self, signal: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
+    def _check_risk_reward(self, signal: Dict[str, Any], market_data: Dict[str, Any],
+                           min_rr_ratio: Optional[float]) -> bool:
         rr_ratio = market_data.get("rr_ratio", 0.0)
-        return rr_ratio >= config.MIN_RR_RATIO
+        threshold = config.MIN_RR_RATIO if min_rr_ratio is None else min_rr_ratio
+        return rr_ratio >= threshold
 
 class AdaptiveTrading:
     """Adjust trading based on recent performance"""
@@ -3671,10 +3693,12 @@ class EnhancedGlobalState:
         self.daily_trades_count = 0
         self.daily_loss_triggered = False
         self.last_summary_time = time.time()
+        self.start_time = time.time()
         self.peak_equity = starting_balance
         self.max_drawdown = 0.0
         self.last_trade_time = {s: 0 for s in config.SYMBOLS}
         self.last_forced_time = {s: 0 for s in config.SYMBOLS}
+        self.last_trade_attempt = {s: 0 for s in config.SYMBOLS}
         self.last_signal_time = {s: None for s in config.SYMBOLS}
         self.last_signal_dir = {s: None for s in config.SYMBOLS}
         self.signal_stats = self._load_learning_stats()
@@ -5117,7 +5141,16 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 continue
             
             bar = df.iloc[-1]
-            if float(bar.get('atr', 0)) < config.MIN_ATR:
+            relax_mode = False
+            if config.AUTO_RELAX_FILTERS:
+                last_attempt = global_state.last_trade_attempt.get(symbol, 0)
+                if last_attempt and (time.time() - last_attempt) >= config.NO_TRADE_RELAX_MINUTES * 60:
+                    relax_mode = True
+                elif not last_attempt and (time.time() - global_state.start_time) >= config.NO_TRADE_RELAX_MINUTES * 60:
+                    relax_mode = True
+
+            atr_threshold = config.MIN_ATR * (config.RELAX_MIN_ATR_PCT if relax_mode else 1.0)
+            if float(bar.get('atr', 0)) < atr_threshold:
                 time.sleep(1)
                 continue
             
@@ -5211,6 +5244,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 logger.logger.info(f"{nowstr()} {symbol}: FORCE TRADE -> {chosen_dir}")
             
             if chosen_dir:
+                global_state.last_trade_attempt[symbol] = time.time()
                 signal_timestamp = global_state.last_signal_time.get(symbol)
                 signal_dir = global_state.last_signal_dir.get(symbol)
                 if signal_timestamp is None or signal_dir != chosen_dir:
@@ -5227,7 +5261,8 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
 
                 if config.MOMENTUM_CONFIRMATION_REQUIRED:
                     confirmed, strength = calculate_momentum_strength(df, chosen_dir)
-                    if not confirmed or strength < config.MIN_MOMENTUM_STRENGTH:
+                    min_momentum = config.RELAX_MIN_MOMENTUM if relax_mode else config.MIN_MOMENTUM_STRENGTH
+                    if not confirmed or strength < min_momentum:
                         logger.logger.info(f"{nowstr()} {symbol}: momentum filter failed strength={strength:.2f}")
                         time.sleep(0.2)
                         continue
@@ -5335,8 +5370,9 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 risk = abs(entry_price - sl_price)
                 reward = abs(tp_price - entry_price)
                 rr = (reward / risk) if risk > 0 else 0
-                if rr < config.MIN_RR_RATIO:
-                    logger.logger.info(f"{nowstr()} {symbol}: R:R {rr:.2f} below minimum {config.MIN_RR_RATIO}, skipping")
+                min_rr = config.RELAX_MIN_RR_RATIO if relax_mode else config.MIN_RR_RATIO
+                if rr < min_rr:
+                    logger.logger.info(f"{nowstr()} {symbol}: R:R {rr:.2f} below minimum {min_rr}, skipping")
                     time.sleep(0.2)
                     continue
 
@@ -5348,7 +5384,13 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     "last_signal_time": global_state.last_trade_time.get(symbol, 0),
                     "rr_ratio": rr
                 }
-                if not global_state.trade_filter.filter_trade({"direction": chosen_dir}, market_data):
+                if not global_state.trade_filter.filter_trade(
+                    {"direction": chosen_dir},
+                    market_data,
+                    min_trend_strength=(config.RELAX_MIN_TREND_STRENGTH if relax_mode else None),
+                    max_spread_multiplier=(config.RELAX_MAX_SPREAD_MULTIPLIER if relax_mode else None),
+                    min_rr_ratio=min_rr
+                ):
                     logger.logger.info(f"{nowstr()} {symbol}: trade filter blocked entry")
                     time.sleep(0.2)
                     continue
