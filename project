@@ -3156,6 +3156,7 @@ class AutomatedSupervisor:
             try:
                 if thread_manager.stop_event.is_set():
                     break
+                thread_manager.heartbeat(threading.current_thread().name)
                 self.monitor_all_threads()
                 time.sleep(5)
             except Exception as e:
