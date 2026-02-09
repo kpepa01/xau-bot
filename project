@@ -1578,11 +1578,31 @@ class TelemetryDashboard:
     """Generate a lightweight HTML/JSON dashboard from latest performance data."""
 
     def __init__(self, output_dir: str, logger_instance: AutomatedLogger):
-        self.output_dir = output_dir
         self.logger_instance = logger_instance
-        os.makedirs(self.output_dir, exist_ok=True)
+        self.output_dir = self._resolve_output_dir(output_dir)
         self.snapshot_path = os.path.join(self.output_dir, "telemetry_snapshot.json")
         self.html_path = os.path.join(self.output_dir, "telemetry_dashboard.html")
+
+    def _resolve_output_dir(self, output_dir: str) -> str:
+        candidates = [output_dir]
+        if self.logger_instance and getattr(self.logger_instance, "log_dir", None):
+            candidates.append(os.path.join(self.logger_instance.log_dir, "telemetry"))
+        candidates.append(os.path.join(os.path.expanduser("~"), "xau_bot_reports"))
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                os.makedirs(candidate, exist_ok=True)
+                return candidate
+            except PermissionError:
+                continue
+            except OSError:
+                continue
+
+        fallback = os.path.join(os.getcwd(), "telemetry_reports")
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
 
     def update_snapshot(self, snapshot: Dict[str, Any]) -> None:
         try:
