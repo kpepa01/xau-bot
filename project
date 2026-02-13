@@ -2647,19 +2647,36 @@ class TradeTracker:
     
     def _infer_trade_volume(self, ticket: int, symbol: str) -> Optional[float]:
         positions = get_positions_safe(symbol)
-        if not positions:
-            return None
+        if positions:
+            for pos in positions:
+                pos_ticket = getattr(pos, 'ticket', None)
+                if pos_ticket != ticket:
+                    continue
+                vol = getattr(pos, 'volume', None)
+                if vol is not None:
+                    try:
+                        return float(vol)
+                    except Exception:
+                        return None
 
-        for pos in positions:
-            pos_ticket = getattr(pos, 'ticket', None)
-            if pos_ticket != ticket:
-                continue
-            vol = getattr(pos, 'volume', None)
-            if vol is not None:
-                try:
-                    return float(vol)
-                except Exception:
-                    return None
+            # If ticket mapping failed, infer from single live symbol position.
+            if len(positions) == 1:
+                vol = getattr(positions[0], 'volume', None)
+                if vol is not None:
+                    try:
+                        return float(vol)
+                    except Exception:
+                        return None
+
+        # Last resort for paper mode / metadata-only mode: use symbol minimum lot.
+        info = get_symbol_info_safe(symbol)
+        volume_min = getattr(info, 'volume_min', None) if info is not None else None
+        if volume_min is not None:
+            try:
+                return float(volume_min)
+            except Exception:
+                return None
+
         return None
 
     def _calculate_risk_per_pip(self, symbol: str, lot_size: float) -> float:
@@ -3767,6 +3784,8 @@ class EnhancedGlobalState:
         self.recent_performance = deque(maxlen=20)
         self.correlation_data: Dict[str, Dict[str, float]] = {}
         self.news_events: List[Dict[str, Any]] = []
+        self.last_news_refresh = 0.0
+        self.last_correlation_refresh = 0.0
         self.trade_memory_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'recent_trades.json')
         self.recent_trade_levels: List[Dict[str, Any]] = self._load_recent_trade_levels()
         self.lock = threading.RLock()
@@ -3800,6 +3819,61 @@ class EnhancedGlobalState:
             })
             self.recent_trade_levels = self.recent_trade_levels[-200:]
             self._persist_recent_trade_levels()
+
+    def update_news_events(self) -> None:
+        """Best-effort refresh of news events cache used by is_news_window."""
+        try:
+            now = datetime.now()
+            events: List[Dict[str, Any]] = []
+            start = now - timedelta(hours=2)
+            end = now + timedelta(hours=24)
+
+            if hasattr(mt5, "calendar_events_get"):
+                raw = mt5.calendar_events_get(start, end)
+                if raw:
+                    for ev in raw:
+                        event_time = getattr(ev, "time", None)
+                        if isinstance(event_time, (int, float)):
+                            event_time = datetime.fromtimestamp(event_time)
+                        if not isinstance(event_time, datetime):
+                            continue
+                        events.append({
+                            "time": event_time,
+                            "impact": getattr(ev, "importance", ""),
+                            "title": getattr(ev, "name", ""),
+                            "currency": getattr(ev, "currency", ""),
+                        })
+
+            self.news_events = events
+        except Exception as e:
+            logger.log_error('update_news_events', str(e), 'WARNING')
+
+    def update_correlation_data(self) -> None:
+        """Populate rolling correlation data for configured symbol pairs."""
+        try:
+            snapshot: Dict[str, Dict[str, float]] = {}
+            for symbol, pairs in config.CORRELATION_PAIRS.items():
+                base_df = get_bars_enhanced(symbol, config.ENTRY_TF, 200)
+                if base_df.empty or 'close' not in base_df.columns:
+                    continue
+                base_ret = np.log(base_df['close']).diff().dropna()
+                if len(base_ret) < 20:
+                    continue
+                pair_map: Dict[str, float] = {}
+                for pair in pairs:
+                    pair_df = get_bars_enhanced(pair, config.ENTRY_TF, 200)
+                    if pair_df.empty or 'close' not in pair_df.columns:
+                        continue
+                    pair_ret = np.log(pair_df['close']).diff().dropna()
+                    aligned = pd.concat([base_ret, pair_ret], axis=1).dropna()
+                    if len(aligned) < 20:
+                        continue
+                    pair_map[pair] = float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1]))
+                if pair_map:
+                    snapshot[symbol] = pair_map
+            self.correlation_data = snapshot
+        except Exception as e:
+            logger.log_error('update_correlation_data', str(e), 'WARNING')
 
     def is_duplicate_level(self, symbol: str, direction: str, price: float, tolerance: float) -> bool:
         with self.lock:
@@ -4068,15 +4142,18 @@ def detect_market_condition_enhanced(df: pd.DataFrame) -> Dict[str, Any]:
         
         atr_pct = atr / df['close'].iloc[-1] if df['close'].iloc[-1] > 0 else 0.0
 
+        trend_ratio = abs(np.mean(returns)) / atr_pct if atr_pct > 0 else 0.0
+        trend_threshold = 0.5
+
         if volatility > 0.03:
             condition['regime'] = 'volatile'
-        elif atr_pct > 0 and abs(np.mean(returns)) / atr_pct > 0.5:
+        elif trend_ratio > trend_threshold:
             condition['regime'] = 'trending'
         else:
             condition['regime'] = 'ranging'
         
         condition['volatility'] = volatility
-        condition['trend_strength'] = abs(np.mean(returns)) / atr_pct if atr_pct > 0 else 0
+        condition['trend_strength'] = trend_ratio
         condition['adx_value'] = atr / df['close'].iloc[-1] * 100 if df['close'].iloc[-1] > 0 else 0
     
     return condition
@@ -5264,6 +5341,15 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 global_state.reset_daily_stats()
             
             global_state.update_daily_stats()
+
+            # Refresh optional market context used by soft/conditional filters.
+            now_ts = time.time()
+            if now_ts - global_state.last_news_refresh >= 300:
+                global_state.update_news_events()
+                global_state.last_news_refresh = now_ts
+            if now_ts - global_state.last_correlation_refresh >= 300:
+                global_state.update_correlation_data()
+                global_state.last_correlation_refresh = now_ts
             
             if time.time() - global_state.last_summary_time > config.SUMMARY_INTERVAL:
                 print_daily_summary_enhanced()
@@ -5378,6 +5464,8 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             
             chosen_dir = confluence_result['direction']
             confluence_score = confluence_result.get('confluence_score', 0)
+            if not session_preferred and chosen_dir:
+                confluence_score = max(0, confluence_score - 1)
             forced_trade = False
             
             chosen_reasons = []
