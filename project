@@ -888,6 +888,7 @@ class BotConfig:
     MIN_PROFIT_FOR_MOVE: float = 6.0
     BREAKEVEN_AT_PIPS: float = 60.0
     BREAKEVEN_MIN_PROFIT: float = 6.0
+    TRAIL_PROFIT_STEP_USD: float = 7.0
 
     # ==== Daily Protection ====
     DAILY_LOSS_PCT: float = 3.0
@@ -1117,6 +1118,8 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("MIN_CLASSIC_CONFLUENCE cannot be negative.")
     if bot_config.MAX_TRADE_DURATION_MINUTES <= 0:
         errors.append("MAX_TRADE_DURATION_MINUTES must be greater than 0.")
+    if bot_config.TRAIL_PROFIT_STEP_USD <= 0:
+        errors.append("TRAIL_PROFIT_STEP_USD must be greater than 0.")
     if bot_config.BACKTEST_MODE:
         missing_files = [
             sym for sym, path in bot_config.BACKTEST_DATA_FILES.items()
@@ -2680,91 +2683,71 @@ class TradeTracker:
             profit_usd = points * trade['risk_per_pip'] * 0.1
             return profit_usd
     
+    def _sl_for_locked_profit_usd(self, trade: Dict[str, Any], lock_usd: float) -> float:
+        """Convert a desired locked USD profit into an SL price."""
+        if lock_usd <= 0:
+            return trade['entry_price']
+
+        usd_per_point = trade['risk_per_pip'] * 0.1
+        if usd_per_point <= 0:
+            return trade['entry_price']
+
+        points_to_lock = lock_usd / usd_per_point
+        price_offset = points_to_lock * trade['point_value']
+
+        if trade['direction'] == 'buy':
+            return trade['entry_price'] + price_offset
+        return trade['entry_price'] - price_offset
+
     def update_trade(self, ticket: int, current_price: float) -> Optional[Tuple[float, str]]:
-        """Update trade and return (new_sl, reason) if needed"""
+        """Intelligent trailing: +7$ -> BE, +14$ -> +7$, +21$ -> +14$, dynamic after."""
         with self.lock:
             if ticket not in self.trades:
                 return None
-            
+
             trade = self.trades[ticket]
             direction = trade['direction']
             entry_price = trade['entry_price']
             current_sl = trade['current_sl']
-            
+
             current_profit_pips = self.calculate_current_profit_pips(ticket, current_price)
             current_profit_usd = self.calculate_current_profit_usd(ticket, current_price)
-            
             logger.logger.debug(f"Trade {ticket}: {current_profit_pips:.1f} pips profit, ${current_profit_usd:.2f} USD")
-            
-            if not trade['breakeven_moved']:
-                should_move_breakeven = False
-                reason = ""
-                
-                if current_profit_pips >= config.BREAKEVEN_AT_PIPS:
-                    should_move_breakeven = True
-                    reason = f"Breakeven at {current_profit_pips:.1f} pips"
-                
-                if current_profit_usd >= config.BREAKEVEN_MIN_PROFIT:
-                    should_move_breakeven = True
-                    reason = f"Breakeven at ${current_profit_usd:.2f} profit"
-                
-                if should_move_breakeven:
-                    new_sl = entry_price
-                    if (direction == 'buy' and new_sl > current_sl) or \
-                       (direction == 'sell' and new_sl < current_sl):
-                        trade['current_sl'] = new_sl
-                        trade['breakeven_moved'] = True
-                        trade['last_move_pips'] = current_profit_pips
-                        trade['last_move_profit_usd'] = current_profit_usd
-                        logger.logger.info(f"Moving to breakeven: {reason}")
-                        return (new_sl, f"breakeven_{reason}")
-            
-            target_pips = 0
-            for pips, threshold_price in trade['pip_thresholds']:
-                if direction == 'buy' and current_price >= threshold_price:
-                    target_pips = pips
-                elif direction == 'sell' and current_price <= threshold_price:
-                    target_pips = pips
-            
-            target_profit_usd = 0
-            if current_profit_usd >= config.MIN_PROFIT_FOR_MOVE:
-                profit_increments = range(7, int(current_profit_usd) + 7, 7)
-                for increment in profit_increments:
-                    if current_profit_usd >= increment:
-                        target_profit_usd = increment
-            
-            move_triggered = False
-            move_reason = ""
-            
-            if target_pips > trade['last_move_pips']:
-                move_triggered = True
-                move_reason = f"{target_pips}_pips"
-            elif target_profit_usd > trade['last_move_profit_usd']:
-                move_triggered = True
-                move_reason = f"${target_profit_usd}_profit"
-            
-            if move_triggered:
-                if not trade['breakeven_moved']:
-                    new_sl = entry_price
-                    move_reason = f"breakeven_{move_reason}"
-                else:
-                    if direction == 'buy':
-                        new_sl = current_price - (70 * trade['pip_value'])
-                        new_sl = max(new_sl, entry_price, current_sl)
-                    else:
-                        new_sl = current_price + (70 * trade['pip_value'])
-                        new_sl = min(new_sl, entry_price, current_sl)
-                
-                if (direction == 'buy' and new_sl > current_sl) or \
-                   (direction == 'sell' and new_sl < current_sl):
-                    trade['current_sl'] = new_sl
-                    trade['last_move_pips'] = max(trade['last_move_pips'], target_pips)
-                    trade['last_move_profit_usd'] = max(trade['last_move_profit_usd'], target_profit_usd)
-                    logger.logger.info(f"Moving SL: {move_reason}, new SL: {new_sl:.5f} (profit: {current_profit_pips:.1f} pips, ${current_profit_usd:.2f})")
-                    return (new_sl, move_reason)
-            
-            return None
-    
+
+            if current_profit_usd < config.TRAIL_PROFIT_STEP_USD:
+                return None
+
+            step = int(current_profit_usd // config.TRAIL_PROFIT_STEP_USD)
+            lock_usd = max(0.0, (step - 1) * config.TRAIL_PROFIT_STEP_USD)
+
+            if lock_usd <= 0:
+                proposed_sl = entry_price
+                reason = "trail_be_at_$7"
+                trade['breakeven_moved'] = True
+            else:
+                proposed_sl = self._sl_for_locked_profit_usd(trade, lock_usd)
+                reason = f"trail_lock_${lock_usd:.2f}"
+
+            if direction == 'buy':
+                new_sl = max(proposed_sl, current_sl)
+                valid_move = new_sl > current_sl
+            else:
+                new_sl = min(proposed_sl, current_sl)
+                valid_move = new_sl < current_sl
+
+            if not valid_move:
+                return None
+
+            trade['current_sl'] = new_sl
+            trade['last_move_pips'] = max(trade.get('last_move_pips', 0.0), current_profit_pips)
+            trade['last_move_profit_usd'] = max(trade.get('last_move_profit_usd', 0.0), lock_usd)
+
+            logger.logger.info(
+                f"Intelligent trailing for {ticket}: SL -> {new_sl:.5f} | "
+                f"profit=${current_profit_usd:.2f} | lock_target=${lock_usd:.2f}"
+            )
+            return (new_sl, reason)
+
     def remove_trade(self, ticket: int):
         with self.lock:
             if ticket in self.trades:
