@@ -815,12 +815,13 @@ class BotConfig:
     MAX_TRADES_PER_SYMBOL: int = 2
     MAX_POSITIONS_TOTAL: int = 4
     MAX_LOSS_PER_TRADE: float = 15.0
+    MIN_RISK_PER_TRADE_USD: float = 5.0
     DYNAMIC_POSITION_SIZING: bool = True
     RISK_PER_TRADE_PCT: float = 1.0
     VOLATILITY_ADJUSTED_SL: bool = True
     MIN_RR_RATIO: float = 2.0
 
-    COOLDOWN: int = 1400
+    COOLDOWN: int = 1800
     FORCE_TRADE_EVERY: int = 1400
 
     # ==== Indicator Settings ====
@@ -851,6 +852,11 @@ class BotConfig:
     RELAX_MIN_ATR_PCT: float = 0.85
     RELAX_MAX_SPREAD_MULTIPLIER: float = 2.5
     RELAX_MIN_TREND_STRENGTH: float = 0.45
+    MTF_CONFIRMATION_REQUIRED: bool = True
+    MIN_SMC_CONFLUENCE: int = 2
+    MIN_CLASSIC_CONFLUENCE: int = 1
+    AVOID_DUPLICATE_LEVEL_TRADES: bool = True
+    DUPLICATE_LEVEL_TOLERANCE_ATR: float = 0.2
 
     # ==== HTF Confirmation ====
     HTF_H4_TF: int = mt5.TIMEFRAME_H4
@@ -1103,6 +1109,12 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("RELAX_MIN_TREND_STRENGTH must be between 0 and 1.")
     if not (0 < bot_config.RISK_PER_TRADE_PCT <= 100):
         errors.append("RISK_PER_TRADE_PCT must be between 0 and 100.")
+    if bot_config.MIN_RISK_PER_TRADE_USD < 0:
+        errors.append("MIN_RISK_PER_TRADE_USD cannot be negative.")
+    if bot_config.MIN_SMC_CONFLUENCE < 0:
+        errors.append("MIN_SMC_CONFLUENCE cannot be negative.")
+    if bot_config.MIN_CLASSIC_CONFLUENCE < 0:
+        errors.append("MIN_CLASSIC_CONFLUENCE cannot be negative.")
     if bot_config.MAX_TRADE_DURATION_MINUTES <= 0:
         errors.append("MAX_TRADE_DURATION_MINUTES must be greater than 0.")
     if bot_config.BACKTEST_MODE:
@@ -1353,6 +1365,13 @@ class AutomatedLogger:
         # Add handlers
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
+
+        # Standard runtime log in local repo folder
+        runtime_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs', 'runtime_log.txt')
+        runtime_handler = logging.FileHandler(runtime_log, encoding='utf-8')
+        runtime_handler.setLevel(logging.INFO)
+        runtime_handler.setFormatter(simple_formatter)
+        self.logger.addHandler(runtime_handler)
     
     def log_error(self, function_name: str, error_message: str, severity: str = "ERROR", 
                   symbol: str = "", line_number: str = "", thread_id: str = ""):
@@ -3712,8 +3731,62 @@ class EnhancedGlobalState:
         self.recent_performance = deque(maxlen=20)
         self.correlation_data: Dict[str, Dict[str, float]] = {}
         self.news_events: List[Dict[str, Any]] = []
+        self.trade_memory_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'recent_trades.json')
+        self.recent_trade_levels: List[Dict[str, Any]] = self._load_recent_trade_levels()
         self.lock = threading.RLock()
     
+    def _load_recent_trade_levels(self) -> List[Dict[str, Any]]:
+        try:
+            if os.path.exists(self.trade_memory_file):
+                with open(self.trade_memory_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        return data[-200:]
+        except Exception as e:
+            logger.log_error('_load_recent_trade_levels', str(e), 'WARNING')
+        return []
+
+    def _persist_recent_trade_levels(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.trade_memory_file), exist_ok=True)
+            with open(self.trade_memory_file, 'w', encoding='utf-8') as f:
+                json.dump(self.recent_trade_levels[-200:], f, indent=2)
+        except Exception as e:
+            logger.log_error('_persist_recent_trade_levels', str(e), 'WARNING')
+
+    def record_trade_level(self, symbol: str, direction: str, price: float) -> None:
+        with self.lock:
+            self.recent_trade_levels.append({
+                'time': datetime.now().isoformat(),
+                'symbol': symbol,
+                'direction': direction,
+                'price': price
+            })
+            self.recent_trade_levels = self.recent_trade_levels[-200:]
+            self._persist_recent_trade_levels()
+
+    def is_duplicate_level(self, symbol: str, direction: str, price: float, tolerance: float) -> bool:
+        with self.lock:
+            now = datetime.now()
+            for item in reversed(self.recent_trade_levels[-100:]):
+                if item.get('symbol') != symbol or item.get('direction') != direction:
+                    continue
+                try:
+                    item_price = float(item.get('price', 0.0))
+                except Exception:
+                    continue
+                t = item.get('time')
+                if t:
+                    try:
+                        ts = datetime.fromisoformat(t)
+                        if (now - ts).total_seconds() > 6 * 3600:
+                            continue
+                    except Exception:
+                        pass
+                if abs(price - item_price) <= tolerance:
+                    return True
+            return False
+
     def _load_learning_stats(self):
         stats = {}
         learning_file = os.path.join(os.path.expanduser("~"), "Documents", "trade_learning_log.csv")
@@ -3994,7 +4067,61 @@ def calculate_momentum_strength(df: pd.DataFrame, direction: str) -> Tuple[bool,
         confirmed = rsi_val <= 50.0
     return confirmed, strength
 
+def is_macro_high_risk_time(now: datetime) -> bool:
+    """Simple built-in NFP/CPI risk-time detector for XAUUSD."""
+    # NFP (typically first Friday around 13:30 UTC)
+    if now.weekday() == 4 and now.day <= 7 and now.hour == 13 and 0 <= now.minute <= 59:
+        return True
+    # CPI (approx monthly mid-cycle around 13:30 UTC)
+    if 10 <= now.day <= 16 and now.hour == 13 and 0 <= now.minute <= 59:
+        return True
+    return False
+
+
+def get_mtf_alignment(df_h1: pd.DataFrame, df_h4: pd.DataFrame, direction: str) -> bool:
+    if df_h1.empty or df_h4.empty:
+        return False
+    for frame in (df_h1, df_h4):
+        if 'ema_fast' not in frame.columns or 'ema_slow' not in frame.columns:
+            return False
+    h1_fast, h1_slow = float(df_h1['ema_fast'].iloc[-1]), float(df_h1['ema_slow'].iloc[-1])
+    h4_fast, h4_slow = float(df_h4['ema_fast'].iloc[-1]), float(df_h4['ema_slow'].iloc[-1])
+    if direction == 'buy':
+        return h1_fast > h1_slow and h4_fast > h4_slow
+    return h1_fast < h1_slow and h4_fast < h4_slow
+
+
+def evaluate_fire_conditions(confluence_result: Dict[str, Any], direction: str) -> Tuple[bool, str]:
+    side = 'buy_signals' if direction == 'buy' else 'sell_signals'
+    side_signals = confluence_result.get(side, {})
+    smc_count = 0
+    if side_signals.get('fvg'):
+        smc_count += 1
+    if side_signals.get('liquidity'):
+        smc_count += 1
+    if side_signals.get('snr'):
+        smc_count += 1
+    classic_count = 0
+    if side_signals.get('trend'):
+        classic_count += 1
+    if side_signals.get('crt'):
+        classic_count += 1
+    if smc_count < config.MIN_SMC_CONFLUENCE:
+        return False, f'smc_confluence={smc_count}<{config.MIN_SMC_CONFLUENCE}'
+    if classic_count < config.MIN_CLASSIC_CONFLUENCE:
+        return False, f'classic_confluence={classic_count}<{config.MIN_CLASSIC_CONFLUENCE}'
+    return True, 'ok'
+
+
+def is_duplicate_trade_level(symbol: str, direction: str, entry_price: float, atr: float) -> bool:
+    if not config.AVOID_DUPLICATE_LEVEL_TRADES:
+        return False
+    tolerance = max(atr * config.DUPLICATE_LEVEL_TOLERANCE_ATR, 0.01)
+    return global_state.is_duplicate_level(symbol, direction, entry_price, tolerance)
+
 def is_news_window(events: List[Dict[str, Any]], now: datetime) -> bool:
+    if is_macro_high_risk_time(now):
+        return True
     if not events:
         return False
     for event in events:
@@ -4048,7 +4175,7 @@ def calculate_position_size(symbol: str, entry_price: float, sl_price: float) ->
     balance = float(getattr(account, "balance", 0.0))
     if balance <= 0:
         return config.LOT_FIXED
-    risk_amount = balance * (config.RISK_PER_TRADE_PCT / 100.0)
+    risk_amount = max(balance * (config.RISK_PER_TRADE_PCT / 100.0), config.MIN_RISK_PER_TRADE_USD)
     stop_points = abs(entry_price - sl_price)
     tick_value = getattr(info, "trade_tick_value", None)
     tick_size = getattr(info, "trade_tick_size", None)
@@ -5054,6 +5181,21 @@ class BacktestEngine:
                              f"WinRate={stats['win_rate']:.1f}%, "
                              f"Sharpe={stats['sharpe_ratio']:.2f}, "
                              f"MaxDD={stats['max_drawdown']:.2f}%")
+
+        try:
+            backtests_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backtests')
+            os.makedirs(backtests_dir, exist_ok=True)
+            report_path = os.path.join(backtests_dir, f"{datetime.now().date().isoformat()}_report.json")
+            with open(report_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'generated_at': datetime.now().isoformat(),
+                    'starting_balance': self.starting_balance,
+                    'results': results
+                }, f, indent=2)
+            logger.logger.info(f"Backtest report saved to {report_path}")
+        except Exception as e:
+            logger.log_error('BacktestEngine.run', f'Failed to write backtest report: {e}', 'WARNING')
+
         return results
 
 # ==================== ENHANCED MAIN TRADING LOOP WITH FVG AND LIQUIDITY ====================
@@ -5137,8 +5279,10 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             
             df = calc_indicators_safe(get_bars_enhanced(symbol, config.ENTRY_TF, 400))
             df_htf = calc_indicators_safe(get_bars_enhanced(symbol, config.HTF_TF, 250))
+            df_h1 = calc_indicators_safe(get_bars_enhanced(symbol, config.HTF_H1_TF, 250))
+            df_h4 = calc_indicators_safe(get_bars_enhanced(symbol, config.HTF_H4_TF, 250))
             
-            if df.empty or df_htf.empty:
+            if df.empty or df_htf.empty or df_h1.empty or df_h4.empty:
                 time.sleep(1)
                 continue
             
@@ -5248,6 +5392,17 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 forced_trade = True
             
             if chosen_dir:
+                ok_fire, fire_reason = evaluate_fire_conditions(confluence_result, chosen_dir)
+                if not ok_fire and not forced_trade:
+                    logger.logger.info(f"{nowstr()} {symbol}: fire conditions blocked ({fire_reason})")
+                    time.sleep(0.2)
+                    continue
+
+                if config.MTF_CONFIRMATION_REQUIRED and not get_mtf_alignment(df_h1, df_h4, chosen_dir) and not forced_trade:
+                    logger.logger.info(f"{nowstr()} {symbol}: MTF trend misalignment on H1/H4 for {chosen_dir}")
+                    time.sleep(0.2)
+                    continue
+
                 global_state.last_trade_attempt[symbol] = time.time()
                 signal_timestamp = global_state.last_signal_time.get(symbol)
                 signal_dir = global_state.last_signal_dir.get(symbol)
@@ -5290,7 +5445,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     continue
 
                 spread_points = get_spread_points(symbol)
-                if spread_points is not None and spread_points > config.MAX_SPREAD_POINTS:
+                if spread_points is not None and spread_points > config.MAX_SPREAD_POINTS and not forced_trade:
                     logger.logger.info(f"{nowstr()} {symbol}: spread {spread_points:.1f} > max {config.MAX_SPREAD_POINTS}, skipping")
                     time.sleep(0.2)
                     continue
@@ -5375,7 +5530,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 reward = abs(tp_price - entry_price)
                 rr = (reward / risk) if risk > 0 else 0
                 min_rr = config.RELAX_MIN_RR_RATIO if relax_mode else config.MIN_RR_RATIO
-                if rr < min_rr:
+                if rr < min_rr and not forced_trade:
                     logger.logger.info(f"{nowstr()} {symbol}: R:R {rr:.2f} below minimum {min_rr}, skipping")
                     time.sleep(0.2)
                     continue
@@ -5455,6 +5610,11 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 if liquidity_signal_active:
                     confluence_score += config.LIQUIDITY_CONFLUENCE_WEIGHT
                 
+                if is_duplicate_trade_level(symbol, chosen_dir, entry_price, atr):
+                    logger.logger.info(f"{nowstr()} {symbol}: duplicate level filter blocked entry at {entry_price:.5f}")
+                    time.sleep(0.2)
+                    continue
+
                 res = send_trade_safe(symbol, chosen_dir, lot, sl_price, tp_price, 
                                     short_reason, confluence_score, fvg_signal_active)
                 
@@ -5482,6 +5642,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     
                     global_state.daily_trades_count += 1
                     global_state.last_trade_time[symbol] = time.time()
+                    global_state.record_trade_level(symbol, chosen_dir, entry_price)
             
             manage_hybrid_trailing_enhanced(symbol)
             check_closed_trades_enhanced()
