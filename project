@@ -816,7 +816,7 @@ class BotConfig:
     MAX_POSITIONS_TOTAL: int = 4
     MAX_LOSS_PER_TRADE: float = 15.0
     MIN_RISK_PER_TRADE_USD: float = 5.0
-    DYNAMIC_POSITION_SIZING: bool = True
+    DYNAMIC_POSITION_SIZING: bool = False
     RISK_PER_TRADE_PCT: float = 1.0
     VOLATILITY_ADJUSTED_SL: bool = True
     MIN_RR_RATIO: float = 2.0
@@ -2699,7 +2699,7 @@ class TradeTracker:
             return trade['entry_price'] + price_offset
         return trade['entry_price'] - price_offset
 
-    def update_trade(self, ticket: int, current_price: float) -> Optional[Tuple[float, str]]:
+    def update_trade(self, ticket: int, current_price: float, profit_usd_override: Optional[float] = None) -> Optional[Tuple[float, str]]:
         """Intelligent trailing: +7$ -> BE, +14$ -> +7$, +21$ -> +14$, dynamic after."""
         with self.lock:
             if ticket not in self.trades:
@@ -2711,7 +2711,7 @@ class TradeTracker:
             current_sl = trade['current_sl']
 
             current_profit_pips = self.calculate_current_profit_pips(ticket, current_price)
-            current_profit_usd = self.calculate_current_profit_usd(ticket, current_price)
+            current_profit_usd = float(profit_usd_override) if profit_usd_override is not None else self.calculate_current_profit_usd(ticket, current_price)
             logger.logger.debug(f"Trade {ticket}: {current_profit_pips:.1f} pips profit, ${current_profit_usd:.2f} USD")
 
             if current_profit_usd < config.TRAIL_PROFIT_STEP_USD:
@@ -4809,7 +4809,8 @@ def manage_hybrid_trailing_enhanced(symbol: str):
         current_price = tick.ask
     
     ticket = pos.ticket
-    result = trade_tracker.update_trade(ticket, current_price)
+    pos_profit = getattr(pos, 'profit', None)
+    result = trade_tracker.update_trade(ticket, current_price, profit_usd_override=pos_profit)
     
     if result is not None:
         new_sl, move_reason = result
@@ -5428,7 +5429,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     continue
 
                 spread_points = get_spread_points(symbol)
-                if spread_points is not None and spread_points > config.MAX_SPREAD_POINTS and not forced_trade:
+                if spread_points is not None and spread_points > config.MAX_SPREAD_POINTS:
                     logger.logger.info(f"{nowstr()} {symbol}: spread {spread_points:.1f} > max {config.MAX_SPREAD_POINTS}, skipping")
                     time.sleep(0.2)
                     continue
@@ -5513,10 +5514,15 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 reward = abs(tp_price - entry_price)
                 rr = (reward / risk) if risk > 0 else 0
                 min_rr = config.RELAX_MIN_RR_RATIO if relax_mode else config.MIN_RR_RATIO
-                if rr < min_rr and not forced_trade:
-                    logger.logger.info(f"{nowstr()} {symbol}: R:R {rr:.2f} below minimum {min_rr}, skipping")
-                    time.sleep(0.2)
-                    continue
+                if rr < min_rr:
+                    required_reward = risk * min_rr
+                    if chosen_dir == 'buy':
+                        tp_price = entry_price + required_reward
+                    else:
+                        tp_price = entry_price - required_reward
+                    reward = abs(tp_price - entry_price)
+                    rr = (reward / risk) if risk > 0 else 0
+                    logger.logger.info(f"{nowstr()} {symbol}: adjusted TP to satisfy minimum R:R -> {rr:.2f}")
 
                 market_data = {
                     "volume_ratio": float(df['tick_volume'].iloc[-1]) / max(float(df['tick_volume'].iloc[-20:].mean()), 1.0) if 'tick_volume' in df.columns else 1.0,
@@ -5538,15 +5544,16 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                         time.sleep(0.2)
                         continue
 
-                if config.DYNAMIC_POSITION_SIZING:
+                if config.USE_FIXED_LOT:
+                    lot = round_lot(symbol, config.LOT_FIXED)
+                elif config.DYNAMIC_POSITION_SIZING:
                     lot = calculate_position_size(symbol, entry_price, sl_price)
+                    lot = global_state.adaptive_trading.adjust_position_size(
+                        lot, list(global_state.recent_performance)
+                    )
+                    lot = round_lot(symbol, lot)
                 else:
                     lot = round_lot(symbol, config.LOT_FIXED)
-
-                lot = global_state.adaptive_trading.adjust_position_size(
-                    lot, list(global_state.recent_performance)
-                )
-                lot = round_lot(symbol, lot)
                 
                 if chosen_dir == 'buy':
                     potential_loss_points = (entry_price - sl_price) / info.point
