@@ -2647,19 +2647,36 @@ class TradeTracker:
     
     def _infer_trade_volume(self, ticket: int, symbol: str) -> Optional[float]:
         positions = get_positions_safe(symbol)
-        if not positions:
-            return None
+        if positions:
+            for pos in positions:
+                pos_ticket = getattr(pos, 'ticket', None)
+                if pos_ticket != ticket:
+                    continue
+                vol = getattr(pos, 'volume', None)
+                if vol is not None:
+                    try:
+                        return float(vol)
+                    except Exception:
+                        return None
 
-        for pos in positions:
-            pos_ticket = getattr(pos, 'ticket', None)
-            if pos_ticket != ticket:
-                continue
-            vol = getattr(pos, 'volume', None)
-            if vol is not None:
-                try:
-                    return float(vol)
-                except Exception:
-                    return None
+            # If ticket mapping failed, infer from single live symbol position.
+            if len(positions) == 1:
+                vol = getattr(positions[0], 'volume', None)
+                if vol is not None:
+                    try:
+                        return float(vol)
+                    except Exception:
+                        return None
+
+        # Last resort for paper mode / metadata-only mode: use symbol minimum lot.
+        info = get_symbol_info_safe(symbol)
+        volume_min = getattr(info, 'volume_min', None) if info is not None else None
+        if volume_min is not None:
+            try:
+                return float(volume_min)
+            except Exception:
+                return None
+
         return None
 
     def _calculate_risk_per_pip(self, symbol: str, lot_size: float) -> float:
@@ -3234,14 +3251,21 @@ class AutomatedSupervisor:
 
 # ==================== ENHANCED DATA CACHE ====================
 class EnhancedDataCache:
-    """INTELLIGENT DATA CACHING with automatic retry"""
+    """INTELLIGENT DATA CACHING with automatic retry and symbol health tracking"""
     
     def __init__(self, cache_seconds: int = config.DATA_CACHE_SECONDS):
         self.cache = {}
         self.cache_timestamps = {}
         self.cache_seconds = cache_seconds
         self.max_retries = 3
-    
+        self.symbol_backoff_until: Dict[str, float] = {}
+
+    def is_symbol_temporarily_unavailable(self, symbol: str) -> bool:
+        return time.time() < self.symbol_backoff_until.get(symbol, 0.0)
+
+    def mark_symbol_temporarily_unavailable(self, symbol: str, backoff_seconds: int = 900) -> None:
+        self.symbol_backoff_until[symbol] = time.time() + max(60, int(backoff_seconds))
+
     def get_cached_data(self, symbol: str, timeframe: int, bars_needed: int) -> Optional[pd.DataFrame]:
         """Get cached data if available and fresh"""
         key = f"{symbol}_{timeframe}"
@@ -3259,40 +3283,62 @@ class EnhancedDataCache:
     
     def get_data_with_retry(self, symbol: str, timeframe: int, n: int = 400) -> pd.DataFrame:
         """Get data with automatic retry on failure"""
+        if self.is_symbol_temporarily_unavailable(symbol):
+            logger.logger.debug(f"Skipping {symbol} fetch: symbol in temporary backoff window")
+            return pd.DataFrame()
+
         for attempt in range(self.max_retries):
             try:
                 cached_data = self.get_cached_data(symbol, timeframe, n)
                 if cached_data is not None:
                     return cached_data
+
+                selected = mt5.symbol_select(symbol, True)
+                if not selected:
+                    self.mark_symbol_temporarily_unavailable(symbol, backoff_seconds=1800)
+                    raise ValueError(f"Symbol {symbol} is not available in Market Watch")
                 
                 rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, n)
                 if rates is None or len(rates) == 0:
-                    if not config.PAPER_TRADING_ENABLED:
+                    # For non-primary symbols (e.g., correlation context), avoid noisy reconnect/error storms.
+                    if symbol in config.SYMBOLS and not config.PAPER_TRADING_ENABLED:
                         connection_manager.reconnect_if_needed()
                     raise ValueError(f"No data returned for {symbol}")
                 
                 df = pd.DataFrame(rates)
                 df['time'] = pd.to_datetime(df['time'], unit='s')
                 
-                # FIX: MT5 returns 'tick_volume' not 'volume', rename for compatibility
+                # MT5 returns 'tick_volume' not 'volume', rename for compatibility
                 if 'tick_volume' in df.columns:
                     df.rename(columns={'tick_volume': 'volume'}, inplace=True)
                 
                 self.cache[f"{symbol}_{timeframe}"] = df.copy()
                 self.cache_timestamps[f"{symbol}_{timeframe}"] = time.time()
+                # Symbol recovered; clear backoff flag if any.
+                self.symbol_backoff_until.pop(symbol, None)
                 
                 logger.logger.debug(f"Data fetched for {symbol} TF{timeframe}, {len(df)} bars")
                 return df
                 
             except Exception as e:
-                logger.logger.warning(f"Data fetch attempt {attempt + 1} failed for {symbol}: {e}")
+                is_primary_symbol = symbol in config.SYMBOLS
+                if is_primary_symbol:
+                    logger.logger.warning(f"Data fetch attempt {attempt + 1} failed for {symbol}: {e}")
+                else:
+                    logger.logger.debug(f"Context fetch attempt {attempt + 1} failed for {symbol}: {e}")
                 
                 if attempt < self.max_retries - 1:
                     wait_time = 2 ** attempt
                     time.sleep(wait_time)
                 else:
-                    logger.logger.error(f"Failed to fetch data for {symbol} after {self.max_retries} attempts")
-                    logger.log_error("get_data_with_retry", str(e), "ERROR", symbol)
+                    if is_primary_symbol:
+                        logger.logger.error(f"Failed to fetch data for {symbol} after {self.max_retries} attempts")
+                        logger.log_error("get_data_with_retry", str(e), "ERROR", symbol)
+                    else:
+                        self.mark_symbol_temporarily_unavailable(symbol, backoff_seconds=1800)
+                        logger.logger.info(
+                            f"Skipping context symbol {symbol} for 30m after repeated data fetch failures"
+                        )
                     return pd.DataFrame()
         
         return pd.DataFrame()
@@ -3767,6 +3813,8 @@ class EnhancedGlobalState:
         self.recent_performance = deque(maxlen=20)
         self.correlation_data: Dict[str, Dict[str, float]] = {}
         self.news_events: List[Dict[str, Any]] = []
+        self.last_news_refresh = 0.0
+        self.last_correlation_refresh = 0.0
         self.trade_memory_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'recent_trades.json')
         self.recent_trade_levels: List[Dict[str, Any]] = self._load_recent_trade_levels()
         self.lock = threading.RLock()
@@ -3800,6 +3848,63 @@ class EnhancedGlobalState:
             })
             self.recent_trade_levels = self.recent_trade_levels[-200:]
             self._persist_recent_trade_levels()
+
+    def update_news_events(self) -> None:
+        """Best-effort refresh of news events cache used by is_news_window."""
+        try:
+            now = datetime.now()
+            events: List[Dict[str, Any]] = []
+            start = now - timedelta(hours=2)
+            end = now + timedelta(hours=24)
+
+            if hasattr(mt5, "calendar_events_get"):
+                raw = mt5.calendar_events_get(start, end)
+                if raw:
+                    for ev in raw:
+                        event_time = getattr(ev, "time", None)
+                        if isinstance(event_time, (int, float)):
+                            event_time = datetime.fromtimestamp(event_time)
+                        if not isinstance(event_time, datetime):
+                            continue
+                        events.append({
+                            "time": event_time,
+                            "impact": getattr(ev, "importance", ""),
+                            "title": getattr(ev, "name", ""),
+                            "currency": getattr(ev, "currency", ""),
+                        })
+
+            self.news_events = events
+        except Exception as e:
+            logger.log_error('update_news_events', str(e), 'WARNING')
+
+    def update_correlation_data(self) -> None:
+        """Populate rolling correlation data for configured symbol pairs."""
+        try:
+            snapshot: Dict[str, Dict[str, float]] = {}
+            for symbol, pairs in config.CORRELATION_PAIRS.items():
+                base_df = get_bars_enhanced(symbol, config.ENTRY_TF, 200)
+                if base_df.empty or 'close' not in base_df.columns:
+                    continue
+                base_ret = np.log(base_df['close']).diff().dropna()
+                if len(base_ret) < 20:
+                    continue
+                pair_map: Dict[str, float] = {}
+                for pair in pairs:
+                    if data_cache.is_symbol_temporarily_unavailable(pair):
+                        continue
+                    pair_df = get_bars_enhanced(pair, config.ENTRY_TF, 200)
+                    if pair_df.empty or 'close' not in pair_df.columns:
+                        continue
+                    pair_ret = np.log(pair_df['close']).diff().dropna()
+                    aligned = pd.concat([base_ret, pair_ret], axis=1).dropna()
+                    if len(aligned) < 20:
+                        continue
+                    pair_map[pair] = float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1]))
+                if pair_map:
+                    snapshot[symbol] = pair_map
+            self.correlation_data = snapshot
+        except Exception as e:
+            logger.log_error('update_correlation_data', str(e), 'WARNING')
 
     def is_duplicate_level(self, symbol: str, direction: str, price: float, tolerance: float) -> bool:
         with self.lock:
@@ -4068,15 +4173,18 @@ def detect_market_condition_enhanced(df: pd.DataFrame) -> Dict[str, Any]:
         
         atr_pct = atr / df['close'].iloc[-1] if df['close'].iloc[-1] > 0 else 0.0
 
+        trend_ratio = abs(np.mean(returns)) / atr_pct if atr_pct > 0 else 0.0
+        trend_threshold = 0.5
+
         if volatility > 0.03:
             condition['regime'] = 'volatile'
-        elif atr_pct > 0 and abs(np.mean(returns)) / atr_pct > 0.5:
+        elif trend_ratio > trend_threshold:
             condition['regime'] = 'trending'
         else:
             condition['regime'] = 'ranging'
         
         condition['volatility'] = volatility
-        condition['trend_strength'] = abs(np.mean(returns)) / atr_pct if atr_pct > 0 else 0
+        condition['trend_strength'] = trend_ratio
         condition['adx_value'] = atr / df['close'].iloc[-1] * 100 if df['close'].iloc[-1] > 0 else 0
     
     return condition
@@ -5264,6 +5372,15 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 global_state.reset_daily_stats()
             
             global_state.update_daily_stats()
+
+            # Refresh optional market context used by soft/conditional filters.
+            now_ts = time.time()
+            if now_ts - global_state.last_news_refresh >= 300:
+                global_state.update_news_events()
+                global_state.last_news_refresh = now_ts
+            if now_ts - global_state.last_correlation_refresh >= 300:
+                global_state.update_correlation_data()
+                global_state.last_correlation_refresh = now_ts
             
             if time.time() - global_state.last_summary_time > config.SUMMARY_INTERVAL:
                 print_daily_summary_enhanced()
@@ -5378,6 +5495,8 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             
             chosen_dir = confluence_result['direction']
             confluence_score = confluence_result.get('confluence_score', 0)
+            if not session_preferred and chosen_dir:
+                confluence_score = max(0, confluence_score - 1)
             forced_trade = False
             
             chosen_reasons = []
