@@ -3251,14 +3251,21 @@ class AutomatedSupervisor:
 
 # ==================== ENHANCED DATA CACHE ====================
 class EnhancedDataCache:
-    """INTELLIGENT DATA CACHING with automatic retry"""
+    """INTELLIGENT DATA CACHING with automatic retry and symbol health tracking"""
     
     def __init__(self, cache_seconds: int = config.DATA_CACHE_SECONDS):
         self.cache = {}
         self.cache_timestamps = {}
         self.cache_seconds = cache_seconds
         self.max_retries = 3
-    
+        self.symbol_backoff_until: Dict[str, float] = {}
+
+    def is_symbol_temporarily_unavailable(self, symbol: str) -> bool:
+        return time.time() < self.symbol_backoff_until.get(symbol, 0.0)
+
+    def mark_symbol_temporarily_unavailable(self, symbol: str, backoff_seconds: int = 900) -> None:
+        self.symbol_backoff_until[symbol] = time.time() + max(60, int(backoff_seconds))
+
     def get_cached_data(self, symbol: str, timeframe: int, bars_needed: int) -> Optional[pd.DataFrame]:
         """Get cached data if available and fresh"""
         key = f"{symbol}_{timeframe}"
@@ -3276,40 +3283,62 @@ class EnhancedDataCache:
     
     def get_data_with_retry(self, symbol: str, timeframe: int, n: int = 400) -> pd.DataFrame:
         """Get data with automatic retry on failure"""
+        if self.is_symbol_temporarily_unavailable(symbol):
+            logger.logger.debug(f"Skipping {symbol} fetch: symbol in temporary backoff window")
+            return pd.DataFrame()
+
         for attempt in range(self.max_retries):
             try:
                 cached_data = self.get_cached_data(symbol, timeframe, n)
                 if cached_data is not None:
                     return cached_data
+
+                selected = mt5.symbol_select(symbol, True)
+                if not selected:
+                    self.mark_symbol_temporarily_unavailable(symbol, backoff_seconds=1800)
+                    raise ValueError(f"Symbol {symbol} is not available in Market Watch")
                 
                 rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, n)
                 if rates is None or len(rates) == 0:
-                    if not config.PAPER_TRADING_ENABLED:
+                    # For non-primary symbols (e.g., correlation context), avoid noisy reconnect/error storms.
+                    if symbol in config.SYMBOLS and not config.PAPER_TRADING_ENABLED:
                         connection_manager.reconnect_if_needed()
                     raise ValueError(f"No data returned for {symbol}")
                 
                 df = pd.DataFrame(rates)
                 df['time'] = pd.to_datetime(df['time'], unit='s')
                 
-                # FIX: MT5 returns 'tick_volume' not 'volume', rename for compatibility
+                # MT5 returns 'tick_volume' not 'volume', rename for compatibility
                 if 'tick_volume' in df.columns:
                     df.rename(columns={'tick_volume': 'volume'}, inplace=True)
                 
                 self.cache[f"{symbol}_{timeframe}"] = df.copy()
                 self.cache_timestamps[f"{symbol}_{timeframe}"] = time.time()
+                # Symbol recovered; clear backoff flag if any.
+                self.symbol_backoff_until.pop(symbol, None)
                 
                 logger.logger.debug(f"Data fetched for {symbol} TF{timeframe}, {len(df)} bars")
                 return df
                 
             except Exception as e:
-                logger.logger.warning(f"Data fetch attempt {attempt + 1} failed for {symbol}: {e}")
+                is_primary_symbol = symbol in config.SYMBOLS
+                if is_primary_symbol:
+                    logger.logger.warning(f"Data fetch attempt {attempt + 1} failed for {symbol}: {e}")
+                else:
+                    logger.logger.debug(f"Context fetch attempt {attempt + 1} failed for {symbol}: {e}")
                 
                 if attempt < self.max_retries - 1:
                     wait_time = 2 ** attempt
                     time.sleep(wait_time)
                 else:
-                    logger.logger.error(f"Failed to fetch data for {symbol} after {self.max_retries} attempts")
-                    logger.log_error("get_data_with_retry", str(e), "ERROR", symbol)
+                    if is_primary_symbol:
+                        logger.logger.error(f"Failed to fetch data for {symbol} after {self.max_retries} attempts")
+                        logger.log_error("get_data_with_retry", str(e), "ERROR", symbol)
+                    else:
+                        self.mark_symbol_temporarily_unavailable(symbol, backoff_seconds=1800)
+                        logger.logger.info(
+                            f"Skipping context symbol {symbol} for 30m after repeated data fetch failures"
+                        )
                     return pd.DataFrame()
         
         return pd.DataFrame()
@@ -3861,6 +3890,8 @@ class EnhancedGlobalState:
                     continue
                 pair_map: Dict[str, float] = {}
                 for pair in pairs:
+                    if data_cache.is_symbol_temporarily_unavailable(pair):
+                        continue
                     pair_df = get_bars_enhanced(pair, config.ENTRY_TF, 200)
                     if pair_df.empty or 'close' not in pair_df.columns:
                         continue
