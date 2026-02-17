@@ -161,6 +161,13 @@ class FVGStrategy:
             candle1 = df.iloc[i-2]
             candle2 = df.iloc[i-1]
             candle3 = df.iloc[i]
+
+            # Ignore abnormal session/weekend gaps that often create false FVGs.
+            recent_tr = (df['high'].iloc[max(0, i-20):i] - df['low'].iloc[max(0, i-20):i]).replace(0, np.nan)
+            atr_proxy = float(np.nanmean(recent_tr)) if len(recent_tr) else 0.0
+            open_gap = abs(float(candle3['open']) - float(candle2['close']))
+            if atr_proxy > 0 and open_gap > (atr_proxy * config.FVG_GAP_FILTER_ATR_MULTIPLIER):
+                continue
             
             if not self._validate_fvg_formation(candle1, candle2, candle3):
                 continue
@@ -909,6 +916,15 @@ class BotConfig:
 
     DATA_CACHE_SECONDS: int = 60
     VALIDATE_SYMBOLS_ON_STARTUP: bool = True
+    ENABLE_FALLBACK_DATA_SOURCE: bool = env_bool("ENABLE_FALLBACK_DATA_SOURCE", True)
+    MAX_STALE_DATA_SECONDS: int = int(os.getenv("MAX_STALE_DATA_SECONDS", "900"))
+    DATA_MAX_ZERO_ROWS_PCT: float = float(os.getenv("DATA_MAX_ZERO_ROWS_PCT", "0.05"))
+    DATA_MAX_NEGATIVE_ROWS_PCT: float = float(os.getenv("DATA_MAX_NEGATIVE_ROWS_PCT", "0.0"))
+    FVG_GAP_FILTER_ATR_MULTIPLIER: float = float(os.getenv("FVG_GAP_FILTER_ATR_MULTIPLIER", "2.5"))
+    DYNAMIC_RSI_LOOKBACK: int = int(os.getenv("DYNAMIC_RSI_LOOKBACK", "100"))
+    DYNAMIC_RSI_LOW_Q: float = float(os.getenv("DYNAMIC_RSI_LOW_Q", "0.2"))
+    DYNAMIC_RSI_HIGH_Q: float = float(os.getenv("DYNAMIC_RSI_HIGH_Q", "0.8"))
+    CIRCUIT_BREAKER_COOL_OFF_MINUTES: int = int(os.getenv("CIRCUIT_BREAKER_COOL_OFF_MINUTES", "180"))
 
     # ==== Trade Quality Filters ====
     MAX_SPREAD_POINTS: float = 30.0
@@ -1814,8 +1830,9 @@ def is_recoverable_mt5_error(error_code: int) -> bool:
 
 def mt5_order_send_with_recovery(request: Dict[str, Any], context: str, max_attempts: int = 3):
     """Order send with MT5-specific recovery handling."""
+    mutable_request = dict(request)
     for attempt in range(1, max_attempts + 1):
-        res = mt5.order_send(request)
+        res = mt5.order_send(mutable_request)
         if res is not None and getattr(res, "retcode", None) in {
             mt5.TRADE_RETCODE_DONE,
             mt5.TRADE_RETCODE_DONE_PARTIAL,
@@ -1830,6 +1847,14 @@ def mt5_order_send_with_recovery(request: Dict[str, Any], context: str, max_atte
         logger.log_error("mt5_order_send_with_recovery",
                          f"{context} failed: {error_code} {error_desc}",
                          "WARNING")
+
+        retcode = getattr(res, "retcode", None)
+        if retcode in {getattr(mt5, 'TRADE_RETCODE_PRICE_CHANGED', -1), getattr(mt5, 'TRADE_RETCODE_REQUOTE', -1)}:
+            tick = mt5.symbol_info_tick(mutable_request.get("symbol", ""))
+            if tick is not None and "type" in mutable_request:
+                mutable_request["price"] = float(tick.ask) if mutable_request["type"] == mt5.ORDER_TYPE_BUY else float(tick.bid)
+                mutable_request["deviation"] = min(120, int(mutable_request.get("deviation", 50)) + 10)
+                logger.logger.info(f"{context}: requote/price change -> refreshing price and retrying")
 
         if is_recoverable_mt5_error(error_code):
             connection_manager.reconnect_if_needed()
@@ -2339,41 +2364,43 @@ class LiquiditySMCStrategy:
         if len(df) < 20:
             return zones
         
-        # Calculate volume profile - FIX: Use 'tick_volume' instead of 'volume'
-        if 'tick_volume' in df.columns:
-            df['volume_ema'] = df['tick_volume'].rolling(window=20).mean()
-            high_volume_bars = df[df['tick_volume'] > df['volume_ema'] * config.LIQUIDITY_VOLUME_MULTIPLIER]
+        volume_col = 'real_volume' if 'real_volume' in df.columns and df['real_volume'].sum() > 0 else (
+            'volume' if 'volume' in df.columns else ('tick_volume' if 'tick_volume' in df.columns else None)
+        )
+        if volume_col:
+            df['volume_ema'] = df[volume_col].rolling(window=20).mean()
+            high_volume_bars = df[df[volume_col] > df['volume_ema'] * config.LIQUIDITY_VOLUME_MULTIPLIER]
             
             for _, bar in high_volume_bars.iterrows():
                 # Liquidity pools at high volume price levels
                 zones['liquidity_pools'].append({
                     'price': bar['close'],
-                    'volume_ratio': bar['tick_volume'] / df['volume_ema'].iloc[-1],
+                    'volume_ratio': bar[volume_col] / max(df['volume_ema'].iloc[-1], 1.0),
                     'timestamp': bar.name,
-                    'strength': min(1.0, bar['tick_volume'] / df['tick_volume'].max())
+                    'strength': min(1.0, bar[volume_col] / max(df[volume_col].max(), 1.0))
                 })
         
         # Find order blocks (institutional accumulation/distribution)
         for i in range(2, len(df)):
             # FIX: Use 'tick_volume' instead of 'volume'
-            if 'tick_volume' in df.columns and df['tick_volume'].iloc[i] > df['tick_volume'].iloc[i-1] * 1.5:
+            if volume_col and df[volume_col].iloc[i] > df[volume_col].iloc[i-1] * 1.5:
                 # Bullish order block (accumulation)
                 if df['close'].iloc[i] > df['open'].iloc[i] and df['close'].iloc[i-1] < df['open'].iloc[i-1]:
                     zones['order_blocks'].append({
                         'type': 'bullish',
                         'price_range': (df['low'].iloc[i], df['high'].iloc[i]),
-                        'volume_ratio': df['tick_volume'].iloc[i] / df['tick_volume'].rolling(20).mean().iloc[i],
+                        'volume_ratio': df[volume_col].iloc[i] / max(df[volume_col].rolling(20).mean().iloc[i], 1.0),
                         'timestamp': df.index[i],
-                        'strength': min(1.0, df['tick_volume'].iloc[i] / df['tick_volume'].max())
+                        'strength': min(1.0, df[volume_col].iloc[i] / max(df[volume_col].max(), 1.0))
                     })
                 # Bearish order block (distribution)
                 elif df['close'].iloc[i] < df['open'].iloc[i] and df['close'].iloc[i-1] > df['open'].iloc[i-1]:
                     zones['order_blocks'].append({
                         'type': 'bearish',
                         'price_range': (df['low'].iloc[i], df['high'].iloc[i]),
-                        'volume_ratio': df['tick_volume'].iloc[i] / df['tick_volume'].rolling(20).mean().iloc[i],
+                        'volume_ratio': df[volume_col].iloc[i] / max(df[volume_col].rolling(20).mean().iloc[i], 1.0),
                         'timestamp': df.index[i],
-                        'strength': min(1.0, df['tick_volume'].iloc[i] / df['tick_volume'].max())
+                        'strength': min(1.0, df[volume_col].iloc[i] / max(df[volume_col].max(), 1.0))
                     })
         
         # Find breaker blocks (failed liquidity grabs)
@@ -3280,6 +3307,53 @@ class EnhancedDataCache:
                     return cached_df.copy()
         
         return None
+
+    def _timeframe_to_yf_interval(self, timeframe: int) -> str:
+        mapping = {
+            mt5.TIMEFRAME_M1: "1m",
+            mt5.TIMEFRAME_M5: "5m",
+            mt5.TIMEFRAME_M15: "15m",
+            mt5.TIMEFRAME_M30: "30m",
+            mt5.TIMEFRAME_H1: "60m",
+            mt5.TIMEFRAME_H4: "1h",
+            mt5.TIMEFRAME_D1: "1d",
+        }
+        return mapping.get(timeframe, "5m")
+
+    def _fetch_fallback_data(self, symbol: str, timeframe: int, n: int) -> pd.DataFrame:
+        """Best-effort fallback using Yahoo Finance."""
+        if not config.ENABLE_FALLBACK_DATA_SOURCE:
+            return pd.DataFrame()
+
+        try:
+            import yfinance as yf
+        except Exception:
+            return pd.DataFrame()
+
+        try:
+            yf_symbol = symbol if "=" in symbol else f"{symbol}=X"
+            interval = self._timeframe_to_yf_interval(timeframe)
+            period = "60d" if "m" in interval or "h" in interval else "2y"
+            raw = yf.download(yf_symbol, period=period, interval=interval, progress=False, auto_adjust=False)
+            if raw is None or raw.empty:
+                return pd.DataFrame()
+
+            raw = raw.rename(columns={
+                "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"
+            }).reset_index()
+            time_col = "Datetime" if "Datetime" in raw.columns else "Date"
+            raw.rename(columns={time_col: "time"}, inplace=True)
+            df = raw[[c for c in ["time", "open", "high", "low", "close", "volume"] if c in raw.columns]].copy()
+            df["time"] = pd.to_datetime(df["time"])
+            if "volume" not in df.columns:
+                df["volume"] = 0.0
+            if len(df) > n:
+                df = df.tail(n).reset_index(drop=True)
+            logger.logger.info(f"Fallback data source used for {symbol} ({len(df)} bars)")
+            return df
+        except Exception as e:
+            logger.logger.debug(f"Fallback fetch failed for {symbol}: {e}")
+            return pd.DataFrame()
     
     def get_data_with_retry(self, symbol: str, timeframe: int, n: int = 400) -> pd.DataFrame:
         """Get data with automatic retry on failure"""
@@ -3303,14 +3377,19 @@ class EnhancedDataCache:
                     # For non-primary symbols (e.g., correlation context), avoid noisy reconnect/error storms.
                     if symbol in config.SYMBOLS and not config.PAPER_TRADING_ENABLED:
                         connection_manager.reconnect_if_needed()
+                    fallback_df = self._fetch_fallback_data(symbol, timeframe, n)
+                    if not fallback_df.empty:
+                        self.cache[f"{symbol}_{timeframe}"] = fallback_df.copy()
+                        self.cache_timestamps[f"{symbol}_{timeframe}"] = time.time()
+                        return fallback_df
                     raise ValueError(f"No data returned for {symbol}")
                 
                 df = pd.DataFrame(rates)
                 df['time'] = pd.to_datetime(df['time'], unit='s')
-                
-                # MT5 returns 'tick_volume' not 'volume', rename for compatibility
-                if 'tick_volume' in df.columns:
-                    df.rename(columns={'tick_volume': 'volume'}, inplace=True)
+                if 'real_volume' in df.columns and df['real_volume'].sum() > 0:
+                    df['volume'] = df['real_volume']
+                elif 'tick_volume' in df.columns:
+                    df['volume'] = df['tick_volume']
                 
                 self.cache[f"{symbol}_{timeframe}"] = df.copy()
                 self.cache_timestamps[f"{symbol}_{timeframe}"] = time.time()
@@ -3334,6 +3413,11 @@ class EnhancedDataCache:
                     if is_primary_symbol:
                         logger.logger.error(f"Failed to fetch data for {symbol} after {self.max_retries} attempts")
                         logger.log_error("get_data_with_retry", str(e), "ERROR", symbol)
+                        fallback_df = self._fetch_fallback_data(symbol, timeframe, n)
+                        if not fallback_df.empty:
+                            self.cache[f"{symbol}_{timeframe}"] = fallback_df.copy()
+                            self.cache_timestamps[f"{symbol}_{timeframe}"] = time.time()
+                            return fallback_df
                     else:
                         self.mark_symbol_temporarily_unavailable(symbol, backoff_seconds=1800)
                         logger.logger.info(
@@ -3797,6 +3881,7 @@ class EnhancedGlobalState:
         self.start_time = time.time()
         self.peak_equity = starting_balance
         self.max_drawdown = 0.0
+        self.circuit_breaker_until = 0.0
         self.last_trade_time = {s: 0 for s in config.SYMBOLS}
         self.last_forced_time = {s: 0 for s in config.SYMBOLS}
         self.last_trade_attempt = {s: 0 for s in config.SYMBOLS}
@@ -4055,6 +4140,10 @@ class EnhancedGlobalState:
                     
                     if profit_pct <= -config.DAILY_LOSS_PCT:
                         self.daily_loss_triggered = True
+                        self.circuit_breaker_until = max(
+                            self.circuit_breaker_until,
+                            time.time() + config.CIRCUIT_BREAKER_COOL_OFF_MINUTES * 60,
+                        )
                         logger.logger.warning(f"Daily loss limit triggered: {profit_pct:.2f}%")
                         logger.log_error("update_daily_stats", 
                                        f"Daily loss limit {profit_pct:.2f}% triggered",
@@ -4062,6 +4151,10 @@ class EnhancedGlobalState:
                     
                     if self.max_drawdown >= config.MAX_DRAWDOWN_PCT:
                         self.daily_loss_triggered = True
+                        self.circuit_breaker_until = max(
+                            self.circuit_breaker_until,
+                            time.time() + config.CIRCUIT_BREAKER_COOL_OFF_MINUTES * 60,
+                        )
                         logger.logger.warning(f"Max drawdown limit triggered: {self.max_drawdown:.2f}%")
                         logger.log_error("update_daily_stats",
                                        f"Max drawdown {self.max_drawdown:.2f}% triggered",
@@ -4076,6 +4169,7 @@ class EnhancedGlobalState:
             self.daily_start_date = date.today()
             self.daily_trades_count = 0
             self.daily_loss_triggered = False
+            self.circuit_breaker_until = 0.0
             try:
                 acct = get_account_info_safe()
                 if acct:
@@ -4144,6 +4238,55 @@ def coerce_timestamp(value: Any) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     return time.time()
+
+def validate_market_data(df: pd.DataFrame, symbol: str, timeframe: int) -> Tuple[bool, str]:
+    """Sanity checks for corrupt/stale market data."""
+    if df is None or df.empty:
+        return False, "empty_data"
+    required = {'time', 'open', 'high', 'low', 'close'}
+    if not required.issubset(set(df.columns)):
+        return False, "missing_ohlc_columns"
+
+    numeric = df[['open', 'high', 'low', 'close']]
+    non_positive_mask = (numeric <= 0).any(axis=1)
+    negative_mask = (numeric < 0).any(axis=1)
+    if float(non_positive_mask.mean()) > config.DATA_MAX_ZERO_ROWS_PCT:
+        return False, "too_many_non_positive_prices"
+    if float(negative_mask.mean()) > config.DATA_MAX_NEGATIVE_ROWS_PCT:
+        return False, "negative_prices_detected"
+
+    latest_ts = pd.to_datetime(df['time'].iloc[-1]).timestamp()
+    stale_limit = max(config.MAX_STALE_DATA_SECONDS, timeframe_seconds(timeframe) * 3)
+    if (time.time() - latest_ts) > stale_limit:
+        return False, "stale_data"
+
+    return True, "ok"
+
+def compute_dynamic_rsi_bands(df: pd.DataFrame) -> Tuple[float, float]:
+    if 'rsi' not in df.columns or len(df) < max(30, config.DYNAMIC_RSI_LOOKBACK // 2):
+        return float(config.RSI_OS), float(config.RSI_OB)
+    window = df['rsi'].tail(config.DYNAMIC_RSI_LOOKBACK).dropna()
+    if len(window) < 20:
+        return float(config.RSI_OS), float(config.RSI_OB)
+    low = float(np.clip(np.nanquantile(window, config.DYNAMIC_RSI_LOW_Q), 10.0, 45.0))
+    high = float(np.clip(np.nanquantile(window, config.DYNAMIC_RSI_HIGH_Q), 55.0, 90.0))
+    if low >= high:
+        return float(config.RSI_OS), float(config.RSI_OB)
+    return low, high
+
+def detect_order_flow_imbalance(df: pd.DataFrame, lookback: int = 20) -> Dict[str, float]:
+    """Proxy imbalance using signed candle volume when L2 bid/ask is unavailable."""
+    if df is None or df.empty or len(df) < 5:
+        return {'buy_pressure': 0.0, 'sell_pressure': 0.0, 'imbalance': 0.0}
+    vol_col = 'volume' if 'volume' in df.columns else ('tick_volume' if 'tick_volume' in df.columns else None)
+    if vol_col is None:
+        return {'buy_pressure': 0.0, 'sell_pressure': 0.0, 'imbalance': 0.0}
+    tail = df.tail(lookback)
+    up = tail[tail['close'] >= tail['open']][vol_col].sum()
+    down = tail[tail['close'] < tail['open']][vol_col].sum()
+    total = float(up + down)
+    imb = ((up - down) / total) if total > 0 else 0.0
+    return {'buy_pressure': float(up), 'sell_pressure': float(down), 'imbalance': float(imb)}
 
 def detect_market_condition_enhanced(df: pd.DataFrame) -> Dict[str, Any]:
     """Enhanced market condition detection"""
@@ -4494,20 +4637,21 @@ def get_trend_signals(df: pd.DataFrame, df_htf: pd.DataFrame, market_regime: str
         logger.logger.warning(f"Trend signal error: {e}")
     
     try:
+        dyn_rsi_os, dyn_rsi_ob = compute_dynamic_rsi_bands(df)
         rsi_val = bar.get('rsi')
         if pd.notna(rsi_val):
-            if rsi_val <= config.RSI_OS and bar['close'] > bar['open']:
+            if rsi_val <= dyn_rsi_os and bar['close'] > bar['open']:
                 signals.append({
                     'direction': 'buy',
-                    'type': 'RSI_OS',
+                    'type': 'RSI_OS_DYNAMIC',
                     'confidence': 0.75,
                     'price': bar['close']
                 })
             
-            if rsi_val >= config.RSI_OB and bar['close'] < bar['open']:
+            if rsi_val >= dyn_rsi_ob and bar['close'] < bar['open']:
                 signals.append({
                     'direction': 'sell',
-                    'type': 'RSI_OB',
+                    'type': 'RSI_OB_DYNAMIC',
                     'confidence': 0.75,
                     'price': bar['close']
                 })
@@ -4994,11 +5138,24 @@ def manage_hybrid_trailing_enhanced(symbol: str):
             
             atr_value = 0
             try:
-                df = get_bars_enhanced(symbol, config.ENTRY_TF, 50)
+                df = calc_indicators_safe(get_bars_enhanced(symbol, config.ENTRY_TF, 80))
                 if not df.empty:
                     atr_value = float(df.iloc[-1].get('atr', 0))
             except:
                 pass
+
+            if atr_value > 0:
+                atr_mult = 2.0
+                if direction == 'buy':
+                    atr_trail_sl = current_price - (atr_value * atr_mult)
+                    if atr_trail_sl > new_sl:
+                        new_sl = atr_trail_sl
+                        move_reason = f"{move_reason}|atr_{atr_mult}x"
+                else:
+                    atr_trail_sl = current_price + (atr_value * atr_mult)
+                    if atr_trail_sl < new_sl:
+                        new_sl = atr_trail_sl
+                        move_reason = f"{move_reason}|atr_{atr_mult}x"
             
             old_sl = pos.sl
             if old_sl != new_sl:
@@ -5414,6 +5571,12 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 logger.logger.warning(f"{nowstr()} {symbol}: daily limit triggered - pausing")
                 time.sleep(60)
                 continue
+
+            if time.time() < getattr(global_state, 'circuit_breaker_until', 0.0):
+                remaining = int(global_state.circuit_breaker_until - time.time())
+                logger.logger.warning(f"{nowstr()} {symbol}: circuit breaker active ({remaining}s remaining)")
+                time.sleep(30)
+                continue
             
             if trade_tracker.should_pause_trading():
                 logger.logger.critical(f"{nowstr()} {symbol}: Consecutive loss limit reached - PAUSED")
@@ -5438,8 +5601,25 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             df_htf = calc_indicators_safe(get_bars_enhanced(symbol, config.HTF_TF, 250))
             df_h1 = calc_indicators_safe(get_bars_enhanced(symbol, config.HTF_H1_TF, 250))
             df_h4 = calc_indicators_safe(get_bars_enhanced(symbol, config.HTF_H4_TF, 250))
-            
+
             if df.empty or df_htf.empty or df_h1.empty or df_h4.empty:
+                time.sleep(1)
+                continue
+
+            checks = [
+                (df, config.ENTRY_TF, "entry"),
+                (df_htf, config.HTF_TF, "htf"),
+                (df_h1, config.HTF_H1_TF, "h1"),
+                (df_h4, config.HTF_H4_TF, "h4"),
+            ]
+            bad_data = False
+            for data_df, tf, label in checks:
+                ok, reason = validate_market_data(data_df, symbol, tf)
+                if not ok:
+                    logger.logger.warning(f"{symbol}: skipping analysis, {label} data invalid ({reason})")
+                    bad_data = True
+                    break
+            if bad_data:
                 time.sleep(1)
                 continue
             
@@ -5710,6 +5890,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     "last_signal_time": global_state.last_signal_time.get(symbol, 0),
                     "rr_ratio": rr
                 }
+                market_data.update(detect_order_flow_imbalance(df))
                 if not forced_trade:
                     if not global_state.trade_filter.filter_trade(
                         {"direction": chosen_dir},
