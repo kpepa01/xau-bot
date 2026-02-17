@@ -17,6 +17,9 @@ import logging
 import hashlib
 import random
 import re
+import io
+import urllib.parse
+import urllib.request
 from datetime import datetime, date, time as dt_time, timedelta
 from typing import Dict, List, Tuple, Optional, Any
 from collections import deque, defaultdict
@@ -853,6 +856,7 @@ class BotConfig:
     RSI_PERIOD: int = 7
     RSI_OB: int = 70
     RSI_OS: int = 30
+    ADAPTIVE_RSI_BANDS: bool = True
 
     MIN_ATR: float = 0.12
     SL_ATR_MULT: float = 1.5
@@ -909,12 +913,16 @@ class BotConfig:
     BREAKEVEN_AT_PIPS: float = 60.0
     BREAKEVEN_MIN_PROFIT: float = 6.0
     TRAIL_PROFIT_STEP_USD: float = 7.0
+    TRAIL_ATR_MULTIPLIER: float = 2.0
+
 
     # ==== Daily Protection ====
     DAILY_LOSS_PCT: float = 3.0
     DAILY_PROFIT_PCT: float = 3.0
     MAX_DRAWDOWN_PCT: float = 5.0
     MAX_DAILY_TRADES: int = 60
+    DRAWDOWN_COOLDOWN_MINUTES: int = 120
+
 
     # ==== Time Restrictions ====
     NO_TRADE_START: dt_time = dt_time(23, 0)
@@ -929,6 +937,11 @@ class BotConfig:
 
     DATA_CACHE_SECONDS: int = 60
     VALIDATE_SYMBOLS_ON_STARTUP: bool = True
+    ENABLE_FALLBACK_DATA_FEED: bool = True
+    FALLBACK_DATA_PROVIDER: str = "YAHOO"
+    MAX_DATA_STALENESS_MULTIPLIER: int = 3
+    MAX_ALLOWED_GAP_ATR_MULTIPLIER: float = 3.5
+
 
     # ==== Trade Quality Filters ====
     MAX_SPREAD_POINTS: float = 30.0
@@ -1140,6 +1153,14 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("MAX_TRADE_DURATION_MINUTES must be greater than 0.")
     if bot_config.TRAIL_PROFIT_STEP_USD <= 0:
         errors.append("TRAIL_PROFIT_STEP_USD must be greater than 0.")
+    if bot_config.TRAIL_ATR_MULTIPLIER <= 0:
+        errors.append("TRAIL_ATR_MULTIPLIER must be greater than 0.")
+    if bot_config.DRAWDOWN_COOLDOWN_MINUTES < 1:
+        errors.append("DRAWDOWN_COOLDOWN_MINUTES must be at least 1 minute.")
+    if bot_config.MAX_DATA_STALENESS_MULTIPLIER < 1:
+        errors.append("MAX_DATA_STALENESS_MULTIPLIER must be >= 1.")
+    if bot_config.MAX_ALLOWED_GAP_ATR_MULTIPLIER <= 0:
+        errors.append("MAX_ALLOWED_GAP_ATR_MULTIPLIER must be greater than 0.")
     if bot_config.BACKTEST_MODE:
         missing_files = [
             sym for sym, path in bot_config.BACKTEST_DATA_FILES.items()
@@ -1852,6 +1873,14 @@ def mt5_order_send_with_recovery(request: Dict[str, Any], context: str, max_atte
                          "WARNING")
 
         if is_recoverable_mt5_error(error_code):
+            if error_code in {-10004, -10009} and request.get("symbol"):
+                tick = mt5.symbol_info_tick(request["symbol"])
+                if tick is not None:
+                    if request.get("type") == mt5.ORDER_TYPE_BUY:
+                        request["price"] = float(tick.ask)
+                    elif request.get("type") == mt5.ORDER_TYPE_SELL:
+                        request["price"] = float(tick.bid)
+                    request["deviation"] = int(min(200, request.get("deviation", 50) + 25))
             connection_manager.reconnect_if_needed()
             time.sleep(0.5 * attempt)
             continue
@@ -2789,7 +2818,7 @@ class TradeTracker:
             return trade['entry_price'] + price_offset
         return trade['entry_price'] - price_offset
 
-    def update_trade(self, ticket: int, current_price: float, profit_usd_override: Optional[float] = None) -> Optional[Tuple[float, str]]:
+    def update_trade(self, ticket: int, current_price: float, profit_usd_override: Optional[float] = None, atr_override: Optional[float] = None) -> Optional[Tuple[float, str]]:
         """Intelligent trailing: +7$ -> BE, +14$ -> +7$, +21$ -> +14$, dynamic after."""
         with self.lock:
             if ticket not in self.trades:
@@ -2818,11 +2847,17 @@ class TradeTracker:
                 proposed_sl = self._sl_for_locked_profit_usd(trade, lock_usd)
                 reason = f"trail_lock_${lock_usd:.2f}"
 
+            atr = float(atr_override) if atr_override and atr_override > 0 else 0.0
+            if atr > 0 and config.TRAIL_ATR_MULTIPLIER > 0:
+                atr_stop = current_price - atr * config.TRAIL_ATR_MULTIPLIER if direction == 'buy' else current_price + atr * config.TRAIL_ATR_MULTIPLIER
+            else:
+                atr_stop = proposed_sl
+
             if direction == 'buy':
-                new_sl = max(proposed_sl, current_sl)
+                new_sl = max(proposed_sl, current_sl, atr_stop)
                 valid_move = new_sl > current_sl
             else:
-                new_sl = min(proposed_sl, current_sl)
+                new_sl = min(proposed_sl, current_sl, atr_stop)
                 valid_move = new_sl < current_sl
 
             if not valid_move:
@@ -3280,6 +3315,93 @@ class EnhancedDataCache:
         self.max_retries = 3
         self.symbol_backoff_until: Dict[str, float] = {}
 
+    def _timeframe_to_yahoo_interval(self, timeframe: int) -> str:
+        mapping = {
+            mt5.TIMEFRAME_M1: "1m",
+            mt5.TIMEFRAME_M5: "5m",
+            mt5.TIMEFRAME_M15: "15m",
+            mt5.TIMEFRAME_M30: "30m",
+            mt5.TIMEFRAME_H1: "60m",
+            mt5.TIMEFRAME_D1: "1d",
+        }
+        return mapping.get(timeframe, "5m")
+
+    def _fetch_yahoo_fallback(self, symbol: str, timeframe: int, n: int) -> pd.DataFrame:
+        yahoo_symbol = "XAUUSD=X" if symbol.upper().startswith("XAUUSD") else symbol
+        interval = self._timeframe_to_yahoo_interval(timeframe)
+        period = "60d" if interval.endswith("m") else "2y"
+        url = (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(yahoo_symbol)}"
+            f"?range={period}&interval={interval}&includePrePost=false"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+
+        result = payload.get("chart", {}).get("result", [])
+        if not result:
+            return pd.DataFrame()
+        item = result[0]
+        ts = item.get("timestamp") or []
+        quotes = (item.get("indicators", {}).get("quote") or [{}])[0]
+        if not ts:
+            return pd.DataFrame()
+        df = pd.DataFrame({
+            "time": pd.to_datetime(ts, unit="s", utc=True).tz_convert(None),
+            "open": quotes.get("open", []),
+            "high": quotes.get("high", []),
+            "low": quotes.get("low", []),
+            "close": quotes.get("close", []),
+            "volume": quotes.get("volume", []),
+        })
+        df = df.dropna(subset=["open", "high", "low", "close"]).tail(n).reset_index(drop=True)
+        return df
+
+    def _validate_and_clean_data(self, symbol: str, timeframe: int, df: pd.DataFrame) -> pd.DataFrame:
+        required_cols = ["time", "open", "high", "low", "close"]
+        if df is None or df.empty or any(c not in df.columns for c in required_cols):
+            return pd.DataFrame()
+
+        clean = df.copy()
+        for col in ["open", "high", "low", "close"]:
+            clean[col] = pd.to_numeric(clean[col], errors="coerce")
+        clean = clean.dropna(subset=["open", "high", "low", "close"]) 
+        clean = clean[(clean[["open", "high", "low", "close"]] > 0).all(axis=1)]
+        if clean.empty:
+            logger.logger.warning(f"{symbol}: data rejected, non-positive prices")
+            return pd.DataFrame()
+
+        clean = clean.sort_values("time").drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
+
+        stale_seconds = timeframe_seconds(timeframe) * max(1, int(config.MAX_DATA_STALENESS_MULTIPLIER))
+        if not clean.empty:
+            age = (datetime.now() - clean["time"].iloc[-1]).total_seconds()
+            if age > stale_seconds:
+                logger.logger.warning(f"{symbol}: stale market data ({age:.0f}s old)")
+                return pd.DataFrame()
+
+        prev_close = clean["close"].shift(1)
+        gap_abs = (clean["open"] - prev_close).abs()
+        atr_like = (clean["high"] - clean["low"]).rolling(20, min_periods=5).mean().replace(0, np.nan)
+        clean["gap_ratio"] = (gap_abs / atr_like).fillna(0.0)
+        clean["is_gap_bar"] = clean["gap_ratio"] > config.MAX_ALLOWED_GAP_ATR_MULTIPLIER
+
+        volume_col = "real_volume" if "real_volume" in clean.columns and clean["real_volume"].fillna(0).sum() > 0 else "volume"
+        if volume_col not in clean.columns and "tick_volume" in clean.columns:
+            volume_col = "tick_volume"
+        clean["effective_volume"] = pd.to_numeric(clean.get(volume_col, 0), errors="coerce").fillna(0.0)
+
+        return clean
+
+    def _augment_market_microstructure(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        out = df.copy()
+        bar_range = (out["high"] - out["low"]).replace(0, np.nan)
+        signed = ((out["close"] - out["open"]) / bar_range).fillna(0.0)
+        out["order_flow_imbalance"] = (signed * out["effective_volume"]).rolling(5, min_periods=2).mean().fillna(0.0)
+        return out
+
     def is_symbol_temporarily_unavailable(self, symbol: str) -> bool:
         return time.time() < self.symbol_backoff_until.get(symbol, 0.0)
 
@@ -3327,11 +3449,17 @@ class EnhancedDataCache:
                 
                 df = pd.DataFrame(rates)
                 df['time'] = pd.to_datetime(df['time'], unit='s')
-                
-                # MT5 returns 'tick_volume' not 'volume', rename for compatibility
-                if 'tick_volume' in df.columns:
-                    df.rename(columns={'tick_volume': 'volume'}, inplace=True)
-                
+
+                if 'real_volume' in df.columns and df['real_volume'].fillna(0).sum() > 0:
+                    df['volume'] = df['real_volume']
+                elif 'tick_volume' in df.columns:
+                    df['volume'] = df['tick_volume']
+
+                df = self._validate_and_clean_data(symbol, timeframe, df)
+                if df.empty:
+                    raise ValueError(f"Invalid/stale data returned for {symbol}")
+                df = self._augment_market_microstructure(df)
+
                 self.cache[f"{symbol}_{timeframe}"] = df.copy()
                 self.cache_timestamps[f"{symbol}_{timeframe}"] = time.time()
                 # Symbol recovered; clear backoff flag if any.
@@ -3351,6 +3479,19 @@ class EnhancedDataCache:
                     wait_time = 2 ** attempt
                     time.sleep(wait_time)
                 else:
+                    if config.ENABLE_FALLBACK_DATA_FEED:
+                        try:
+                            fallback_df = self._fetch_yahoo_fallback(symbol, timeframe, n)
+                            fallback_df = self._validate_and_clean_data(symbol, timeframe, fallback_df)
+                            fallback_df = self._augment_market_microstructure(fallback_df)
+                            if not fallback_df.empty:
+                                logger.logger.warning(f"Using fallback {config.FALLBACK_DATA_PROVIDER} data for {symbol}")
+                                self.cache[f"{symbol}_{timeframe}"] = fallback_df.copy()
+                                self.cache_timestamps[f"{symbol}_{timeframe}"] = time.time()
+                                return fallback_df
+                        except Exception as fb_err:
+                            logger.logger.warning(f"Fallback data failed for {symbol}: {fb_err}")
+
                     if is_primary_symbol:
                         logger.logger.error(f"Failed to fetch data for {symbol} after {self.max_retries} attempts")
                         logger.log_error("get_data_with_retry", str(e), "ERROR", symbol)
@@ -3554,8 +3695,12 @@ class ConfluenceManager:
         fvg_signals = []
         fvg_confluence = FVGConfluence()
         if self.fvg_strategy and config.FVG_ENABLED:
-            fvg_zones = self.fvg_strategy.detect_fvg(df, symbol)
-            
+            if bool(df.iloc[-1].get('is_gap_bar', False)):
+                logger.logger.info(f"{symbol}: recent gap bar detected, skipping FVG detection to avoid false positives")
+                fvg_zones = []
+            else:
+                fvg_zones = self.fvg_strategy.detect_fvg(df, symbol)
+
             snr_levels = {}
             if self.snr_strategy:
                 snr_levels = self.snr_strategy.identify_key_levels(df, current_price, atr)
@@ -3813,6 +3958,7 @@ class EnhancedGlobalState:
         self.daily_start_date = date.today()
         self.daily_trades_count = 0
         self.daily_loss_triggered = False
+        self.circuit_breaker_until = 0.0
         self.last_summary_time = time.time()
         self.start_time = time.time()
         self.peak_equity = starting_balance
@@ -4048,6 +4194,22 @@ class EnhancedGlobalState:
         """Get current signal strength for a symbol"""
         with self.lock:
             return self.signal_strength.get(symbol, 0)
+
+    def activate_circuit_breaker(self, reason: str) -> None:
+        cooldown = max(1, int(config.DRAWDOWN_COOLDOWN_MINUTES)) * 60
+        self.daily_loss_triggered = True
+        self.circuit_breaker_until = time.time() + cooldown
+        logger.logger.warning(f"Circuit breaker activated for {cooldown//60}m. reason={reason}")
+
+    def is_circuit_breaker_active(self) -> bool:
+        if not self.daily_loss_triggered:
+            return False
+        if time.time() < self.circuit_breaker_until:
+            return True
+        self.daily_loss_triggered = False
+        self.circuit_breaker_until = 0.0
+        logger.logger.info("Circuit breaker cool-off completed, trading resumed")
+        return False
     
     def update_daily_stats(self):
         with self.lock:
@@ -4074,15 +4236,13 @@ class EnhancedGlobalState:
                     profit_pct = ((current_balance - STARTING_BALANCE) / STARTING_BALANCE) * 100.0
                     
                     if profit_pct <= -config.DAILY_LOSS_PCT:
-                        self.daily_loss_triggered = True
-                        logger.logger.warning(f"Daily loss limit triggered: {profit_pct:.2f}%")
+                        self.activate_circuit_breaker(f"daily_loss {profit_pct:.2f}%")
                         logger.log_error("update_daily_stats", 
                                        f"Daily loss limit {profit_pct:.2f}% triggered",
                                        "CRITICAL")
                     
                     if self.max_drawdown >= config.MAX_DRAWDOWN_PCT:
-                        self.daily_loss_triggered = True
-                        logger.logger.warning(f"Max drawdown limit triggered: {self.max_drawdown:.2f}%")
+                        self.activate_circuit_breaker(f"max_drawdown {self.max_drawdown:.2f}%")
                         logger.log_error("update_daily_stats",
                                        f"Max drawdown {self.max_drawdown:.2f}% triggered",
                                        "CRITICAL")
@@ -4096,6 +4256,7 @@ class EnhancedGlobalState:
             self.daily_start_date = date.today()
             self.daily_trades_count = 0
             self.daily_loss_triggered = False
+            self.circuit_breaker_until = 0.0
             try:
                 acct = get_account_info_safe()
                 if acct:
@@ -4390,6 +4551,19 @@ def calc_indicators_safe(df: pd.DataFrame) -> pd.DataFrame:
         df['stoch_d'] = st.stoch_signal()
     except Exception as e:
         logger.logger.warning(f"Failed to calculate Stochastic: {e}")
+
+    if config.ADAPTIVE_RSI_BANDS and 'rsi' in df.columns:
+        rolling = df['rsi'].rolling(120, min_periods=30)
+        df['rsi_ob_dynamic'] = rolling.quantile(0.80).clip(lower=60, upper=85)
+        df['rsi_os_dynamic'] = rolling.quantile(0.20).clip(lower=15, upper=40)
+    else:
+        df['rsi_ob_dynamic'] = config.RSI_OB
+        df['rsi_os_dynamic'] = config.RSI_OS
+
+    if 'order_flow_imbalance' not in df.columns and 'volume' in df.columns:
+        spread = (df['high'] - df['low']).replace(0, np.nan)
+        signed = ((df['close'] - df['open']) / spread).fillna(0.0)
+        df['order_flow_imbalance'] = (signed * df['volume']).rolling(5, min_periods=2).mean().fillna(0.0)
     
     return df
 
@@ -4515,22 +4689,35 @@ def get_trend_signals(df: pd.DataFrame, df_htf: pd.DataFrame, market_regime: str
     
     try:
         rsi_val = bar.get('rsi')
+        rsi_os = bar.get('rsi_os_dynamic', config.RSI_OS)
+        rsi_ob = bar.get('rsi_ob_dynamic', config.RSI_OB)
         if pd.notna(rsi_val):
-            if rsi_val <= config.RSI_OS and bar['close'] > bar['open']:
+            if rsi_val <= rsi_os and bar['close'] > bar['open']:
                 signals.append({
                     'direction': 'buy',
-                    'type': 'RSI_OS',
+                    'type': 'RSI_OS_ADAPTIVE',
                     'confidence': 0.75,
                     'price': bar['close']
                 })
-            
-            if rsi_val >= config.RSI_OB and bar['close'] < bar['open']:
+
+            if rsi_val >= rsi_ob and bar['close'] < bar['open']:
                 signals.append({
                     'direction': 'sell',
-                    'type': 'RSI_OB',
+                    'type': 'RSI_OB_ADAPTIVE',
                     'confidence': 0.75,
                     'price': bar['close']
                 })
+    except Exception:
+        pass
+
+    try:
+        ofi = float(bar.get('order_flow_imbalance', 0.0))
+        ofi_avg = float(df['order_flow_imbalance'].tail(50).abs().mean()) if 'order_flow_imbalance' in df.columns else 0.0
+        threshold = max(ofi_avg * 1.25, 1e-9)
+        if ofi > threshold:
+            signals.append({'direction': 'buy', 'type': 'ORDER_FLOW_IMBALANCE', 'confidence': 0.7, 'price': bar['close']})
+        elif ofi < -threshold:
+            signals.append({'direction': 'sell', 'type': 'ORDER_FLOW_IMBALANCE', 'confidence': 0.7, 'price': bar['close']})
     except Exception:
         pass
     
@@ -4995,7 +5182,15 @@ def manage_hybrid_trailing_enhanced(symbol: str):
     
     ticket = pos.ticket
     pos_profit = getattr(pos, 'profit', None)
-    result = trade_tracker.update_trade(ticket, current_price, profit_usd_override=pos_profit)
+    atr_for_trailing = None
+    try:
+        df_for_atr = get_bars_enhanced(symbol, config.ENTRY_TF, 50)
+        if not df_for_atr.empty:
+            atr_for_trailing = float(df_for_atr.iloc[-1].get('atr', 0) or 0)
+    except Exception:
+        atr_for_trailing = None
+
+    result = trade_tracker.update_trade(ticket, current_price, profit_usd_override=pos_profit, atr_override=atr_for_trailing)
     
     if result is not None:
         new_sl, move_reason = result
@@ -5430,8 +5625,8 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 time.sleep(60)
                 continue
             
-            if global_state.daily_loss_triggered:
-                logger.logger.warning(f"{nowstr()} {symbol}: daily limit triggered - pausing")
+            if global_state.is_circuit_breaker_active():
+                logger.logger.warning(f"{nowstr()} {symbol}: circuit breaker active - pausing")
                 time.sleep(60)
                 continue
             
@@ -5611,7 +5806,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             
             if (chosen_dir and 
                 len(opened) < config.MAX_TRADES_PER_SYMBOL and 
-                not global_state.daily_loss_triggered and
+                not global_state.is_circuit_breaker_active() and
                 not trade_tracker.should_pause_trading() and
                 not global_state.should_pause_symbol(symbol)):
                 
