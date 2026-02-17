@@ -5,11 +5,11 @@
 # ============================================================
 
 import os
+import sys
 import json
 import csv
-import pandas as pd
-import numpy as np
-import MetaTrader5 as mt5
+import subprocess
+import importlib.util
 import time
 import math
 import threading
@@ -21,12 +21,32 @@ from datetime import datetime, date, time as dt_time, timedelta
 from typing import Dict, List, Tuple, Optional, Any
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
+from itertools import product
+from types import SimpleNamespace
+
+
+def _ensure_package(import_name: str, pip_name: str) -> None:
+    """Install missing runtime dependencies automatically."""
+    if importlib.util.find_spec(import_name) is not None:
+        return
+
+    print(f"[BOOTSTRAP] Missing '{import_name}'. Installing '{pip_name}'...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
+
+
+_ensure_package("pandas", "pandas>=2.0.0")
+_ensure_package("numpy", "numpy>=1.24.0")
+_ensure_package("MetaTrader5", "MetaTrader5>=5.0.45")
+_ensure_package("ta", "ta>=0.11.0")
+_ensure_package("dotenv", "python-dotenv>=1.0.0")
+
+import pandas as pd
+import numpy as np
+import MetaTrader5 as mt5
 from ta.trend import EMAIndicator, MACD
 from ta.volatility import AverageTrueRange, BollingerBands
 from ta.momentum import RSIIndicator, StochasticOscillator
 from dotenv import load_dotenv
-from itertools import product
-from types import SimpleNamespace
 
 # Load environment variables
 load_dotenv()
