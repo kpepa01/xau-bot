@@ -826,7 +826,7 @@ class BotConfig:
     MIN_RISK_PER_TRADE_USD: float = 5.0
     DYNAMIC_POSITION_SIZING: bool = False
     RISK_PER_TRADE_PCT: float = 1.0
-    VOLATILITY_ADJUSTED_SL: bool = True
+    VOLATILITY_ADJUSTED_SL: bool = False
     MIN_RR_RATIO: float = 2.0
 
     COOLDOWN: int = 1800
@@ -1722,6 +1722,13 @@ class ConnectionManager:
                     logger.log_error("validate_all_symbols", f"Symbol {symbol} not found", "ERROR")
                 else:
                     logger.logger.info(f"✅ Symbol {symbol} validated")
+                    logger.logger.info(
+                        f"{symbol} point={getattr(info, 'point', 'n/a')}, "
+                        f"trade_tick_size={getattr(info, 'trade_tick_size', 'n/a')}, "
+                        f"trade_tick_value={getattr(info, 'trade_tick_value', 'n/a')}, "
+                        f"stops_level={getattr(info, 'trade_stops_level', 'n/a')}, "
+                        f"digits={getattr(info, 'digits', 'n/a')}"
+                    )
                     logger.logger.debug(f"  Point: {info.point}, Spread: {info.spread}")
             except Exception as e:
                 logger.logger.error(f"Error validating symbol {symbol}: {e}")
@@ -4566,6 +4573,59 @@ def symbol_min_stop(symbol: str):
         logger.log_error("symbol_min_stop", str(e), "WARNING", symbol)
         return None
 
+def modify_position_sl_with_retry(symbol: str, pos: Any, new_sl: float, tp: float, context: str = ""):
+    """Modify position SL with stop-level aware retries."""
+    if config.PAPER_TRADING_ENABLED:
+        for position in paper_engine.positions.values():
+            if position["ticket"] == int(getattr(pos, 'ticket', 0)):
+                position["sl"] = float(new_sl)
+                return True
+        return False
+
+    info = mt5.symbol_info(symbol)
+    tick = mt5.symbol_info_tick(symbol)
+    if info is None or tick is None:
+        logger.logger.error(f"{nowstr()} {symbol}: cannot modify SL, missing symbol info/tick")
+        return None
+
+    point = float(getattr(info, 'point', 0.0) or 0.0)
+    digits = int(getattr(info, 'digits', 3) or 3)
+    base_min_stop = symbol_min_stop(symbol) or (point * 10 if point > 0 else 0.1)
+
+    for attempt in range(1, 4):
+        sl_candidate = float(new_sl)
+        buffer_mult = 1.0 + (attempt - 1) * 0.5
+        min_stop = base_min_stop * buffer_mult
+
+        if getattr(pos, 'type', None) == 0:
+            max_allowed_sl = tick.bid - min_stop
+            sl_candidate = min(sl_candidate, max_allowed_sl)
+        else:
+            min_allowed_sl = tick.ask + min_stop
+            sl_candidate = max(sl_candidate, min_allowed_sl)
+
+        sl_candidate = round(sl_candidate, digits)
+
+        req = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": int(pos.ticket),
+            "symbol": symbol,
+            "sl": sl_candidate,
+            "tp": float(tp) if tp else 0.0
+        }
+        res = mt5_order_send_with_recovery(req, f"{context} attempt={attempt}")
+        if res:
+            return res
+
+        err = mt5.last_error()
+        logger.logger.warning(
+            f"{nowstr()} {symbol}: SL modify failed ticket={getattr(pos, 'ticket', 0)} "
+            f"attempt={attempt}/3 sl={sl_candidate} min_stop={min_stop:.5f} last_error={err}"
+        )
+        time.sleep(0.2 * attempt)
+
+    return None
+
 def round_lot(symbol: str, lot: float) -> float:
     try:
         if config.PAPER_TRADING_ENABLED:
@@ -5120,8 +5180,7 @@ def manage_hybrid_trailing_enhanced(symbol: str):
         current_price = tick.ask
     
     ticket = pos.ticket
-    pos_profit = getattr(pos, 'profit', None)
-    result = trade_tracker.update_trade(ticket, current_price, profit_usd_override=pos_profit)
+    result = trade_tracker.update_trade(ticket, current_price)
     
     if result is not None:
         new_sl, move_reason = result
@@ -5146,7 +5205,7 @@ def manage_hybrid_trailing_enhanced(symbol: str):
             except:
                 pass
 
-            if atr_value > 0:
+            if config.VOLATILITY_ADJUSTED_SL and atr_value > 0:
                 atr_mult = 2.0
                 if direction == 'buy':
                     atr_trail_sl = current_price - (atr_value * atr_mult)
@@ -5162,19 +5221,14 @@ def manage_hybrid_trailing_enhanced(symbol: str):
             old_sl = pos.sl
             if old_sl != new_sl:
                 try:
-                    if config.PAPER_TRADING_ENABLED:
-                        for position in paper_engine.positions.values():
-                            if position["ticket"] == ticket:
-                                position["sl"] = new_sl
-                        result = True
-                    else:
-                        result = mt5_order_send_with_recovery({
-                            "action": mt5.TRADE_ACTION_SLTP,
-                            "position": ticket,
-                            "sl": new_sl,
-                            "tp": pos.tp
-                        }, f"manage_hybrid_trailing_enhanced {symbol}")
-                    
+                    result = modify_position_sl_with_retry(
+                        symbol=symbol,
+                        pos=pos,
+                        new_sl=new_sl,
+                        tp=pos.tp,
+                        context=f"manage_hybrid_trailing_enhanced {symbol}"
+                    )
+
                     if result:
                         logger.logger.info(f"{nowstr()} {symbol}: SL moved from {old_sl:.5f} to {new_sl:.5f} "
                                          f"at {profit_pips:.1f} pips profit (${current_profit_usd:.2f}) "
