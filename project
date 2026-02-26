@@ -897,6 +897,11 @@ class BotConfig:
     BREAKEVEN_AT_PIPS: float = 60.0
     BREAKEVEN_MIN_PROFIT: float = 6.0
     TRAIL_PROFIT_STEP_USD: float = 7.0
+    SMART_TRAIL_START_USD: float = 4.0
+    SMART_TRAIL_BE_BUFFER_USD: float = 1.0
+    SMART_TRAIL_LOCK_RATIO: float = 0.82
+    SMART_TRAIL_MAX_GIVEBACK_USD: float = 2.5
+    SMART_TRAIL_MIN_INCREMENT_USD: float = 1.25
 
     # ==== Daily Protection ====
     DAILY_LOSS_PCT: float = 3.0
@@ -2804,8 +2809,21 @@ class TradeTracker:
             return trade['entry_price'] + price_offset
         return trade['entry_price'] - price_offset
 
+    def _locked_usd_from_sl(self, trade: Dict[str, Any], sl_price: float) -> float:
+        """Estimate currently locked USD at SL price for a trade."""
+        usd_per_point = trade['risk_per_pip'] * 0.1
+        if usd_per_point <= 0:
+            return 0.0
+
+        if trade['direction'] == 'buy':
+            points = (sl_price - trade['entry_price']) / trade['point_value']
+        else:
+            points = (trade['entry_price'] - sl_price) / trade['point_value']
+
+        return max(0.0, points * usd_per_point)
+
     def update_trade(self, ticket: int, current_price: float, profit_usd_override: Optional[float] = None) -> Optional[Tuple[float, str]]:
-        """Intelligent trailing: +7$ -> BE, +14$ -> +7$, +21$ -> +14$, dynamic after."""
+        """Smart fast trailing that secures profit aggressively as trade moves in favor."""
         with self.lock:
             if ticket not in self.trades:
                 return None
@@ -2819,19 +2837,34 @@ class TradeTracker:
             current_profit_usd = float(profit_usd_override) if profit_usd_override is not None else self.calculate_current_profit_usd(ticket, current_price)
             logger.logger.debug(f"Trade {ticket}: {current_profit_pips:.1f} pips profit, ${current_profit_usd:.2f} USD")
 
-            if current_profit_usd < config.TRAIL_PROFIT_STEP_USD:
+            start_usd = max(0.5, float(config.SMART_TRAIL_START_USD))
+            if current_profit_usd < start_usd:
                 return None
 
-            step = int(current_profit_usd // config.TRAIL_PROFIT_STEP_USD)
-            lock_usd = max(0.0, (step - 1) * config.TRAIL_PROFIT_STEP_USD)
+            be_buffer = max(0.0, float(config.SMART_TRAIL_BE_BUFFER_USD))
+            lock_ratio = min(0.95, max(0.50, float(config.SMART_TRAIL_LOCK_RATIO)))
+            max_giveback = max(0.5, float(config.SMART_TRAIL_MAX_GIVEBACK_USD))
+            min_increment = max(0.25, float(config.SMART_TRAIL_MIN_INCREMENT_USD))
 
-            if lock_usd <= 0:
-                proposed_sl = entry_price
-                reason = "trail_be_at_$7"
-                trade['breakeven_moved'] = True
+            if current_profit_usd < (start_usd * 2):
+                lock_usd = be_buffer
+                reason = "smart_trail_early_protect"
+            elif current_profit_usd < (start_usd * 3):
+                lock_usd = max(be_buffer, current_profit_usd * 0.60)
+                reason = "smart_trail_accelerate"
             else:
-                proposed_sl = self._sl_for_locked_profit_usd(trade, lock_usd)
-                reason = f"trail_lock_${lock_usd:.2f}"
+                lock_usd = max(current_profit_usd * lock_ratio, current_profit_usd - max_giveback)
+                reason = "smart_trail_runner_lock"
+
+            lock_usd = min(lock_usd, max(0.0, current_profit_usd - min_increment))
+            if lock_usd <= 0:
+                return None
+
+            current_locked_usd = self._locked_usd_from_sl(trade, current_sl)
+            if lock_usd <= (current_locked_usd + min_increment):
+                return None
+
+            proposed_sl = self._sl_for_locked_profit_usd(trade, lock_usd)
 
             if direction == 'buy':
                 new_sl = max(proposed_sl, current_sl)
@@ -2844,12 +2877,13 @@ class TradeTracker:
                 return None
 
             trade['current_sl'] = new_sl
+            trade['breakeven_moved'] = True
             trade['last_move_pips'] = max(trade.get('last_move_pips', 0.0), current_profit_pips)
             trade['last_move_profit_usd'] = max(trade.get('last_move_profit_usd', 0.0), lock_usd)
 
             logger.logger.info(
-                f"Intelligent trailing for {ticket}: SL -> {new_sl:.5f} | "
-                f"profit=${current_profit_usd:.2f} | lock_target=${lock_usd:.2f}"
+                f"Smart trailing for {ticket}: SL -> {new_sl:.5f} | "
+                f"profit=${current_profit_usd:.2f} | locked=${lock_usd:.2f} | prev_locked=${current_locked_usd:.2f}"
             )
             return (new_sl, reason)
 
