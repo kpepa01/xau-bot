@@ -902,6 +902,12 @@ class BotConfig:
     SMART_TRAIL_LOCK_RATIO: float = 0.82
     SMART_TRAIL_MAX_GIVEBACK_USD: float = 2.5
     SMART_TRAIL_MIN_INCREMENT_USD: float = 1.25
+    DYNAMIC_TP_TRENDING_ATR_MULT: float = 2.0
+    DYNAMIC_TP_RANGING_ATR_MULT: float = 1.0
+    DYNAMIC_TP_VOLATILE_ATR_MULT: float = 1.4
+    ENTRY_MAX_DISTANCE_ATR: float = 0.85
+    ENTRY_RSI_BUY_MAX: float = 72.0
+    ENTRY_RSI_SELL_MIN: float = 28.0
 
     # ==== Daily Protection ====
     DAILY_LOSS_PCT: float = 3.0
@@ -963,7 +969,7 @@ class BotConfig:
     FVG_USE_OPPOSITE_SIDE_TP: bool = True
     FVG_SL_BREAKER_MULTIPLIER: float = 1.2
     FVG_MIN_STOP_ATR_MULTIPLIER: float = 1.0
-    FVG_MIN_CANDLE_BODY_RATIO: float = 0.8
+    FVG_MIN_CANDLE_BODY_RATIO: float = 0.6
     FVG_MAX_GAP_PERCENTAGE: float = 0.02
     FVG_STRENGTH_VOLUME_MULTIPLIER: float = 1.5
 
@@ -4375,20 +4381,72 @@ def detect_market_condition_enhanced(df: pd.DataFrame) -> Dict[str, Any]:
     
     return condition
 
-def calculate_dynamic_tp(entry_price: float, direction: str, atr: float, market_regime: str) -> float:
-    """Calculate dynamic take profit based on market conditions"""
-    base_multiplier = config.TP_ATR_MULT
-    
+def calculate_dynamic_tp(entry_price: float, direction: str, atr: float, market_regime: str,
+                         confluence_score: float = 0.0, trend_strength: float = 0.0) -> float:
+    """Adaptive TP using market regime + confluence/trend quality boost."""
     if market_regime == 'trending':
-        multiplier = base_multiplier * 1.5
+        multiplier = config.DYNAMIC_TP_TRENDING_ATR_MULT
     elif market_regime == 'volatile':
-        multiplier = base_multiplier * 1.2
+        multiplier = config.DYNAMIC_TP_VOLATILE_ATR_MULT
     else:
-        multiplier = base_multiplier * 0.8
-    
+        multiplier = config.DYNAMIC_TP_RANGING_ATR_MULT
+
+    if confluence_score >= 4:
+        multiplier += 0.20
+    if trend_strength >= 0.75:
+        multiplier += 0.15
+
+    multiplier = min(3.5, max(0.8, multiplier))
     if direction == 'buy':
         return entry_price + (atr * multiplier)
     return entry_price - (atr * multiplier)
+
+
+def should_skip_chase_entry(df: pd.DataFrame, direction: str, atr: float, market_regime: str,
+                            has_smc_signal: bool = False) -> Tuple[bool, str]:
+    """Avoid late/chase entries where reward quality degrades."""
+    if df.empty or atr <= 0:
+        return False, "ok"
+
+    bar = df.iloc[-1]
+    ema_fast = float(bar.get('ema_fast', bar.get('close', 0.0)))
+    close = float(bar.get('close', ema_fast))
+    rsi_val = float(bar.get('rsi', 50.0))
+
+    extension_atr = abs(close - ema_fast) / max(atr, 1e-8)
+    max_ext = config.ENTRY_MAX_DISTANCE_ATR
+    if market_regime == 'ranging':
+        max_ext *= 0.85
+
+    if extension_atr > max_ext and not has_smc_signal:
+        return True, f"overextended extension_atr={extension_atr:.2f}>{max_ext:.2f}"
+
+    if direction == 'buy' and rsi_val > config.ENTRY_RSI_BUY_MAX and not has_smc_signal:
+        return True, f"buy_rsi_too_high={rsi_val:.1f}"
+    if direction == 'sell' and rsi_val < config.ENTRY_RSI_SELL_MIN and not has_smc_signal:
+        return True, f"sell_rsi_too_low={rsi_val:.1f}"
+
+    return False, "ok"
+
+
+def adjust_sl_for_regime_and_quality(entry_price: float, direction: str, atr: float, sl_price: float,
+                                     market_regime: str, confluence_score: float) -> float:
+    """Tighten/relax SL distance based on regime and setup quality."""
+    regime_mult = 1.0
+    if market_regime == 'trending':
+        regime_mult = 1.12
+    elif market_regime == 'ranging':
+        regime_mult = 0.88
+
+    quality_mult = 0.92 if confluence_score >= 4 else 1.0
+    target_dist = atr * config.SL_ATR_MULT * regime_mult * quality_mult
+
+    if direction == 'buy':
+        adaptive_sl = entry_price - target_dist
+        return max(sl_price, adaptive_sl)
+    adaptive_sl = entry_price + target_dist
+    return min(sl_price, adaptive_sl)
+
 
 def calculate_momentum_strength(df: pd.DataFrame, direction: str) -> Tuple[bool, float]:
     rsi_val = float(df['rsi'].iloc[-1]) if 'rsi' in df.columns else 50.0
@@ -5883,6 +5941,19 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 
                 entry_price = float(tick.ask) if chosen_dir == 'buy' else float(tick.bid)
                 atr = float(bar['atr']) if not pd.isna(bar.get('atr')) else info.point * 50
+                trend_strength = detect_market_condition_enhanced(df).get("trend_strength", 0.0)
+                skip_entry, skip_reason = should_skip_chase_entry(
+                    df=df,
+                    direction=chosen_dir,
+                    atr=atr,
+                    market_regime=market_regime,
+                    has_smc_signal=(fvg_signal_active or liquidity_signal_active)
+                )
+                if skip_entry and not forced_trade:
+                    logger.logger.info(f"{nowstr()} {symbol}: entry quality filter blocked ({skip_reason})")
+                    time.sleep(0.2)
+                    continue
+
                 sl_dist = atr * config.SL_ATR_MULT
                 tp_dist = atr * config.TP_ATR_MULT
                 
@@ -5905,6 +5976,15 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
 
                 if config.VOLATILITY_ADJUSTED_SL:
                     sl_price = adjust_sl_for_volatility(entry_price, chosen_dir, atr, sl_price)
+
+                sl_price = adjust_sl_for_regime_and_quality(
+                    entry_price=entry_price,
+                    direction=chosen_dir,
+                    atr=atr,
+                    sl_price=sl_price,
+                    market_regime=market_regime,
+                    confluence_score=confluence_score
+                )
 
                 # FVG-BASED TARGETS
                 fvg_based_tp = False
@@ -5950,7 +6030,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                             sl_price = entry_price + min_fvg_stop
 
                 if not fvg_based_tp:
-                    tp_price = calculate_dynamic_tp(entry_price, chosen_dir, atr, market_regime)
+                    tp_price = calculate_dynamic_tp(entry_price, chosen_dir, atr, market_regime, confluence_score, trend_strength)
 
                 min_stop = symbol_min_stop(symbol) or info.point * 10
                 if chosen_dir == 'buy' and (entry_price - sl_price) < min_stop:
