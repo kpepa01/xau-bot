@@ -1047,6 +1047,8 @@ class BotConfig:
         'XAUJPY': ['USDJPY', 'JP225']
     })
     MAX_CORRELATION_THRESHOLD: float = 0.7
+    CORRELATED_EXPOSURE_LOT_REDUCTION: float = 0.35
+    CORRELATED_EXPOSURE_MAX_OPEN: int = 1
 
     # ==== News Filter ====
     ECONOMIC_NEWS_FILTER: bool = True
@@ -4557,6 +4559,69 @@ def adjust_sl_for_volatility(entry_price: float, direction: str, atr: float, sl_
     clamped_dist = min(max(dist, min_dist), max_dist)
     return entry_price - clamped_dist if direction == 'buy' else entry_price + clamped_dist
 
+def estimate_loss_usd(symbol: str, entry_price: float, sl_price: float, lot: float) -> float:
+    """Estimate SL loss in USD using symbol tick metadata."""
+    if lot <= 0:
+        return 0.0
+    info = get_symbol_info_safe(symbol)
+    if info is None:
+        return 0.0
+
+    tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
+    tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
+    move = abs(float(entry_price) - float(sl_price))
+
+    if tick_value > 0 and tick_size > 0 and move > 0:
+        ticks = move / tick_size
+        return max(0.0, ticks * tick_value * float(lot))
+
+    point = float(getattr(info, "point", 0.0) or 0.0)
+    if point <= 0 or move <= 0:
+        return 0.0
+
+    value_per_point = tick_value / tick_size if tick_value > 0 and tick_size > 0 else 0.0
+    if value_per_point <= 0:
+        return 0.0
+    points = move / point
+    return max(0.0, points * value_per_point * point * float(lot))
+
+
+def correlated_exposure_lot_adjustment(symbol: str, direction: str, proposed_lot: float) -> float:
+    """Reduce lot when correlated symbols already have open same-direction exposure."""
+    try:
+        if proposed_lot <= 0:
+            return proposed_lot
+
+        positions = get_positions_safe() or []
+        correlated = set(config.CORRELATION_PAIRS.get(symbol, []))
+        if not correlated:
+            return proposed_lot
+
+        same_dir_open = 0
+        for pos in positions:
+            psym = getattr(pos, 'symbol', '')
+            if psym not in correlated:
+                continue
+            if getattr(pos, 'magic', None) != config.MAGIC:
+                continue
+            pdir = 'buy' if getattr(pos, 'type', None) == 0 else 'sell'
+            if pdir == direction:
+                same_dir_open += 1
+
+        if same_dir_open >= int(config.CORRELATED_EXPOSURE_MAX_OPEN):
+            reduction = min(0.8, max(0.0, float(config.CORRELATED_EXPOSURE_LOT_REDUCTION)))
+            adjusted = proposed_lot * (1.0 - reduction)
+            logger.logger.info(
+                f"{nowstr()} {symbol}: correlated exposure active ({same_dir_open}), "
+                f"reducing lot {proposed_lot:.3f} -> {adjusted:.3f}"
+            )
+            return adjusted
+
+    except Exception as e:
+        logger.log_error("correlated_exposure_lot_adjustment", str(e), "WARNING", symbol)
+
+    return proposed_lot
+
 def calculate_position_size(symbol: str, entry_price: float, sl_price: float) -> float:
     info = get_symbol_info_safe(symbol)
     if info is None:
@@ -6084,20 +6149,17 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 else:
                     lot = round_lot(symbol, config.LOT_FIXED)
                 
-                if chosen_dir == 'buy':
-                    potential_loss_points = (entry_price - sl_price) / info.point
-                else:
-                    potential_loss_points = (sl_price - entry_price) / info.point
-                
-                potential_loss_usd = potential_loss_points * 0.02
-                
+                lot = round_lot(symbol, correlated_exposure_lot_adjustment(symbol, chosen_dir, lot))
+
+                potential_loss_usd = estimate_loss_usd(symbol, entry_price, sl_price, lot)
+
                 if potential_loss_usd > config.MAX_LOSS_PER_TRADE:
                     logger.logger.warning(f"{symbol}: Potential loss ${potential_loss_usd:.2f} > max ${config.MAX_LOSS_PER_TRADE}")
-                    max_allowed_points = config.MAX_LOSS_PER_TRADE / 0.02
-                    if potential_loss_points > max_allowed_points:
-                        adjustment = max_allowed_points / potential_loss_points
+                    if potential_loss_usd > 0:
+                        adjustment = config.MAX_LOSS_PER_TRADE / potential_loss_usd
                         lot = round_lot(symbol, lot * adjustment)
-                        logger.logger.info(f"{symbol}: Adjusted lot from {config.LOT_FIXED} to {lot}")
+                        potential_loss_usd = estimate_loss_usd(symbol, entry_price, sl_price, lot)
+                        logger.logger.info(f"{symbol}: Adjusted lot for max-loss control -> {lot}")
                 
                 logger.logger.info(f"{nowstr()} {symbol} ATTEMPT {chosen_dir} lot={lot:.3f} "
                                  f"entry={entry_price:.5f} sl={sl_price:.5f} tp={tp_price:.5f} "
