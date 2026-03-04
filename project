@@ -5317,6 +5317,47 @@ def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp
         debug_mt5_error()
         return None
 
+def ensure_position_tracked(symbol: str, pos: Any) -> None:
+    """Bootstrap tracker state for already-open live positions (e.g., after bot restart)."""
+    try:
+        ticket = int(getattr(pos, 'ticket', 0) or 0)
+        if ticket <= 0:
+            return
+        if trade_tracker.get_trade(ticket) is not None:
+            return
+
+        direction = 'buy' if getattr(pos, 'type', None) == 0 else 'sell'
+        entry_price = float(getattr(pos, 'price_open', 0.0) or 0.0)
+        sl_price = float(getattr(pos, 'sl', 0.0) or 0.0)
+        tp_price = float(getattr(pos, 'tp', 0.0) or 0.0)
+        volume = float(getattr(pos, 'volume', config.LOT_FIXED) or config.LOT_FIXED)
+
+        if entry_price <= 0:
+            return
+
+        if sl_price <= 0:
+            min_stop = symbol_min_stop(symbol) or 0.5
+            if direction == 'buy':
+                sl_price = entry_price - min_stop
+            else:
+                sl_price = entry_price + min_stop
+
+        trade_tracker.add_trade(
+            ticket=ticket,
+            symbol=symbol,
+            direction=direction,
+            entry_price=entry_price,
+            sl_price=sl_price,
+            tp_price=tp_price,
+            confluence_score=0,
+            fvg_signal=False,
+            lot_size=volume
+        )
+        logger.logger.info(f"{nowstr()} {symbol}: bootstrapped tracker for live ticket={ticket}")
+    except Exception as e:
+        logger.log_error("ensure_position_tracked", str(e), "WARNING", symbol)
+
+
 # ==================== ENHANCED HYBRID SL MANAGEMENT ====================
 def manage_hybrid_trailing_enhanced(symbol: str):
     """Enhanced trailing stop management with safety checks"""
@@ -5337,6 +5378,7 @@ def manage_hybrid_trailing_enhanced(symbol: str):
         current_price = tick.ask
     
     ticket = pos.ticket
+    ensure_position_tracked(symbol, pos)
     result = trade_tracker.update_trade(ticket, current_price)
     
     if result is not None:
@@ -5415,6 +5457,18 @@ def manage_hybrid_trailing_enhanced(symbol: str):
                 except Exception as e:
                     logger.logger.error(f"{nowstr()} {symbol}: Error moving SL: {e}")
                     logger.log_error("manage_hybrid_trailing_enhanced", str(e), "ERROR", symbol)
+
+    if result is None:
+        try:
+            tracked = trade_tracker.get_trade(ticket)
+            if tracked:
+                current_profit_usd = trade_tracker.calculate_current_profit_usd(ticket, current_price)
+                logger.logger.debug(
+                    f"{nowstr()} {symbol}: no SL move ticket={ticket} profit=${current_profit_usd:.2f} "
+                    f"start=${config.SMART_TRAIL_START_USD:.2f} current_sl={tracked.get('current_sl', 0):.5f}"
+                )
+        except Exception:
+            pass
 
     trade_info = trade_tracker.get_trade(ticket)
     if trade_info and trade_info.get('open_time'):
