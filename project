@@ -831,6 +831,7 @@ class BotConfig:
 
     COOLDOWN: int = 1800
     FORCE_TRADE_EVERY: int = 1400
+    FORCE_TRADE_ENABLED: bool = False
 
     # ==== Indicator Settings ====
     EMA_FAST: int = 12
@@ -884,6 +885,7 @@ class BotConfig:
 
     MIN_CONFIRMING_SIGNALS: int = 2
     CONSECUTIVE_LOSS_LIMIT: int = 3
+    CONSECUTIVE_LOSS_COOLDOWN_MINUTES: int = 90
 
     # ==== Partial Close ====
     PARTIAL_CLOSE_ENABLED: bool = True
@@ -910,7 +912,8 @@ class BotConfig:
     ENTRY_RSI_SELL_MIN: float = 28.0
 
     # ==== Daily Protection ====
-    DAILY_LOSS_PCT: float = 3.0
+    DAILY_LOSS_PCT: float = 5.0
+    DAILY_LOSS_HARD_STOP: bool = False
     DAILY_PROFIT_PCT: float = 3.0
     MAX_DRAWDOWN_PCT: float = 5.0
     MAX_DAILY_TRADES: int = 60
@@ -2627,6 +2630,7 @@ class TradeTracker:
         self.consecutive_losses = 0
         self.lock = threading.RLock()
         self.max_loss_per_trade = config.MAX_LOSS_PER_TRADE
+        self.paused_until = 0.0
     
     def add_trade(self, ticket: int, symbol: str, direction: str, 
                   entry_price: float, sl_price: float, tp_price: float,
@@ -2746,24 +2750,38 @@ class TradeTracker:
         return thresholds
     
     def update_consecutive_losses(self, profit: float):
-        """Track consecutive losses for safety pausing"""
+        """Track consecutive losses with timed cooldown pause instead of permanent lock."""
         with self.lock:
             if profit < 0:
                 self.consecutive_losses += 1
                 logger.logger.warning(f"Consecutive losses: {self.consecutive_losses}/{config.CONSECUTIVE_LOSS_LIMIT}")
-                
+
                 if self.consecutive_losses >= config.CONSECUTIVE_LOSS_LIMIT:
-                    logger.logger.critical(f"⚠️ PAUSING TRADING: {self.consecutive_losses} consecutive losses!")
-                    logger.log_error("update_consecutive_losses", 
-                                   f"{self.consecutive_losses} consecutive losses - Trading paused",
-                                   "CRITICAL")
+                    cooldown = max(15, int(config.CONSECUTIVE_LOSS_COOLDOWN_MINUTES)) * 60
+                    self.paused_until = max(self.paused_until, time.time() + cooldown)
+                    logger.logger.critical(
+                        f"⚠️ Trading cooldown active for {cooldown//60}m after {self.consecutive_losses} consecutive losses"
+                    )
+                    logger.log_error(
+                        "update_consecutive_losses",
+                        f"Cooldown after {self.consecutive_losses} consecutive losses ({cooldown//60}m)",
+                        "CRITICAL",
+                    )
             else:
                 self.consecutive_losses = 0
-    
+                self.paused_until = 0.0
+
     def should_pause_trading(self) -> bool:
-        """Check if trading should be paused due to consecutive losses"""
+        """Pause only while cooldown timer is active; auto-resume afterwards."""
         with self.lock:
-            return self.consecutive_losses >= config.CONSECUTIVE_LOSS_LIMIT
+            now = time.time()
+            if now < self.paused_until:
+                return True
+            if self.paused_until > 0:
+                logger.logger.info("Consecutive-loss cooldown elapsed, trading resumed")
+                self.paused_until = 0.0
+                self.consecutive_losses = 0
+            return False
     
     def calculate_current_profit_pips(self, ticket: int, current_price: float) -> float:
         """Calculate current profit in pips"""
@@ -3941,6 +3959,7 @@ class EnhancedGlobalState:
         self.signal_stats = self._load_learning_stats()
         self.market_regimes = {s: "unknown" for s in config.SYMBOLS}
         self.consecutive_losses_by_symbol = {s: 0 for s in config.SYMBOLS}
+        self.symbol_paused_until = {s: 0.0 for s in config.SYMBOLS}
         self.signal_strength = {s: 0 for s in config.SYMBOLS}
         self.confluence_manager = ConfluenceManager()
         self.trade_filter = TradeFilter()
@@ -4099,18 +4118,30 @@ class EnhancedGlobalState:
         return stats
     
     def update_consecutive_losses(self, symbol: str, profit: float):
-        """Update consecutive losses for a symbol"""
+        """Update per-symbol consecutive losses with timed cooldown."""
         with self.lock:
             if profit < 0:
                 self.consecutive_losses_by_symbol[symbol] += 1
                 logger.logger.warning(f"{symbol}: Consecutive losses: {self.consecutive_losses_by_symbol[symbol]}")
+                if self.consecutive_losses_by_symbol[symbol] >= config.CONSECUTIVE_LOSS_LIMIT:
+                    cooldown = max(15, int(config.CONSECUTIVE_LOSS_COOLDOWN_MINUTES)) * 60
+                    self.symbol_paused_until[symbol] = max(self.symbol_paused_until.get(symbol, 0.0), time.time() + cooldown)
             else:
                 self.consecutive_losses_by_symbol[symbol] = 0
-    
+                self.symbol_paused_until[symbol] = 0.0
+
     def should_pause_symbol(self, symbol: str) -> bool:
-        """Check if trading should be paused for a symbol"""
+        """Check whether symbol cooldown is active and auto-resume when elapsed."""
         with self.lock:
-            return self.consecutive_losses_by_symbol.get(symbol, 0) >= config.CONSECUTIVE_LOSS_LIMIT
+            now = time.time()
+            until = self.symbol_paused_until.get(symbol, 0.0)
+            if now < until:
+                return True
+            if until > 0:
+                self.symbol_paused_until[symbol] = 0.0
+                self.consecutive_losses_by_symbol[symbol] = 0
+                logger.logger.info(f"{symbol}: symbol cooldown elapsed, trading resumed")
+            return False
     
     def update_learning(self, symbol: str, signal: str, outcome: str):
         with self.lock:
@@ -4187,17 +4218,19 @@ class EnhancedGlobalState:
                             self.max_drawdown = max(self.max_drawdown, performance_tracker.max_drawdown)
                     
                     current_balance = float(acct.balance)
-                    profit_pct = ((current_balance - STARTING_BALANCE) / STARTING_BALANCE) * 100.0
-                    
-                    if profit_pct <= -config.DAILY_LOSS_PCT:
-                        self.daily_loss_triggered = True
+                    daily_reference = max(1e-6, self.peak_equity if self.peak_equity > 0 else STARTING_BALANCE)
+                    equity_drawdown_pct = ((current_equity - daily_reference) / daily_reference) * 100.0
+                    profit_pct = ((current_balance - STARTING_BALANCE) / max(1e-6, STARTING_BALANCE)) * 100.0
+
+                    if equity_drawdown_pct <= -config.DAILY_LOSS_PCT:
+                        self.daily_loss_triggered = bool(config.DAILY_LOSS_HARD_STOP)
                         self.circuit_breaker_until = max(
                             self.circuit_breaker_until,
                             time.time() + config.CIRCUIT_BREAKER_COOL_OFF_MINUTES * 60,
                         )
-                        logger.logger.warning(f"Daily loss limit triggered: {profit_pct:.2f}%")
+                        logger.logger.warning(f"Daily loss/cooldown triggered: {equity_drawdown_pct:.2f}%")
                         logger.log_error("update_daily_stats", 
-                                       f"Daily loss limit {profit_pct:.2f}% triggered",
+                                       f"Daily loss/cooldown {equity_drawdown_pct:.2f}% triggered",
                                        "CRITICAL")
                     
                     if self.max_drawdown >= config.MAX_DRAWDOWN_PCT:
@@ -5835,9 +5868,13 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 continue
             
             if global_state.daily_loss_triggered:
-                logger.logger.warning(f"{nowstr()} {symbol}: daily limit triggered - pausing")
-                time.sleep(60)
-                continue
+                if (not config.DAILY_LOSS_HARD_STOP) and time.time() >= getattr(global_state, 'circuit_breaker_until', 0.0):
+                    global_state.daily_loss_triggered = False
+                    logger.logger.info(f"{nowstr()} {symbol}: daily cooldown elapsed, resuming trading")
+                else:
+                    logger.logger.warning(f"{nowstr()} {symbol}: daily limit triggered - pausing")
+                    time.sleep(60)
+                    continue
 
             if time.time() < getattr(global_state, 'circuit_breaker_until', 0.0):
                 remaining = int(global_state.circuit_breaker_until - time.time())
@@ -5972,7 +6009,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     liquidity_signal_active = True
             
             # FORCE TRADE LOGIC
-            if (chosen_dir is None and 
+            if (config.FORCE_TRADE_ENABLED and chosen_dir is None and 
                 time.time() - global_state.last_forced_time.get(symbol, 0) >= config.FORCE_TRADE_EVERY):
                 
                 ema_fast = bar.get('ema_fast')
