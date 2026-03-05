@@ -831,7 +831,7 @@ class BotConfig:
 
     COOLDOWN: int = 1800
     FORCE_TRADE_EVERY: int = 1400
-    FORCE_TRADE_ENABLED: bool = False
+    FORCE_TRADE_ENABLED: bool = True
 
     # ==== Indicator Settings ====
     EMA_FAST: int = 12
@@ -910,6 +910,9 @@ class BotConfig:
     ENTRY_MAX_DISTANCE_ATR: float = 0.85
     ENTRY_RSI_BUY_MAX: float = 72.0
     ENTRY_RSI_SELL_MIN: float = 28.0
+    VOLATILITY_PERCENTILE_LOOKBACK: int = 200
+    VOL_LOW_PERCENTILE: float = 0.2
+    VOL_HIGH_PERCENTILE: float = 0.8
 
     # ==== Daily Protection ====
     DAILY_LOSS_PCT: float = 5.0
@@ -4483,6 +4486,68 @@ def adjust_sl_for_regime_and_quality(entry_price: float, direction: str, atr: fl
     return min(sl_price, adaptive_sl)
 
 
+def get_atr_percentile(df: pd.DataFrame, lookback: int = 200) -> float:
+    """Compute percentile rank of latest ATR within rolling lookback."""
+    if df.empty or 'atr' not in df.columns:
+        return 0.5
+    atr_series = pd.to_numeric(df['atr'], errors='coerce').dropna()
+    if len(atr_series) < 20:
+        return 0.5
+    window = atr_series.iloc[-max(20, lookback):]
+    last = float(window.iloc[-1])
+    pct = float((window <= last).sum()) / max(1, len(window))
+    return min(1.0, max(0.0, pct))
+
+
+def get_dynamic_sl_multiplier(df: pd.DataFrame) -> float:
+    """Map ATR percentile to SL multiplier for volatility-adaptive risk control."""
+    pctl = get_atr_percentile(df, config.VOLATILITY_PERCENTILE_LOOKBACK)
+    if pctl <= config.VOL_LOW_PERCENTILE:
+        return max(1.1, config.SL_ATR_MULT * 0.8)
+    if pctl >= config.VOL_HIGH_PERCENTILE:
+        return min(4.0, config.SL_ATR_MULT * 1.35)
+    return config.SL_ATR_MULT
+
+
+def detect_rsi_macd_divergence(df: pd.DataFrame, lookback: int = 40) -> Dict[str, Any]:
+    """Lightweight divergence detector (regular bullish/bearish) using RSI and MACD-diff."""
+    result = {'bullish': 0, 'bearish': 0, 'details': []}
+    if df.empty or len(df) < 25:
+        return result
+
+    w = df.tail(max(25, lookback)).copy()
+    if not {'low', 'high', 'rsi'}.issubset(w.columns):
+        return result
+
+    lows = w['low'].astype(float)
+    highs = w['high'].astype(float)
+    rsi = pd.to_numeric(w['rsi'], errors='coerce').fillna(50.0)
+    macd = pd.to_numeric(w.get('macd_diff', pd.Series([0.0]*len(w), index=w.index)), errors='coerce').fillna(0.0)
+
+    low_idx = lows.nsmallest(4).index.sort_values()
+    high_idx = highs.nlargest(4).index.sort_values()
+
+    if len(low_idx) >= 2:
+        i1, i2 = low_idx[-2], low_idx[-1]
+        if float(lows.loc[i2]) < float(lows.loc[i1]) and float(rsi.loc[i2]) > float(rsi.loc[i1]):
+            result['bullish'] += 1
+            result['details'].append('rsi_bullish_div')
+        if float(lows.loc[i2]) < float(lows.loc[i1]) and float(macd.loc[i2]) > float(macd.loc[i1]):
+            result['bullish'] += 1
+            result['details'].append('macd_bullish_div')
+
+    if len(high_idx) >= 2:
+        j1, j2 = high_idx[-2], high_idx[-1]
+        if float(highs.loc[j2]) > float(highs.loc[j1]) and float(rsi.loc[j2]) < float(rsi.loc[j1]):
+            result['bearish'] += 1
+            result['details'].append('rsi_bearish_div')
+        if float(highs.loc[j2]) > float(highs.loc[j1]) and float(macd.loc[j2]) < float(macd.loc[j1]):
+            result['bearish'] += 1
+            result['details'].append('macd_bearish_div')
+
+    return result
+
+
 def calculate_momentum_strength(df: pd.DataFrame, direction: str) -> Tuple[bool, float]:
     rsi_val = float(df['rsi'].iloc[-1]) if 'rsi' in df.columns else 50.0
     strength = min(1.0, abs(rsi_val - 50.0) / 50.0)
@@ -5962,6 +6027,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                              f"EMAfast={ema_fast_val:.3f} | EMAslow={ema_slow_val:.3f} | "
                              f"RSI={rsi_val:.2f} | ATR={atr_val:.4f} | "
                              f"Regime={market_regime} | Confluence={confluence_result['confluence_score']}/5")
+            divergence = detect_rsi_macd_divergence(df)
             
             if last_bar_time is not None and bar['time'] == last_bar_time:
                 manage_hybrid_trailing_enhanced(symbol)
@@ -6015,26 +6081,30 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 ema_fast = bar.get('ema_fast')
                 ema_slow = bar.get('ema_slow')
                 
-                if pd.notna(ema_fast) and pd.notna(ema_slow):
-                    if ema_fast > ema_slow:
+                rsi_now = float(bar.get('rsi', 50.0)) if pd.notna(bar.get('rsi')) else 50.0
+                ema_gap = abs(float(ema_fast) - float(ema_slow)) if pd.notna(ema_fast) and pd.notna(ema_slow) else 0.0
+                force_atr = float(bar.get('atr', 0.0)) if pd.notna(bar.get('atr')) else 0.0
+                min_force_gap = max(force_atr * 0.10, 0.01)
+
+                if pd.notna(ema_fast) and pd.notna(ema_slow) and ema_gap >= min_force_gap:
+                    if ema_fast > ema_slow and rsi_now >= 52:
                         chosen_dir = 'buy'
                         confluence_score = 1
                         chosen_reasons = ['Force_EMA_Up']
-                    else:
+                    elif ema_fast < ema_slow and rsi_now <= 48:
                         chosen_dir = 'sell'
                         confluence_score = 1
                         chosen_reasons = ['Force_EMA_Down']
-                else:
-                    import random
-                    chosen_dir = random.choice(['buy', 'sell'])
-                    confluence_score = 0
-                    chosen_reasons = ['Force_Random']
+
+                if chosen_dir is None:
+                    logger.logger.info(f"{nowstr()} {symbol}: force-trade skipped (quality gate ema_gap={ema_gap:.4f}, rsi={rsi_now:.1f})")
                 
-                global_state.last_forced_time[symbol] = time.time()
-                global_state.last_signal_time[symbol] = coerce_timestamp(bar['time'])
-                global_state.last_signal_dir[symbol] = chosen_dir
-                logger.logger.info(f"{nowstr()} {symbol}: FORCE TRADE -> {chosen_dir}")
-                forced_trade = True
+                if chosen_dir is not None:
+                    global_state.last_forced_time[symbol] = time.time()
+                    global_state.last_signal_time[symbol] = coerce_timestamp(bar['time'])
+                    global_state.last_signal_dir[symbol] = chosen_dir
+                    logger.logger.info(f"{nowstr()} {symbol}: FORCE TRADE -> {chosen_dir}")
+                    forced_trade = True
             
             if chosen_dir:
                 ok_fire, fire_reason = evaluate_fire_conditions(confluence_result, chosen_dir)
@@ -6043,7 +6113,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     time.sleep(0.2)
                     continue
 
-                if config.MTF_CONFIRMATION_REQUIRED and not get_mtf_alignment(df_h1, df_h4, chosen_dir) and not forced_trade:
+                if config.MTF_CONFIRMATION_REQUIRED and not get_mtf_alignment(df_h1, df_h4, chosen_dir):
                     logger.logger.info(f"{nowstr()} {symbol}: MTF trend misalignment on H1/H4 for {chosen_dir}")
                     time.sleep(0.2)
                     continue
@@ -6063,13 +6133,28 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                         time.sleep(0.2)
                         continue
                 
-                if config.MOMENTUM_CONFIRMATION_REQUIRED and not forced_trade:
+                if config.MOMENTUM_CONFIRMATION_REQUIRED:
                     confirmed, strength = calculate_momentum_strength(df, chosen_dir)
                     min_momentum = config.RELAX_MIN_MOMENTUM if relax_mode else config.MIN_MOMENTUM_STRENGTH
                     if not confirmed or strength < min_momentum:
                         logger.logger.info(f"{nowstr()} {symbol}: momentum filter failed strength={strength:.2f}")
                         time.sleep(0.2)
                         continue
+
+                if chosen_dir == 'buy' and divergence.get('bearish', 0) >= 2:
+                    logger.logger.info(f"{nowstr()} {symbol}: bearish divergence filter blocked buy ({divergence.get('details', [])})")
+                    time.sleep(0.2)
+                    continue
+                if chosen_dir == 'sell' and divergence.get('bullish', 0) >= 2:
+                    logger.logger.info(f"{nowstr()} {symbol}: bullish divergence filter blocked sell ({divergence.get('details', [])})")
+                    time.sleep(0.2)
+                    continue
+                if chosen_dir == 'buy' and divergence.get('bullish', 0) > 0:
+                    confluence_score += 0.5
+                    chosen_reasons.append('DIV_BULL')
+                if chosen_dir == 'sell' and divergence.get('bearish', 0) > 0:
+                    confluence_score += 0.5
+                    chosen_reasons.append('DIV_BEAR')
 
             opened = active_positions(symbol)
             
@@ -6098,6 +6183,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 entry_price = float(tick.ask) if chosen_dir == 'buy' else float(tick.bid)
                 atr = float(bar['atr']) if not pd.isna(bar.get('atr')) else info.point * 50
                 trend_strength = detect_market_condition_enhanced(df).get("trend_strength", 0.0)
+                dynamic_sl_mult = get_dynamic_sl_multiplier(df)
                 skip_entry, skip_reason = should_skip_chase_entry(
                     df=df,
                     direction=chosen_dir,
@@ -6105,12 +6191,12 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     market_regime=market_regime,
                     has_smc_signal=(fvg_signal_active or liquidity_signal_active)
                 )
-                if skip_entry and not forced_trade:
+                if skip_entry:
                     logger.logger.info(f"{nowstr()} {symbol}: entry quality filter blocked ({skip_reason})")
                     time.sleep(0.2)
                     continue
 
-                sl_dist = atr * config.SL_ATR_MULT
+                sl_dist = atr * dynamic_sl_mult
                 tp_dist = atr * config.TP_ATR_MULT
                 
                 if chosen_dir == 'buy':
@@ -6124,7 +6210,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     sl_price = calculate_support_resistance_sl(df, chosen_dir, entry_price, atr)
 
                 if config.USE_ATR_MULTIPLIER_SL:
-                    atr_sl = atr * config.ATR_SL_MULTIPLIER
+                    atr_sl = atr * max(config.ATR_SL_MULTIPLIER, dynamic_sl_mult)
                     if chosen_dir == 'buy':
                         sl_price = min(sl_price, entry_price - atr_sl)
                     else:
