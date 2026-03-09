@@ -829,9 +829,11 @@ class BotConfig:
     VOLATILITY_ADJUSTED_SL: bool = False
     MIN_RR_RATIO: float = 2.0
 
-    COOLDOWN: int = 1800
+    COOLDOWN: int = 600
     FORCE_TRADE_EVERY: int = 1400
     FORCE_TRADE_ENABLED: bool = True
+    COOLDOWN_MIN_SECONDS: int = 180
+    COOLDOWN_HIGH_QUALITY_SECONDS: int = 300
 
     # ==== Indicator Settings ====
     EMA_FAST: int = 12
@@ -853,7 +855,7 @@ class BotConfig:
     MAX_SL_DISTANCE_ATR: float = 3.0
     MOMENTUM_CONFIRMATION_REQUIRED: bool = True
     MIN_MOMENTUM_STRENGTH: float = 0.6
-    ENTRY_DELAY_BARS: int = 2
+    ENTRY_DELAY_BARS: int = 1
     AUTO_RELAX_FILTERS: bool = True
     NO_TRADE_RELAX_MINUTES: int = 30
     RELAX_MIN_RR_RATIO: float = 1.6
@@ -919,11 +921,11 @@ class BotConfig:
     DAILY_LOSS_HARD_STOP: bool = False
     DAILY_PROFIT_PCT: float = 3.0
     MAX_DRAWDOWN_PCT: float = 5.0
-    MAX_DAILY_TRADES: int = 60
+    MAX_DAILY_TRADES: int = 140
 
     # ==== Time Restrictions ====
-    NO_TRADE_START: dt_time = dt_time(23, 0)
-    NO_TRADE_END: dt_time = dt_time(0, 30)
+    NO_TRADE_START: dt_time = dt_time(23, 55)
+    NO_TRADE_END: dt_time = dt_time(0, 5)
 
     # ==== Stability & Automation ====
     SUMMARY_INTERVAL: int = 1800
@@ -4293,6 +4295,27 @@ def is_in_trading_session(session_name: str) -> bool:
         return start <= now_time <= end
     return now_time >= start or now_time <= end
 
+def compute_effective_cooldown_seconds(symbol: str, confluence_score: float, market_regime: str,
+                                     fvg_signal_active: bool, liquidity_signal_active: bool) -> int:
+    """Adaptive cooldown: trade more often for high-quality setups while limiting churn."""
+    base_cd = int(max(60, config.COOLDOWN))
+    min_cd = int(max(60, config.COOLDOWN_MIN_SECONDS))
+    high_quality_cd = int(max(min_cd, config.COOLDOWN_HIGH_QUALITY_SECONDS))
+
+    score = float(confluence_score)
+    if fvg_signal_active:
+        score += float(config.FVG_CONFLUENCE_WEIGHT)
+    if liquidity_signal_active:
+        score += float(config.LIQUIDITY_CONFLUENCE_WEIGHT)
+
+    if market_regime == 'trending' and score >= 3.5:
+        return min(high_quality_cd, base_cd)
+    if score >= 4.5:
+        return min(high_quality_cd, base_cd)
+    if market_regime == 'ranging':
+        return max(base_cd, int(base_cd * 1.2))
+    return base_cd
+
 def timeframe_seconds(timeframe: int) -> int:
     mapping = {
         mt5.TIMEFRAME_M1: 60,
@@ -6037,7 +6060,14 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             
             last_bar_time = bar['time']
             
-            if time.time() - global_state.last_trade_time.get(symbol, 0) < config.COOLDOWN:
+            effective_cd = compute_effective_cooldown_seconds(
+                symbol=symbol,
+                confluence_score=confluence_result.get('confluence_score', 0),
+                market_regime=market_regime,
+                fvg_signal_active=(len(confluence_result.get('fvg_signals', [])) > 0),
+                liquidity_signal_active=(len(confluence_result.get('liquidity_signals', [])) > 0)
+            )
+            if time.time() - global_state.last_trade_time.get(symbol, 0) < effective_cd:
                 manage_hybrid_trailing_enhanced(symbol)
                 check_closed_trades_enhanced()
                 time.sleep(0.2)
@@ -6433,7 +6463,7 @@ def main_enhanced():
         logger.logger.info("=" * 80)
         logger.logger.info("SAFETY CONFIGURATION:")
         logger.logger.info(f"  • Lot size: {config.LOT_FIXED}")
-        logger.logger.info(f"  • Cooldown: {config.COOLDOWN} seconds")
+        logger.logger.info(f"  • Cooldown: {config.COOLDOWN} seconds (adaptive min {config.COOLDOWN_MIN_SECONDS}s, high-quality {config.COOLDOWN_HIGH_QUALITY_SECONDS}s)")
         logger.logger.info(f"  • SL Multiplier: {config.SL_ATR_MULT}")
         logger.logger.info(f"  • Max loss per trade: ${config.MAX_LOSS_PER_TRADE}")
         logger.logger.info(f"  • Consecutive loss limit: {config.CONSECUTIVE_LOSS_LIMIT}")
