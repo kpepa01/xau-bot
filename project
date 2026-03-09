@@ -1057,6 +1057,10 @@ class BotConfig:
     MAX_CORRELATION_THRESHOLD: float = 0.7
     CORRELATED_EXPOSURE_LOT_REDUCTION: float = 0.35
     CORRELATED_EXPOSURE_MAX_OPEN: int = 1
+    SIGNAL_MIN_SAMPLES: int = 12
+    SIGNAL_MIN_WINRATE: float = 0.42
+    MONTE_CARLO_PATHS: int = 400
+    RISK_OF_RUIN_ALERT_PCT: float = 5.0
 
     # ==== News Filter ====
     ECONOMIC_NEWS_FILTER: bool = True
@@ -4719,6 +4723,10 @@ def correlated_exposure_lot_adjustment(symbol: str, direction: str, proposed_lot
             return proposed_lot
 
         same_dir_open = 0
+        corr_weight = 0.0
+        corr_snapshot = getattr(global_state, 'correlation_data', {}) or {}
+        pair_corr = corr_snapshot.get(symbol, {}) if isinstance(corr_snapshot, dict) else {}
+
         for pos in positions:
             psym = getattr(pos, 'symbol', '')
             if psym not in correlated:
@@ -4728,12 +4736,15 @@ def correlated_exposure_lot_adjustment(symbol: str, direction: str, proposed_lot
             pdir = 'buy' if getattr(pos, 'type', None) == 0 else 'sell'
             if pdir == direction:
                 same_dir_open += 1
+                corr_weight += abs(float(pair_corr.get(psym, 0.5) or 0.5))
 
         if same_dir_open >= int(config.CORRELATED_EXPOSURE_MAX_OPEN):
-            reduction = min(0.8, max(0.0, float(config.CORRELATED_EXPOSURE_LOT_REDUCTION)))
+            base_reduction = min(0.8, max(0.0, float(config.CORRELATED_EXPOSURE_LOT_REDUCTION)))
+            dynamic_bonus = min(0.25, 0.05 * corr_weight)
+            reduction = min(0.9, base_reduction + dynamic_bonus)
             adjusted = proposed_lot * (1.0 - reduction)
             logger.logger.info(
-                f"{nowstr()} {symbol}: correlated exposure active ({same_dir_open}), "
+                f"{nowstr()} {symbol}: correlated exposure active ({same_dir_open}, corr_w={corr_weight:.2f}), "
                 f"reducing lot {proposed_lot:.3f} -> {adjusted:.3f}"
             )
             return adjusted
@@ -5689,6 +5700,68 @@ def check_closed_trades_enhanced():
         logger.logger.error(f"Error in check_closed_trades_enhanced: {e}")
         logger.log_error("check_closed_trades_enhanced", str(e), "ERROR")
 
+def setup_quality_gate(symbol: str, market_regime: str, confluence_score: float) -> Tuple[bool, str]:
+    """Adaptive pre-trade gate using recent performance and regime attribution."""
+    recent = list(global_state.recent_performance)
+    min_samples = max(5, int(config.SIGNAL_MIN_SAMPLES))
+    if len(recent) < min_samples:
+        return True, "insufficient_samples"
+
+    wins = sum(1 for p in recent[-min_samples:] if p > 0)
+    win_rate = wins / float(min_samples)
+    if win_rate >= float(config.SIGNAL_MIN_WINRATE):
+        return True, f"ok_winrate={win_rate:.2f}"
+
+    # When recent performance is weak, require stronger confluence to continue trading.
+    dynamic_min_confluence = max(config.MIN_CONFLUENCE_SCORE + 1, 3)
+    if confluence_score >= dynamic_min_confluence:
+        return True, f"weak_winrate_but_strong_confluence={confluence_score}"
+
+    return False, f"weak_recent_winrate={win_rate:.2f}<={config.SIGNAL_MIN_WINRATE:.2f}"
+
+
+def monte_carlo_drawdown_risk(perf: List[float], paths: int = 400) -> Dict[str, float]:
+    """Simple Monte Carlo resampling on recent trade outcomes."""
+    if not perf:
+        return {'worst_dd_pct': 0.0, 'p95_dd_pct': 0.0}
+
+    sample = np.array(perf[-120:], dtype=float)
+    n = len(sample)
+    paths = max(100, int(paths))
+    drawdowns = []
+
+    for _ in range(paths):
+        seq = np.random.choice(sample, size=n, replace=True)
+        equity = 0.0
+        peak = 0.0
+        worst = 0.0
+        for r in seq:
+            equity += float(r)
+            peak = max(peak, equity)
+            worst = min(worst, equity - peak)
+        denom = max(1.0, abs(peak) + 1.0)
+        dd_pct = abs(worst) / denom * 100.0
+        drawdowns.append(dd_pct)
+
+    drawdowns = np.array(drawdowns)
+    return {
+        'worst_dd_pct': float(np.max(drawdowns)) if len(drawdowns) else 0.0,
+        'p95_dd_pct': float(np.percentile(drawdowns, 95)) if len(drawdowns) else 0.0,
+    }
+
+
+def risk_of_ruin_probability(balance: float, risk_per_trade: float, win_rate: float, rr: float) -> float:
+    """Approximate risk-of-ruin style metric for dashboarding."""
+    if balance <= 0 or risk_per_trade <= 0:
+        return 100.0
+    edge = (win_rate * rr) - (1.0 - win_rate)
+    if edge <= 0:
+        return 100.0
+    units = max(1.0, balance / risk_per_trade)
+    ruin = (1.0 / (1.0 + edge)) ** units
+    return min(100.0, max(0.0, ruin * 100.0))
+
+
 # ==================== ENHANCED PERFORMANCE MONITORING ====================
 def print_daily_summary_enhanced():
     """Enhanced daily performance summary"""
@@ -5760,7 +5833,16 @@ def print_daily_summary_enhanced():
         logger.logger.info(f"Profit Factor: {profit_factor:.2f}")
         logger.logger.info(f"Sharpe Ratio: {sharpe:.2f}")
         logger.logger.info(f"Daily P/L: ${daily_pnl:.2f}")
+        mc = monte_carlo_drawdown_risk(list(global_state.recent_performance), config.MONTE_CARLO_PATHS)
+        risk_per_trade = max(1.0, config.MAX_LOSS_PER_TRADE)
+        rr_for_ror = max(0.5, config.MIN_RR_RATIO)
+        ror_pct = risk_of_ruin_probability(balance, risk_per_trade, win_rate / 100.0, rr_for_ror)
+
         logger.logger.info(f"Max Drawdown: {global_state.max_drawdown:.2f}%")
+        logger.logger.info(f"MonteCarlo DD95: {mc['p95_dd_pct']:.2f}% | WorstMC DD: {mc['worst_dd_pct']:.2f}%")
+        logger.logger.info(f"Risk of Ruin (approx): {ror_pct:.2f}%")
+        if ror_pct > float(config.RISK_OF_RUIN_ALERT_PCT):
+            logger.logger.warning(f"⚠️ Risk of ruin above threshold: {ror_pct:.2f}% > {config.RISK_OF_RUIN_ALERT_PCT:.2f}%")
         logger.logger.info(f"Consecutive Losses: {trade_tracker.consecutive_losses}/{config.CONSECUTIVE_LOSS_LIMIT}")
         logger.logger.info(f"Tracked Trades: {len(trade_tracker.trades)}")
         logger.logger.info("=" * 80)
@@ -6185,6 +6267,12 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 if chosen_dir == 'sell' and divergence.get('bearish', 0) > 0:
                     confluence_score += 0.5
                     chosen_reasons.append('DIV_BEAR')
+
+            allow_setup, setup_reason = setup_quality_gate(symbol, market_regime, confluence_score)
+            if not allow_setup and not forced_trade:
+                logger.logger.info(f"{nowstr()} {symbol}: setup quality gate blocked ({setup_reason})")
+                time.sleep(0.2)
+                continue
 
             opened = active_positions(symbol)
             
