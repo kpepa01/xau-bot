@@ -826,11 +826,12 @@ class BotConfig:
     MIN_RISK_PER_TRADE_USD: float = 5.0
     DYNAMIC_POSITION_SIZING: bool = False
     RISK_PER_TRADE_PCT: float = 1.0
-    VOLATILITY_ADJUSTED_SL: bool = True
+    VOLATILITY_ADJUSTED_SL: bool = False
     MIN_RR_RATIO: float = 2.0
 
     COOLDOWN: int = 1800
     FORCE_TRADE_EVERY: int = 1400
+    FORCE_TRADE_ENABLED: bool = True
 
     # ==== Indicator Settings ====
     EMA_FAST: int = 12
@@ -884,6 +885,7 @@ class BotConfig:
 
     MIN_CONFIRMING_SIGNALS: int = 2
     CONSECUTIVE_LOSS_LIMIT: int = 3
+    CONSECUTIVE_LOSS_COOLDOWN_MINUTES: int = 90
 
     # ==== Partial Close ====
     PARTIAL_CLOSE_ENABLED: bool = True
@@ -897,16 +899,28 @@ class BotConfig:
     BREAKEVEN_AT_PIPS: float = 60.0
     BREAKEVEN_MIN_PROFIT: float = 6.0
     TRAIL_PROFIT_STEP_USD: float = 7.0
+    SMART_TRAIL_START_USD: float = 4.0
+    SMART_TRAIL_BE_BUFFER_USD: float = 1.0
+    SMART_TRAIL_LOCK_RATIO: float = 0.82
+    SMART_TRAIL_MAX_GIVEBACK_USD: float = 2.5
+    SMART_TRAIL_MIN_INCREMENT_USD: float = 1.25
+    DYNAMIC_TP_TRENDING_ATR_MULT: float = 2.0
+    DYNAMIC_TP_RANGING_ATR_MULT: float = 1.0
+    DYNAMIC_TP_VOLATILE_ATR_MULT: float = 1.4
+    ENTRY_MAX_DISTANCE_ATR: float = 0.85
+    ENTRY_RSI_BUY_MAX: float = 72.0
+    ENTRY_RSI_SELL_MIN: float = 28.0
 
     # ==== Daily Protection ====
-    DAILY_LOSS_PCT: float = 3.0
+    DAILY_LOSS_PCT: float = 5.0
+    DAILY_LOSS_HARD_STOP: bool = False
     DAILY_PROFIT_PCT: float = 3.0
     MAX_DRAWDOWN_PCT: float = 5.0
     MAX_DAILY_TRADES: int = 60
 
     # ==== Time Restrictions ====
     NO_TRADE_START: dt_time = dt_time(23, 0)
-    NO_TRADE_END: dt_time = dt_time(0, 30)
+    NO_TRADE_END: dt_time = dt_time(0, 10)
 
     # ==== Stability & Automation ====
     SUMMARY_INTERVAL: int = 1800
@@ -958,7 +972,7 @@ class BotConfig:
     FVG_USE_OPPOSITE_SIDE_TP: bool = True
     FVG_SL_BREAKER_MULTIPLIER: float = 1.2
     FVG_MIN_STOP_ATR_MULTIPLIER: float = 1.0
-    FVG_MIN_CANDLE_BODY_RATIO: float = 0.8
+    FVG_MIN_CANDLE_BODY_RATIO: float = 0.6
     FVG_MAX_GAP_PERCENTAGE: float = 0.02
     FVG_STRENGTH_VOLUME_MULTIPLIER: float = 1.5
 
@@ -1036,6 +1050,8 @@ class BotConfig:
         'XAUJPY': ['USDJPY', 'JP225']
     })
     MAX_CORRELATION_THRESHOLD: float = 0.7
+    CORRELATED_EXPOSURE_LOT_REDUCTION: float = 0.35
+    CORRELATED_EXPOSURE_MAX_OPEN: int = 1
 
     # ==== News Filter ====
     ECONOMIC_NEWS_FILTER: bool = True
@@ -1722,6 +1738,13 @@ class ConnectionManager:
                     logger.log_error("validate_all_symbols", f"Symbol {symbol} not found", "ERROR")
                 else:
                     logger.logger.info(f"✅ Symbol {symbol} validated")
+                    logger.logger.info(
+                        f"{symbol} point={getattr(info, 'point', 'n/a')}, "
+                        f"trade_tick_size={getattr(info, 'trade_tick_size', 'n/a')}, "
+                        f"trade_tick_value={getattr(info, 'trade_tick_value', 'n/a')}, "
+                        f"stops_level={getattr(info, 'trade_stops_level', 'n/a')}, "
+                        f"digits={getattr(info, 'digits', 'n/a')}"
+                    )
                     logger.logger.debug(f"  Point: {info.point}, Spread: {info.spread}")
             except Exception as e:
                 logger.logger.error(f"Error validating symbol {symbol}: {e}")
@@ -2607,6 +2630,7 @@ class TradeTracker:
         self.consecutive_losses = 0
         self.lock = threading.RLock()
         self.max_loss_per_trade = config.MAX_LOSS_PER_TRADE
+        self.paused_until = 0.0
     
     def add_trade(self, ticket: int, symbol: str, direction: str, 
                   entry_price: float, sl_price: float, tp_price: float,
@@ -2726,24 +2750,38 @@ class TradeTracker:
         return thresholds
     
     def update_consecutive_losses(self, profit: float):
-        """Track consecutive losses for safety pausing"""
+        """Track consecutive losses with timed cooldown pause instead of permanent lock."""
         with self.lock:
             if profit < 0:
                 self.consecutive_losses += 1
                 logger.logger.warning(f"Consecutive losses: {self.consecutive_losses}/{config.CONSECUTIVE_LOSS_LIMIT}")
-                
+
                 if self.consecutive_losses >= config.CONSECUTIVE_LOSS_LIMIT:
-                    logger.logger.critical(f"⚠️ PAUSING TRADING: {self.consecutive_losses} consecutive losses!")
-                    logger.log_error("update_consecutive_losses", 
-                                   f"{self.consecutive_losses} consecutive losses - Trading paused",
-                                   "CRITICAL")
+                    cooldown = max(15, int(config.CONSECUTIVE_LOSS_COOLDOWN_MINUTES)) * 60
+                    self.paused_until = max(self.paused_until, time.time() + cooldown)
+                    logger.logger.critical(
+                        f"⚠️ Trading cooldown active for {cooldown//60}m after {self.consecutive_losses} consecutive losses"
+                    )
+                    logger.log_error(
+                        "update_consecutive_losses",
+                        f"Cooldown after {self.consecutive_losses} consecutive losses ({cooldown//60}m)",
+                        "CRITICAL",
+                    )
             else:
                 self.consecutive_losses = 0
-    
+                self.paused_until = 0.0
+
     def should_pause_trading(self) -> bool:
-        """Check if trading should be paused due to consecutive losses"""
+        """Pause only while cooldown timer is active; auto-resume afterwards."""
         with self.lock:
-            return self.consecutive_losses >= config.CONSECUTIVE_LOSS_LIMIT
+            now = time.time()
+            if now < self.paused_until:
+                return True
+            if self.paused_until > 0:
+                logger.logger.info("Consecutive-loss cooldown elapsed, trading resumed")
+                self.paused_until = 0.0
+                self.consecutive_losses = 0
+            return False
     
     def calculate_current_profit_pips(self, ticket: int, current_price: float) -> float:
         """Calculate current profit in pips"""
@@ -2797,8 +2835,21 @@ class TradeTracker:
             return trade['entry_price'] + price_offset
         return trade['entry_price'] - price_offset
 
+    def _locked_usd_from_sl(self, trade: Dict[str, Any], sl_price: float) -> float:
+        """Estimate currently locked USD at SL price for a trade."""
+        usd_per_point = trade['risk_per_pip'] * 0.1
+        if usd_per_point <= 0:
+            return 0.0
+
+        if trade['direction'] == 'buy':
+            points = (sl_price - trade['entry_price']) / trade['point_value']
+        else:
+            points = (trade['entry_price'] - sl_price) / trade['point_value']
+
+        return max(0.0, points * usd_per_point)
+
     def update_trade(self, ticket: int, current_price: float, profit_usd_override: Optional[float] = None) -> Optional[Tuple[float, str]]:
-        """Intelligent trailing: +7$ -> BE, +14$ -> +7$, +21$ -> +14$, dynamic after."""
+        """Smart fast trailing that secures profit aggressively as trade moves in favor."""
         with self.lock:
             if ticket not in self.trades:
                 return None
@@ -2812,19 +2863,34 @@ class TradeTracker:
             current_profit_usd = float(profit_usd_override) if profit_usd_override is not None else self.calculate_current_profit_usd(ticket, current_price)
             logger.logger.debug(f"Trade {ticket}: {current_profit_pips:.1f} pips profit, ${current_profit_usd:.2f} USD")
 
-            if current_profit_usd < config.TRAIL_PROFIT_STEP_USD:
+            start_usd = max(0.5, float(config.SMART_TRAIL_START_USD))
+            if current_profit_usd < start_usd:
                 return None
 
-            step = int(current_profit_usd // config.TRAIL_PROFIT_STEP_USD)
-            lock_usd = max(0.0, (step - 1) * config.TRAIL_PROFIT_STEP_USD)
+            be_buffer = max(0.0, float(config.SMART_TRAIL_BE_BUFFER_USD))
+            lock_ratio = min(0.95, max(0.50, float(config.SMART_TRAIL_LOCK_RATIO)))
+            max_giveback = max(0.5, float(config.SMART_TRAIL_MAX_GIVEBACK_USD))
+            min_increment = max(0.25, float(config.SMART_TRAIL_MIN_INCREMENT_USD))
 
-            if lock_usd <= 0:
-                proposed_sl = entry_price
-                reason = "trail_be_at_$7"
-                trade['breakeven_moved'] = True
+            if current_profit_usd < (start_usd * 2):
+                lock_usd = be_buffer
+                reason = "smart_trail_early_protect"
+            elif current_profit_usd < (start_usd * 3):
+                lock_usd = max(be_buffer, current_profit_usd * 0.60)
+                reason = "smart_trail_accelerate"
             else:
-                proposed_sl = self._sl_for_locked_profit_usd(trade, lock_usd)
-                reason = f"trail_lock_${lock_usd:.2f}"
+                lock_usd = max(current_profit_usd * lock_ratio, current_profit_usd - max_giveback)
+                reason = "smart_trail_runner_lock"
+
+            lock_usd = min(lock_usd, max(0.0, current_profit_usd - min_increment))
+            if lock_usd <= 0:
+                return None
+
+            current_locked_usd = self._locked_usd_from_sl(trade, current_sl)
+            if lock_usd <= (current_locked_usd + min_increment):
+                return None
+
+            proposed_sl = self._sl_for_locked_profit_usd(trade, lock_usd)
 
             if direction == 'buy':
                 new_sl = max(proposed_sl, current_sl)
@@ -2837,12 +2903,13 @@ class TradeTracker:
                 return None
 
             trade['current_sl'] = new_sl
+            trade['breakeven_moved'] = True
             trade['last_move_pips'] = max(trade.get('last_move_pips', 0.0), current_profit_pips)
             trade['last_move_profit_usd'] = max(trade.get('last_move_profit_usd', 0.0), lock_usd)
 
             logger.logger.info(
-                f"Intelligent trailing for {ticket}: SL -> {new_sl:.5f} | "
-                f"profit=${current_profit_usd:.2f} | lock_target=${lock_usd:.2f}"
+                f"Smart trailing for {ticket}: SL -> {new_sl:.5f} | "
+                f"profit=${current_profit_usd:.2f} | locked=${lock_usd:.2f} | prev_locked=${current_locked_usd:.2f}"
             )
             return (new_sl, reason)
 
@@ -3892,6 +3959,7 @@ class EnhancedGlobalState:
         self.signal_stats = self._load_learning_stats()
         self.market_regimes = {s: "unknown" for s in config.SYMBOLS}
         self.consecutive_losses_by_symbol = {s: 0 for s in config.SYMBOLS}
+        self.symbol_paused_until = {s: 0.0 for s in config.SYMBOLS}
         self.signal_strength = {s: 0 for s in config.SYMBOLS}
         self.confluence_manager = ConfluenceManager()
         self.trade_filter = TradeFilter()
@@ -4050,18 +4118,30 @@ class EnhancedGlobalState:
         return stats
     
     def update_consecutive_losses(self, symbol: str, profit: float):
-        """Update consecutive losses for a symbol"""
+        """Update per-symbol consecutive losses with timed cooldown."""
         with self.lock:
             if profit < 0:
                 self.consecutive_losses_by_symbol[symbol] += 1
                 logger.logger.warning(f"{symbol}: Consecutive losses: {self.consecutive_losses_by_symbol[symbol]}")
+                if self.consecutive_losses_by_symbol[symbol] >= config.CONSECUTIVE_LOSS_LIMIT:
+                    cooldown = max(15, int(config.CONSECUTIVE_LOSS_COOLDOWN_MINUTES)) * 60
+                    self.symbol_paused_until[symbol] = max(self.symbol_paused_until.get(symbol, 0.0), time.time() + cooldown)
             else:
                 self.consecutive_losses_by_symbol[symbol] = 0
-    
+                self.symbol_paused_until[symbol] = 0.0
+
     def should_pause_symbol(self, symbol: str) -> bool:
-        """Check if trading should be paused for a symbol"""
+        """Check whether symbol cooldown is active and auto-resume when elapsed."""
         with self.lock:
-            return self.consecutive_losses_by_symbol.get(symbol, 0) >= config.CONSECUTIVE_LOSS_LIMIT
+            now = time.time()
+            until = self.symbol_paused_until.get(symbol, 0.0)
+            if now < until:
+                return True
+            if until > 0:
+                self.symbol_paused_until[symbol] = 0.0
+                self.consecutive_losses_by_symbol[symbol] = 0
+                logger.logger.info(f"{symbol}: symbol cooldown elapsed, trading resumed")
+            return False
     
     def update_learning(self, symbol: str, signal: str, outcome: str):
         with self.lock:
@@ -4138,17 +4218,19 @@ class EnhancedGlobalState:
                             self.max_drawdown = max(self.max_drawdown, performance_tracker.max_drawdown)
                     
                     current_balance = float(acct.balance)
-                    profit_pct = ((current_balance - STARTING_BALANCE) / STARTING_BALANCE) * 100.0
-                    
-                    if profit_pct <= -config.DAILY_LOSS_PCT:
-                        self.daily_loss_triggered = True
+                    daily_reference = max(1e-6, self.peak_equity if self.peak_equity > 0 else STARTING_BALANCE)
+                    equity_drawdown_pct = ((current_equity - daily_reference) / daily_reference) * 100.0
+                    profit_pct = ((current_balance - STARTING_BALANCE) / max(1e-6, STARTING_BALANCE)) * 100.0
+
+                    if equity_drawdown_pct <= -config.DAILY_LOSS_PCT:
+                        self.daily_loss_triggered = bool(config.DAILY_LOSS_HARD_STOP)
                         self.circuit_breaker_until = max(
                             self.circuit_breaker_until,
                             time.time() + config.CIRCUIT_BREAKER_COOL_OFF_MINUTES * 60,
                         )
-                        logger.logger.warning(f"Daily loss limit triggered: {profit_pct:.2f}%")
+                        logger.logger.warning(f"Daily loss/cooldown triggered: {equity_drawdown_pct:.2f}%")
                         logger.log_error("update_daily_stats", 
-                                       f"Daily loss limit {profit_pct:.2f}% triggered",
+                                       f"Daily loss/cooldown {equity_drawdown_pct:.2f}% triggered",
                                        "CRITICAL")
                     
                     if self.max_drawdown >= config.MAX_DRAWDOWN_PCT:
@@ -4334,20 +4416,72 @@ def detect_market_condition_enhanced(df: pd.DataFrame) -> Dict[str, Any]:
     
     return condition
 
-def calculate_dynamic_tp(entry_price: float, direction: str, atr: float, market_regime: str) -> float:
-    """Calculate dynamic take profit based on market conditions"""
-    base_multiplier = config.TP_ATR_MULT
-    
+def calculate_dynamic_tp(entry_price: float, direction: str, atr: float, market_regime: str,
+                         confluence_score: float = 0.0, trend_strength: float = 0.0) -> float:
+    """Adaptive TP using market regime + confluence/trend quality boost."""
     if market_regime == 'trending':
-        multiplier = base_multiplier * 1.5
+        multiplier = config.DYNAMIC_TP_TRENDING_ATR_MULT
     elif market_regime == 'volatile':
-        multiplier = base_multiplier * 1.2
+        multiplier = config.DYNAMIC_TP_VOLATILE_ATR_MULT
     else:
-        multiplier = base_multiplier * 0.8
-    
+        multiplier = config.DYNAMIC_TP_RANGING_ATR_MULT
+
+    if confluence_score >= 4:
+        multiplier += 0.20
+    if trend_strength >= 0.75:
+        multiplier += 0.15
+
+    multiplier = min(3.5, max(0.8, multiplier))
     if direction == 'buy':
         return entry_price + (atr * multiplier)
     return entry_price - (atr * multiplier)
+
+
+def should_skip_chase_entry(df: pd.DataFrame, direction: str, atr: float, market_regime: str,
+                            has_smc_signal: bool = False) -> Tuple[bool, str]:
+    """Avoid late/chase entries where reward quality degrades."""
+    if df.empty or atr <= 0:
+        return False, "ok"
+
+    bar = df.iloc[-1]
+    ema_fast = float(bar.get('ema_fast', bar.get('close', 0.0)))
+    close = float(bar.get('close', ema_fast))
+    rsi_val = float(bar.get('rsi', 50.0))
+
+    extension_atr = abs(close - ema_fast) / max(atr, 1e-8)
+    max_ext = config.ENTRY_MAX_DISTANCE_ATR
+    if market_regime == 'ranging':
+        max_ext *= 0.85
+
+    if extension_atr > max_ext and not has_smc_signal:
+        return True, f"overextended extension_atr={extension_atr:.2f}>{max_ext:.2f}"
+
+    if direction == 'buy' and rsi_val > config.ENTRY_RSI_BUY_MAX and not has_smc_signal:
+        return True, f"buy_rsi_too_high={rsi_val:.1f}"
+    if direction == 'sell' and rsi_val < config.ENTRY_RSI_SELL_MIN and not has_smc_signal:
+        return True, f"sell_rsi_too_low={rsi_val:.1f}"
+
+    return False, "ok"
+
+
+def adjust_sl_for_regime_and_quality(entry_price: float, direction: str, atr: float, sl_price: float,
+                                     market_regime: str, confluence_score: float) -> float:
+    """Tighten/relax SL distance based on regime and setup quality."""
+    regime_mult = 1.0
+    if market_regime == 'trending':
+        regime_mult = 1.12
+    elif market_regime == 'ranging':
+        regime_mult = 0.88
+
+    quality_mult = 0.92 if confluence_score >= 4 else 1.0
+    target_dist = atr * config.SL_ATR_MULT * regime_mult * quality_mult
+
+    if direction == 'buy':
+        adaptive_sl = entry_price - target_dist
+        return max(sl_price, adaptive_sl)
+    adaptive_sl = entry_price + target_dist
+    return min(sl_price, adaptive_sl)
+
 
 def calculate_momentum_strength(df: pd.DataFrame, direction: str) -> Tuple[bool, float]:
     rsi_val = float(df['rsi'].iloc[-1]) if 'rsi' in df.columns else 50.0
@@ -4458,6 +4592,69 @@ def adjust_sl_for_volatility(entry_price: float, direction: str, atr: float, sl_
     clamped_dist = min(max(dist, min_dist), max_dist)
     return entry_price - clamped_dist if direction == 'buy' else entry_price + clamped_dist
 
+def estimate_loss_usd(symbol: str, entry_price: float, sl_price: float, lot: float) -> float:
+    """Estimate SL loss in USD using symbol tick metadata."""
+    if lot <= 0:
+        return 0.0
+    info = get_symbol_info_safe(symbol)
+    if info is None:
+        return 0.0
+
+    tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
+    tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
+    move = abs(float(entry_price) - float(sl_price))
+
+    if tick_value > 0 and tick_size > 0 and move > 0:
+        ticks = move / tick_size
+        return max(0.0, ticks * tick_value * float(lot))
+
+    point = float(getattr(info, "point", 0.0) or 0.0)
+    if point <= 0 or move <= 0:
+        return 0.0
+
+    value_per_point = tick_value / tick_size if tick_value > 0 and tick_size > 0 else 0.0
+    if value_per_point <= 0:
+        return 0.0
+    points = move / point
+    return max(0.0, points * value_per_point * point * float(lot))
+
+
+def correlated_exposure_lot_adjustment(symbol: str, direction: str, proposed_lot: float) -> float:
+    """Reduce lot when correlated symbols already have open same-direction exposure."""
+    try:
+        if proposed_lot <= 0:
+            return proposed_lot
+
+        positions = get_positions_safe() or []
+        correlated = set(config.CORRELATION_PAIRS.get(symbol, []))
+        if not correlated:
+            return proposed_lot
+
+        same_dir_open = 0
+        for pos in positions:
+            psym = getattr(pos, 'symbol', '')
+            if psym not in correlated:
+                continue
+            if getattr(pos, 'magic', None) != config.MAGIC:
+                continue
+            pdir = 'buy' if getattr(pos, 'type', None) == 0 else 'sell'
+            if pdir == direction:
+                same_dir_open += 1
+
+        if same_dir_open >= int(config.CORRELATED_EXPOSURE_MAX_OPEN):
+            reduction = min(0.8, max(0.0, float(config.CORRELATED_EXPOSURE_LOT_REDUCTION)))
+            adjusted = proposed_lot * (1.0 - reduction)
+            logger.logger.info(
+                f"{nowstr()} {symbol}: correlated exposure active ({same_dir_open}), "
+                f"reducing lot {proposed_lot:.3f} -> {adjusted:.3f}"
+            )
+            return adjusted
+
+    except Exception as e:
+        logger.log_error("correlated_exposure_lot_adjustment", str(e), "WARNING", symbol)
+
+    return proposed_lot
+
 def calculate_position_size(symbol: str, entry_price: float, sl_price: float) -> float:
     info = get_symbol_info_safe(symbol)
     if info is None:
@@ -4565,6 +4762,59 @@ def symbol_min_stop(symbol: str):
     except Exception as e:
         logger.log_error("symbol_min_stop", str(e), "WARNING", symbol)
         return None
+
+def modify_position_sl_with_retry(symbol: str, pos: Any, new_sl: float, tp: float, context: str = ""):
+    """Modify position SL with stop-level aware retries."""
+    if config.PAPER_TRADING_ENABLED:
+        for position in paper_engine.positions.values():
+            if position["ticket"] == int(getattr(pos, 'ticket', 0)):
+                position["sl"] = float(new_sl)
+                return True
+        return False
+
+    info = mt5.symbol_info(symbol)
+    tick = mt5.symbol_info_tick(symbol)
+    if info is None or tick is None:
+        logger.logger.error(f"{nowstr()} {symbol}: cannot modify SL, missing symbol info/tick")
+        return None
+
+    point = float(getattr(info, 'point', 0.0) or 0.0)
+    digits = int(getattr(info, 'digits', 3) or 3)
+    base_min_stop = symbol_min_stop(symbol) or (point * 10 if point > 0 else 0.1)
+
+    for attempt in range(1, 4):
+        sl_candidate = float(new_sl)
+        buffer_mult = 1.0 + (attempt - 1) * 0.5
+        min_stop = base_min_stop * buffer_mult
+
+        if getattr(pos, 'type', None) == 0:
+            max_allowed_sl = tick.bid - min_stop
+            sl_candidate = min(sl_candidate, max_allowed_sl)
+        else:
+            min_allowed_sl = tick.ask + min_stop
+            sl_candidate = max(sl_candidate, min_allowed_sl)
+
+        sl_candidate = round(sl_candidate, digits)
+
+        req = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": int(pos.ticket),
+            "symbol": symbol,
+            "sl": sl_candidate,
+            "tp": float(tp) if tp else 0.0
+        }
+        res = mt5_order_send_with_recovery(req, f"{context} attempt={attempt}")
+        if res:
+            return res
+
+        err = mt5.last_error()
+        logger.logger.warning(
+            f"{nowstr()} {symbol}: SL modify failed ticket={getattr(pos, 'ticket', 0)} "
+            f"attempt={attempt}/3 sl={sl_candidate} min_stop={min_stop:.5f} last_error={err}"
+        )
+        time.sleep(0.2 * attempt)
+
+    return None
 
 def round_lot(symbol: str, lot: float) -> float:
     try:
@@ -5100,6 +5350,47 @@ def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp
         debug_mt5_error()
         return None
 
+def ensure_position_tracked(symbol: str, pos: Any) -> None:
+    """Bootstrap tracker state for already-open live positions (e.g., after bot restart)."""
+    try:
+        ticket = int(getattr(pos, 'ticket', 0) or 0)
+        if ticket <= 0:
+            return
+        if trade_tracker.get_trade(ticket) is not None:
+            return
+
+        direction = 'buy' if getattr(pos, 'type', None) == 0 else 'sell'
+        entry_price = float(getattr(pos, 'price_open', 0.0) or 0.0)
+        sl_price = float(getattr(pos, 'sl', 0.0) or 0.0)
+        tp_price = float(getattr(pos, 'tp', 0.0) or 0.0)
+        volume = float(getattr(pos, 'volume', config.LOT_FIXED) or config.LOT_FIXED)
+
+        if entry_price <= 0:
+            return
+
+        if sl_price <= 0:
+            min_stop = symbol_min_stop(symbol) or 0.5
+            if direction == 'buy':
+                sl_price = entry_price - min_stop
+            else:
+                sl_price = entry_price + min_stop
+
+        trade_tracker.add_trade(
+            ticket=ticket,
+            symbol=symbol,
+            direction=direction,
+            entry_price=entry_price,
+            sl_price=sl_price,
+            tp_price=tp_price,
+            confluence_score=0,
+            fvg_signal=False,
+            lot_size=volume
+        )
+        logger.logger.info(f"{nowstr()} {symbol}: bootstrapped tracker for live ticket={ticket}")
+    except Exception as e:
+        logger.log_error("ensure_position_tracked", str(e), "WARNING", symbol)
+
+
 # ==================== ENHANCED HYBRID SL MANAGEMENT ====================
 def manage_hybrid_trailing_enhanced(symbol: str):
     """Enhanced trailing stop management with safety checks"""
@@ -5120,8 +5411,8 @@ def manage_hybrid_trailing_enhanced(symbol: str):
         current_price = tick.ask
     
     ticket = pos.ticket
-    pos_profit = getattr(pos, 'profit', None)
-    result = trade_tracker.update_trade(ticket, current_price, profit_usd_override=pos_profit)
+    ensure_position_tracked(symbol, pos)
+    result = trade_tracker.update_trade(ticket, current_price)
     
     if result is not None:
         new_sl, move_reason = result
@@ -5146,7 +5437,7 @@ def manage_hybrid_trailing_enhanced(symbol: str):
             except:
                 pass
 
-            if atr_value > 0:
+            if config.VOLATILITY_ADJUSTED_SL and atr_value > 0:
                 atr_mult = 2.0
                 if direction == 'buy':
                     atr_trail_sl = current_price - (atr_value * atr_mult)
@@ -5162,19 +5453,14 @@ def manage_hybrid_trailing_enhanced(symbol: str):
             old_sl = pos.sl
             if old_sl != new_sl:
                 try:
-                    if config.PAPER_TRADING_ENABLED:
-                        for position in paper_engine.positions.values():
-                            if position["ticket"] == ticket:
-                                position["sl"] = new_sl
-                        result = True
-                    else:
-                        result = mt5_order_send_with_recovery({
-                            "action": mt5.TRADE_ACTION_SLTP,
-                            "position": ticket,
-                            "sl": new_sl,
-                            "tp": pos.tp
-                        }, f"manage_hybrid_trailing_enhanced {symbol}")
-                    
+                    result = modify_position_sl_with_retry(
+                        symbol=symbol,
+                        pos=pos,
+                        new_sl=new_sl,
+                        tp=pos.tp,
+                        context=f"manage_hybrid_trailing_enhanced {symbol}"
+                    )
+
                     if result:
                         logger.logger.info(f"{nowstr()} {symbol}: SL moved from {old_sl:.5f} to {new_sl:.5f} "
                                          f"at {profit_pips:.1f} pips profit (${current_profit_usd:.2f}) "
@@ -5204,6 +5490,18 @@ def manage_hybrid_trailing_enhanced(symbol: str):
                 except Exception as e:
                     logger.logger.error(f"{nowstr()} {symbol}: Error moving SL: {e}")
                     logger.log_error("manage_hybrid_trailing_enhanced", str(e), "ERROR", symbol)
+
+    if result is None:
+        try:
+            tracked = trade_tracker.get_trade(ticket)
+            if tracked:
+                current_profit_usd = trade_tracker.calculate_current_profit_usd(ticket, current_price)
+                logger.logger.debug(
+                    f"{nowstr()} {symbol}: no SL move ticket={ticket} profit=${current_profit_usd:.2f} "
+                    f"start=${config.SMART_TRAIL_START_USD:.2f} current_sl={tracked.get('current_sl', 0):.5f}"
+                )
+        except Exception:
+            pass
 
     trade_info = trade_tracker.get_trade(ticket)
     if trade_info and trade_info.get('open_time'):
@@ -5570,9 +5868,13 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 continue
             
             if global_state.daily_loss_triggered:
-                logger.logger.warning(f"{nowstr()} {symbol}: daily limit triggered - pausing")
-                time.sleep(60)
-                continue
+                if (not config.DAILY_LOSS_HARD_STOP) and time.time() >= getattr(global_state, 'circuit_breaker_until', 0.0):
+                    global_state.daily_loss_triggered = False
+                    logger.logger.info(f"{nowstr()} {symbol}: daily cooldown elapsed, resuming trading")
+                else:
+                    logger.logger.warning(f"{nowstr()} {symbol}: daily limit triggered - pausing")
+                    time.sleep(60)
+                    continue
 
             if time.time() < getattr(global_state, 'circuit_breaker_until', 0.0):
                 remaining = int(global_state.circuit_breaker_until - time.time())
@@ -5707,7 +6009,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     liquidity_signal_active = True
             
             # FORCE TRADE LOGIC
-            if (chosen_dir is None and 
+            if (config.FORCE_TRADE_ENABLED and chosen_dir is None and 
                 time.time() - global_state.last_forced_time.get(symbol, 0) >= config.FORCE_TRADE_EVERY):
                 
                 ema_fast = bar.get('ema_fast')
@@ -5795,6 +6097,19 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 
                 entry_price = float(tick.ask) if chosen_dir == 'buy' else float(tick.bid)
                 atr = float(bar['atr']) if not pd.isna(bar.get('atr')) else info.point * 50
+                trend_strength = detect_market_condition_enhanced(df).get("trend_strength", 0.0)
+                skip_entry, skip_reason = should_skip_chase_entry(
+                    df=df,
+                    direction=chosen_dir,
+                    atr=atr,
+                    market_regime=market_regime,
+                    has_smc_signal=(fvg_signal_active or liquidity_signal_active)
+                )
+                if skip_entry and not forced_trade:
+                    logger.logger.info(f"{nowstr()} {symbol}: entry quality filter blocked ({skip_reason})")
+                    time.sleep(0.2)
+                    continue
+
                 sl_dist = atr * config.SL_ATR_MULT
                 tp_dist = atr * config.TP_ATR_MULT
                 
@@ -5817,6 +6132,15 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
 
                 if config.VOLATILITY_ADJUSTED_SL:
                     sl_price = adjust_sl_for_volatility(entry_price, chosen_dir, atr, sl_price)
+
+                sl_price = adjust_sl_for_regime_and_quality(
+                    entry_price=entry_price,
+                    direction=chosen_dir,
+                    atr=atr,
+                    sl_price=sl_price,
+                    market_regime=market_regime,
+                    confluence_score=confluence_score
+                )
 
                 # FVG-BASED TARGETS
                 fvg_based_tp = False
@@ -5862,7 +6186,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                             sl_price = entry_price + min_fvg_stop
 
                 if not fvg_based_tp:
-                    tp_price = calculate_dynamic_tp(entry_price, chosen_dir, atr, market_regime)
+                    tp_price = calculate_dynamic_tp(entry_price, chosen_dir, atr, market_regime, confluence_score, trend_strength)
 
                 min_stop = symbol_min_stop(symbol) or info.point * 10
                 if chosen_dir == 'buy' and (entry_price - sl_price) < min_stop:
@@ -5916,20 +6240,17 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 else:
                     lot = round_lot(symbol, config.LOT_FIXED)
                 
-                if chosen_dir == 'buy':
-                    potential_loss_points = (entry_price - sl_price) / info.point
-                else:
-                    potential_loss_points = (sl_price - entry_price) / info.point
-                
-                potential_loss_usd = potential_loss_points * 0.02
-                
+                lot = round_lot(symbol, correlated_exposure_lot_adjustment(symbol, chosen_dir, lot))
+
+                potential_loss_usd = estimate_loss_usd(symbol, entry_price, sl_price, lot)
+
                 if potential_loss_usd > config.MAX_LOSS_PER_TRADE:
                     logger.logger.warning(f"{symbol}: Potential loss ${potential_loss_usd:.2f} > max ${config.MAX_LOSS_PER_TRADE}")
-                    max_allowed_points = config.MAX_LOSS_PER_TRADE / 0.02
-                    if potential_loss_points > max_allowed_points:
-                        adjustment = max_allowed_points / potential_loss_points
+                    if potential_loss_usd > 0:
+                        adjustment = config.MAX_LOSS_PER_TRADE / potential_loss_usd
                         lot = round_lot(symbol, lot * adjustment)
-                        logger.logger.info(f"{symbol}: Adjusted lot from {config.LOT_FIXED} to {lot}")
+                        potential_loss_usd = estimate_loss_usd(symbol, entry_price, sl_price, lot)
+                        logger.logger.info(f"{symbol}: Adjusted lot for max-loss control -> {lot}")
                 
                 logger.logger.info(f"{nowstr()} {symbol} ATTEMPT {chosen_dir} lot={lot:.3f} "
                                  f"entry={entry_price:.5f} sl={sl_price:.5f} tp={tp_price:.5f} "
