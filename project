@@ -832,6 +832,8 @@ class BotConfig:
     COOLDOWN: int = 600
     FORCE_TRADE_EVERY: int = 1400
     FORCE_TRADE_ENABLED: bool = True
+    FORCE_STARTUP_WINDOW_MINUTES: int = 45
+    FORCE_STARTUP_ALLOW_WEAK_SIGNAL: bool = True
     COOLDOWN_MIN_SECONDS: int = 180
     COOLDOWN_HIGH_QUALITY_SECONDS: int = 300
 
@@ -6209,35 +6211,53 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     liquidity_signal_active = True
             
             # FORCE TRADE LOGIC
-            if (config.FORCE_TRADE_ENABLED and chosen_dir is None and 
-                time.time() - global_state.last_forced_time.get(symbol, 0) >= config.FORCE_TRADE_EVERY):
-                
+            startup_minutes = (time.time() - global_state.start_time) / 60.0
+            startup_force_mode = (
+                config.FORCE_STARTUP_ALLOW_WEAK_SIGNAL and
+                global_state.daily_trades_count == 0 and
+                startup_minutes <= config.FORCE_STARTUP_WINDOW_MINUTES
+            )
+            force_interval = 60 if startup_force_mode else config.FORCE_TRADE_EVERY
+            if (config.FORCE_TRADE_ENABLED and chosen_dir is None and
+                time.time() - global_state.last_forced_time.get(symbol, 0) >= force_interval):
+
                 ema_fast = bar.get('ema_fast')
                 ema_slow = bar.get('ema_slow')
-                
+
                 rsi_now = float(bar.get('rsi', 50.0)) if pd.notna(bar.get('rsi')) else 50.0
                 ema_gap = abs(float(ema_fast) - float(ema_slow)) if pd.notna(ema_fast) and pd.notna(ema_slow) else 0.0
                 force_atr = float(bar.get('atr', 0.0)) if pd.notna(bar.get('atr')) else 0.0
-                min_force_gap = max(force_atr * 0.10, 0.01)
+                min_force_gap = max(force_atr * (0.03 if startup_force_mode else 0.10), 0.005)
+                buy_rsi_gate = 50 if startup_force_mode else 52
+                sell_rsi_gate = 50 if startup_force_mode else 48
 
                 if pd.notna(ema_fast) and pd.notna(ema_slow) and ema_gap >= min_force_gap:
-                    if ema_fast > ema_slow and rsi_now >= 52:
+                    if ema_fast > ema_slow and rsi_now >= buy_rsi_gate:
                         chosen_dir = 'buy'
-                        confluence_score = 1
+                        confluence_score = max(confluence_score, 1)
                         chosen_reasons = ['Force_EMA_Up']
-                    elif ema_fast < ema_slow and rsi_now <= 48:
+                    elif ema_fast < ema_slow and rsi_now <= sell_rsi_gate:
                         chosen_dir = 'sell'
-                        confluence_score = 1
+                        confluence_score = max(confluence_score, 1)
                         chosen_reasons = ['Force_EMA_Down']
 
+                # Startup fallback: if still no direction, use EMA slope bias to avoid dead start.
+                if chosen_dir is None and startup_force_mode and pd.notna(ema_fast) and pd.notna(ema_slow):
+                    chosen_dir = 'buy' if float(ema_fast) >= float(ema_slow) else 'sell'
+                    confluence_score = max(confluence_score, 1)
+                    chosen_reasons = ['Force_Startup_Bias']
+
                 if chosen_dir is None:
-                    logger.logger.info(f"{nowstr()} {symbol}: force-trade skipped (quality gate ema_gap={ema_gap:.4f}, rsi={rsi_now:.1f})")
-                
+                    logger.logger.info(
+                        f"{nowstr()} {symbol}: force-trade skipped (startup={startup_force_mode}, "
+                        f"ema_gap={ema_gap:.4f}, min_gap={min_force_gap:.4f}, rsi={rsi_now:.1f})"
+                    )
+
                 if chosen_dir is not None:
                     global_state.last_forced_time[symbol] = time.time()
                     global_state.last_signal_time[symbol] = coerce_timestamp(bar['time'])
                     global_state.last_signal_dir[symbol] = chosen_dir
-                    logger.logger.info(f"{nowstr()} {symbol}: FORCE TRADE -> {chosen_dir}")
+                    logger.logger.info(f"{nowstr()} {symbol}: FORCE TRADE -> {chosen_dir} (startup={startup_force_mode})")
                     forced_trade = True
             
             if chosen_dir:
@@ -6296,7 +6316,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     chosen_reasons.append('DIV_BEAR')
 
             allow_setup, setup_reason = setup_quality_gate(symbol, market_regime, confluence_score)
-            if not allow_setup and not forced_trade and not long_no_trade_mode:
+            if not allow_setup and not forced_trade and not long_no_trade_mode and not startup_force_mode:
                 logger.logger.info(f"{nowstr()} {symbol}: setup quality gate blocked ({setup_reason})")
                 time.sleep(0.2)
                 continue
