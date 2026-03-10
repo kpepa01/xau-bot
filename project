@@ -4237,14 +4237,14 @@ class EnhancedGlobalState:
 
                     if equity_drawdown_pct <= -config.DAILY_LOSS_PCT:
                         self.daily_loss_triggered = bool(config.DAILY_LOSS_HARD_STOP)
-                        self.circuit_breaker_until = max(
-                            self.circuit_breaker_until,
-                            time.time() + config.CIRCUIT_BREAKER_COOL_OFF_MINUTES * 60,
-                        )
-                        logger.logger.warning(f"Daily loss/cooldown triggered: {equity_drawdown_pct:.2f}%")
-                        logger.log_error("update_daily_stats", 
-                                       f"Daily loss/cooldown {equity_drawdown_pct:.2f}% triggered",
-                                       "CRITICAL")
+                        now_ts = time.time()
+                        # Avoid perpetual lock: only (re)arm circuit breaker when previous window has elapsed.
+                        if now_ts >= self.circuit_breaker_until:
+                            self.circuit_breaker_until = now_ts + config.CIRCUIT_BREAKER_COOL_OFF_MINUTES * 60
+                            logger.logger.warning(f"Daily loss/cooldown triggered: {equity_drawdown_pct:.2f}%")
+                            logger.log_error("update_daily_stats", 
+                                           f"Daily loss/cooldown {equity_drawdown_pct:.2f}% triggered",
+                                           "CRITICAL")
                     
                     if self.max_drawdown >= config.MAX_DRAWDOWN_PCT:
                         self.daily_loss_triggered = True
@@ -6247,6 +6247,12 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     confluence_score = max(confluence_score, 1)
                     chosen_reasons = ['Force_Startup_Bias']
 
+                # Long-idle fallback: prevent 24h inactivity if all filters remain inconclusive.
+                if chosen_dir is None and long_no_trade_mode and pd.notna(ema_fast) and pd.notna(ema_slow):
+                    chosen_dir = 'buy' if float(ema_fast) >= float(ema_slow) else 'sell'
+                    confluence_score = max(confluence_score, 1)
+                    chosen_reasons = ['Force_LongIdle_Bias']
+
                 if chosen_dir is None:
                     logger.logger.info(
                         f"{nowstr()} {symbol}: force-trade skipped (startup={startup_force_mode}, "
@@ -6319,6 +6325,16 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             if not allow_setup and not forced_trade and not long_no_trade_mode and not startup_force_mode:
                 logger.logger.info(f"{nowstr()} {symbol}: setup quality gate blocked ({setup_reason})")
                 time.sleep(0.2)
+                continue
+
+            if not chosen_dir:
+                logger.logger.info(
+                    f"{nowstr()} {symbol}: no direction selected | confluence={confluence_result.get('confluence_score', 0)} "
+                    f"forced={forced_trade} relax={relax_mode} long_idle={long_no_trade_mode}"
+                )
+                manage_hybrid_trailing_enhanced(symbol)
+                check_closed_trades_enhanced()
+                time.sleep(0.4)
                 continue
 
             opened = active_positions(symbol)
