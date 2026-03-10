@@ -17,6 +17,8 @@ import logging
 import hashlib
 import random
 import re
+from urllib import error as urlerror
+from urllib import request as urlrequest
 from datetime import datetime, date, time as dt_time, timedelta
 from typing import Dict, List, Tuple, Optional, Any
 from collections import deque, defaultdict
@@ -940,6 +942,8 @@ class BotConfig:
     DYNAMIC_RSI_LOW_Q: float = float(os.getenv("DYNAMIC_RSI_LOW_Q", "0.2"))
     DYNAMIC_RSI_HIGH_Q: float = float(os.getenv("DYNAMIC_RSI_HIGH_Q", "0.8"))
     CIRCUIT_BREAKER_COOL_OFF_MINUTES: int = int(os.getenv("CIRCUIT_BREAKER_COOL_OFF_MINUTES", "180"))
+    CIRCUIT_BREAKER_ERROR_THRESHOLD: int = int(os.getenv("CIRCUIT_BREAKER_ERROR_THRESHOLD", "5"))
+    CIRCUIT_BREAKER_ERROR_WINDOW_SECONDS: int = int(os.getenv("CIRCUIT_BREAKER_ERROR_WINDOW_SECONDS", "300"))
 
     # ==== Trade Quality Filters ====
     MAX_SPREAD_POINTS: float = 30.0
@@ -953,6 +957,11 @@ class BotConfig:
     PAPER_SPREAD_PIPS: float = float(os.getenv("PAPER_SPREAD_PIPS", "0.2"))
     PAPER_SLIPPAGE_PIPS: float = float(os.getenv("PAPER_SLIPPAGE_PIPS", "0.1"))
     PAPER_COMMISSION_PER_LOT: float = float(os.getenv("PAPER_COMMISSION_PER_LOT", "0"))
+    BACKTEST_SPREAD_PIPS: float = float(os.getenv("BACKTEST_SPREAD_PIPS", "0.2"))
+    BACKTEST_SLIPPAGE_PIPS: float = float(os.getenv("BACKTEST_SLIPPAGE_PIPS", "0.1"))
+    BACKTEST_COMMISSION_PER_LOT: float = float(os.getenv("BACKTEST_COMMISSION_PER_LOT", "0"))
+    BACKTEST_MAX_LOSS_PER_TRADE: float = float(os.getenv("BACKTEST_MAX_LOSS_PER_TRADE", "15"))
+    BACKTEST_DAILY_LOSS_PCT: float = float(os.getenv("BACKTEST_DAILY_LOSS_PCT", "5"))
 
     BACKTEST_MODE: bool = env_bool("BACKTEST_MODE", False)
     BACKTEST_INITIAL_BALANCE: float = float(os.getenv("BACKTEST_INITIAL_BALANCE", "10000"))
@@ -1058,6 +1067,8 @@ class BotConfig:
     MINUTES_BEFORE_NEWS: int = 30
     MINUTES_AFTER_NEWS: int = 60
     HIGH_IMPACT_ONLY: bool = True
+    ECONOMIC_CALENDAR_API_URL: str = os.getenv("ECONOMIC_CALENDAR_API_URL", "https://nfs.faireconomy.media/ff_calendar_thisweek.json")
+    NEWS_CACHE_TTL_SECONDS: int = int(os.getenv("NEWS_CACHE_TTL_SECONDS", "300"))
 
     def adjust_weights(self, crt_score: float, snr_score: float, trend_strength: float, 
                        fvg_score: float, regime: str, volatility: float) -> Dict[str, float]:
@@ -3970,6 +3981,7 @@ class EnhancedGlobalState:
         self.news_events: List[Dict[str, Any]] = []
         self.last_news_refresh = 0.0
         self.last_correlation_refresh = 0.0
+        self.critical_error_times: Dict[str, deque] = defaultdict(deque)
         self.trade_memory_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'recent_trades.json')
         self.recent_trade_levels: List[Dict[str, Any]] = self._load_recent_trade_levels()
         self.lock = threading.RLock()
@@ -4004,33 +4016,98 @@ class EnhancedGlobalState:
             self.recent_trade_levels = self.recent_trade_levels[-200:]
             self._persist_recent_trade_levels()
 
+    def _load_external_calendar_events(self, now: datetime) -> List[Dict[str, Any]]:
+        """Load high-impact events from an external economic calendar API."""
+        events: List[Dict[str, Any]] = []
+        req = urlrequest.Request(config.ECONOMIC_CALENDAR_API_URL, headers={"User-Agent": "xau-bot/1.0"})
+        with urlrequest.urlopen(req, timeout=8) as response:
+            payload = response.read().decode("utf-8")
+        raw_items = json.loads(payload)
+        if not isinstance(raw_items, list):
+            return events
+
+        start = now - timedelta(hours=2)
+        end = now + timedelta(hours=24)
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            date_part = item.get("date") or item.get("Date")
+            time_part = item.get("time") or item.get("Time")
+            impact = str(item.get("impact") or item.get("Impact") or "").lower()
+            title = item.get("title") or item.get("event") or item.get("Event") or ""
+            currency = item.get("country") or item.get("currency") or item.get("Currency") or ""
+            if not date_part or not time_part:
+                continue
+            try:
+                event_time = datetime.strptime(f"{date_part} {time_part}", "%Y-%m-%d %H:%M")
+            except ValueError:
+                continue
+            if not (start <= event_time <= end):
+                continue
+            events.append({"time": event_time, "impact": impact, "title": title, "currency": currency})
+        return events
+
+    def _load_mt5_calendar_events(self, now: datetime) -> List[Dict[str, Any]]:
+        """Load events from MT5 calendar when available."""
+        events: List[Dict[str, Any]] = []
+        if not hasattr(mt5, "calendar_events_get"):
+            return events
+        start = now - timedelta(hours=2)
+        end = now + timedelta(hours=24)
+        raw = mt5.calendar_events_get(start, end)
+        if not raw:
+            return events
+        for ev in raw:
+            event_time = getattr(ev, "time", None)
+            if isinstance(event_time, (int, float)):
+                event_time = datetime.fromtimestamp(event_time)
+            if not isinstance(event_time, datetime):
+                continue
+            events.append({
+                "time": event_time,
+                "impact": getattr(ev, "importance", ""),
+                "title": getattr(ev, "name", ""),
+                "currency": getattr(ev, "currency", ""),
+            })
+        return events
+
+    def register_critical_error(self, symbol: str, reason: str) -> None:
+        """Activate the circuit breaker after repeated critical errors in a short window."""
+        now_ts = time.time()
+        if not hasattr(self, "critical_error_times"):
+            self.critical_error_times = defaultdict(deque)
+        window = max(60, int(config.CIRCUIT_BREAKER_ERROR_WINDOW_SECONDS))
+        error_times = self.critical_error_times[symbol]
+        error_times.append(now_ts)
+        while error_times and (now_ts - error_times[0]) > window:
+            error_times.popleft()
+
+        if len(error_times) >= int(config.CIRCUIT_BREAKER_ERROR_THRESHOLD):
+            pause_seconds = max(60, int(config.CIRCUIT_BREAKER_COOL_OFF_MINUTES * 60))
+            self.circuit_breaker_until = max(self.circuit_breaker_until, now_ts + pause_seconds)
+            logger.logger.critical(
+                f"{nowstr()} {symbol}: circuit breaker triggered after {len(error_times)} critical errors ({reason})"
+            )
+
     def update_news_events(self) -> None:
-        """Best-effort refresh of news events cache used by is_news_window."""
+        """Refresh cached news events using external API first, then MT5 fallback."""
+        now = datetime.now()
+        if self.news_events and (time.time() - self.last_news_refresh) < config.NEWS_CACHE_TTL_SECONDS:
+            return
+
         try:
-            now = datetime.now()
-            events: List[Dict[str, Any]] = []
-            start = now - timedelta(hours=2)
-            end = now + timedelta(hours=24)
-
-            if hasattr(mt5, "calendar_events_get"):
-                raw = mt5.calendar_events_get(start, end)
-                if raw:
-                    for ev in raw:
-                        event_time = getattr(ev, "time", None)
-                        if isinstance(event_time, (int, float)):
-                            event_time = datetime.fromtimestamp(event_time)
-                        if not isinstance(event_time, datetime):
-                            continue
-                        events.append({
-                            "time": event_time,
-                            "impact": getattr(ev, "importance", ""),
-                            "title": getattr(ev, "name", ""),
-                            "currency": getattr(ev, "currency", ""),
-                        })
-
+            events = self._load_external_calendar_events(now)
+            if not events:
+                events = self._load_mt5_calendar_events(now)
             self.news_events = events
-        except Exception as e:
-            logger.log_error('update_news_events', str(e), 'WARNING')
+            self.last_news_refresh = time.time()
+        except (urlerror.URLError, TimeoutError, json.JSONDecodeError, ValueError):
+            logger.logger.exception("update_news_events: failed loading external calendar feed")
+            self.news_events = self._load_mt5_calendar_events(now)
+            self.last_news_refresh = time.time()
+        except (AttributeError, OSError):
+            logger.logger.exception("update_news_events: unexpected error")
+            logger.log_error('update_news_events', 'unexpected error while loading calendar events', 'WARNING')
 
     def update_correlation_data(self) -> None:
         """Populate rolling correlation data for configured symbol pairs."""
@@ -4332,18 +4409,47 @@ def validate_market_data(df: pd.DataFrame, symbol: str, timeframe: int) -> Tuple
         return False, "missing_ohlc_columns"
 
     numeric = df[['open', 'high', 'low', 'close']]
+    if not np.isfinite(numeric.to_numpy(dtype=float)).all():
+        return False, "non_finite_prices"
+
     non_positive_mask = (numeric <= 0).any(axis=1)
     negative_mask = (numeric < 0).any(axis=1)
+    bad_ohlc = (df['high'] < df['low']) | (df['high'] < df['open']) | (df['high'] < df['close']) | (df['low'] > df['open']) | (df['low'] > df['close'])
     if float(non_positive_mask.mean()) > config.DATA_MAX_ZERO_ROWS_PCT:
         return False, "too_many_non_positive_prices"
     if float(negative_mask.mean()) > config.DATA_MAX_NEGATIVE_ROWS_PCT:
         return False, "negative_prices_detected"
+    if bool(bad_ohlc.any()):
+        return False, "ohlc_inconsistent"
 
-    latest_ts = pd.to_datetime(df['time'].iloc[-1]).timestamp()
+    times = pd.to_datetime(df['time'], errors='coerce')
+    if times.isna().any():
+        return False, "invalid_timestamps"
+    if len(times) > 1 and not times.is_monotonic_increasing:
+        return False, "non_monotonic_timestamps"
+
+    latest_ts = times.iloc[-1].timestamp()
     stale_limit = max(config.MAX_STALE_DATA_SECONDS, timeframe_seconds(timeframe) * 3)
     if (time.time() - latest_ts) > stale_limit:
         return False, "stale_data"
 
+    return True, "ok"
+
+
+def validate_indicator_snapshot(bar: pd.Series, required: Tuple[str, ...] = ('ema_fast', 'ema_slow', 'atr', 'rsi')) -> Tuple[bool, str]:
+    """Validate required indicators exist and are numeric before trade decisions."""
+    for key in required:
+        if key not in bar:
+            return False, f"missing_{key}"
+        value = bar.get(key)
+        if pd.isna(value):
+            return False, f"nan_{key}"
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            return False, f"invalid_{key}"
+        if not np.isfinite(val):
+            return False, f"non_finite_{key}"
     return True, "ok"
 
 def compute_dynamic_rsi_bands(df: pd.DataFrame) -> Tuple[float, float]:
@@ -4655,7 +4761,26 @@ def correlated_exposure_lot_adjustment(symbol: str, direction: str, proposed_lot
 
     return proposed_lot
 
+def has_sufficient_margin(symbol: str, direction: str, lot: float, price: float) -> bool:
+    """Check free margin before opening a new trade."""
+    if config.PAPER_TRADING_ENABLED:
+        return True
+    account = get_account_info_safe()
+    if account is None:
+        return False
+    order_type = mt5.ORDER_TYPE_BUY if direction == 'buy' else mt5.ORDER_TYPE_SELL
+    try:
+        required_margin = mt5.order_calc_margin(order_type, symbol, lot, price)
+    except (TypeError, AttributeError):
+        logger.logger.exception(f"{symbol}: margin calculation failed")
+        return False
+    if required_margin is None:
+        return False
+    free_margin = float(getattr(account, 'margin_free', 0.0) or 0.0)
+    return free_margin >= float(required_margin)
+
 def calculate_position_size(symbol: str, entry_price: float, sl_price: float) -> float:
+    """Calculate lot size with drawdown-aware dynamic risk and broker constraints."""
     info = get_symbol_info_safe(symbol)
     if info is None:
         return config.LOT_FIXED
@@ -4663,9 +4788,15 @@ def calculate_position_size(symbol: str, entry_price: float, sl_price: float) ->
     if account is None:
         return config.LOT_FIXED
     balance = float(getattr(account, "balance", 0.0))
+    equity = float(getattr(account, "equity", balance))
     if balance <= 0:
         return config.LOT_FIXED
-    risk_amount = max(balance * (config.RISK_PER_TRADE_PCT / 100.0), config.MIN_RISK_PER_TRADE_USD)
+
+    drawdown_pct = max(0.0, ((balance - equity) / balance) * 100.0)
+    dd_scale = max(0.4, 1.0 - (drawdown_pct / max(config.MAX_DRAWDOWN_PCT, 1.0)))
+    effective_risk_pct = config.RISK_PER_TRADE_PCT * dd_scale
+    risk_amount = max(balance * (effective_risk_pct / 100.0), config.MIN_RISK_PER_TRADE_USD)
+
     stop_points = abs(entry_price - sl_price)
     tick_value = getattr(info, "trade_tick_value", None)
     tick_size = getattr(info, "trade_tick_size", None)
@@ -5699,13 +5830,25 @@ def print_daily_summary_enhanced():
 
 # ==================== BACKTESTING FRAMEWORK ====================
 class BacktestEngine:
-    """Lightweight backtesting engine using historical CSV data."""
+    """Lightweight backtesting engine using historical CSV data with execution frictions."""
 
     def __init__(self, data_files: Dict[str, str], starting_balance: float):
         self.data_files = data_files
         self.starting_balance = starting_balance
 
+    def _trade_cost(self, volume: float) -> float:
+        """Per-trade commission model in account currency."""
+        return float(config.BACKTEST_COMMISSION_PER_LOT * volume)
+
+    def _slippage_adjusted_price(self, price: float, direction: str, entering: bool = True) -> float:
+        """Apply directional slippage on entry/exit to emulate live fill quality."""
+        slip = float(config.BACKTEST_SLIPPAGE_PIPS)
+        if entering:
+            return price + slip if direction == 'buy' else price - slip
+        return price - slip if direction == 'buy' else price + slip
+
     def run(self):
+        """Run backtest across configured symbols and persist a summary report."""
         logger.logger.info("Backtest mode active - starting simulation")
         results = {}
 
@@ -5714,21 +5857,38 @@ class BacktestEngine:
                 logger.logger.warning(f"Backtest file missing for {symbol}: {path}")
                 continue
 
-            df = pd.read_csv(path)
+            try:
+                df = pd.read_csv(path)
+            except (FileNotFoundError, pd.errors.EmptyDataError, pd.errors.ParserError):
+                logger.logger.exception(f"{symbol}: failed to read backtest file {path}")
+                continue
+
             if "time" in df.columns:
-                df["time"] = pd.to_datetime(df["time"])
+                df["time"] = pd.to_datetime(df["time"], errors='coerce')
+                df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+
             df = calc_indicators_safe(df)
 
             balance = self.starting_balance
-            equity = balance
             tracker = PerformanceTracker(balance)
             open_position = None
             wins = 0
             losses = 0
+            daily_start_balance = balance
+            current_day = None
+            daily_loss_triggered = False
 
             warmup = max(config.EMA_SLOW, config.ATR_PERIOD, config.RSI_PERIOD) + 5
             for idx in range(warmup, len(df)):
                 bar = df.iloc[idx]
+                now = pd.to_datetime(bar.get('time', datetime.now()))
+                if pd.isna(now):
+                    continue
+                if current_day != now.date():
+                    current_day = now.date()
+                    daily_start_balance = balance
+                    daily_loss_triggered = False
+
                 price = float(bar["close"])
                 tracker.record_equity(balance)
 
@@ -5736,13 +5896,16 @@ class BacktestEngine:
                     direction = open_position["direction"]
                     sl = open_position["sl"]
                     tp = open_position["tp"]
-                    if (direction == "buy" and ((sl and price <= sl) or (tp and price >= tp))) or \
-                       (direction == "sell" and ((sl and price >= sl) or (tp and price <= tp))):
-                        exit_price = sl if sl and ((direction == "buy" and price <= sl) or (direction == "sell" and price >= sl)) else tp
+                    stop_hit = (direction == "buy" and sl and price <= sl) or (direction == "sell" and sl and price >= sl)
+                    tp_hit = (direction == "buy" and tp and price >= tp) or (direction == "sell" and tp and price <= tp)
+                    if stop_hit or tp_hit:
+                        raw_exit = sl if stop_hit else tp
+                        exit_price = self._slippage_adjusted_price(float(raw_exit), direction, entering=False)
                         diff = exit_price - open_position["entry_price"]
                         if direction == "sell":
                             diff = -diff
-                        profit = diff * open_position["volume"] * config.PAPER_CONTRACT_SIZE
+                        gross_profit = diff * open_position["volume"] * config.PAPER_CONTRACT_SIZE
+                        profit = gross_profit - self._trade_cost(open_position["volume"])
                         balance += profit
                         tracker.record_trade(profit)
                         if profit > 0:
@@ -5751,8 +5914,16 @@ class BacktestEngine:
                             losses += 1
                         open_position = None
 
-                if open_position is None:
+                if daily_start_balance > 0:
+                    daily_loss_pct = ((daily_start_balance - balance) / daily_start_balance) * 100.0
+                    if daily_loss_pct >= config.BACKTEST_DAILY_LOSS_PCT:
+                        daily_loss_triggered = True
+
+                if open_position is None and not daily_loss_triggered:
                     df_slice = df.iloc[:idx + 1]
+                    ok, reason = validate_market_data(df_slice.tail(250), symbol, config.ENTRY_TF)
+                    if not ok:
+                        continue
                     market_regime = global_state.confluence_manager.detect_market_regime(df_slice)
                     trend_signals = get_trend_signals(df_slice, df_slice, market_regime)
                     confluence = global_state.confluence_manager.analyze_confluence(
@@ -5760,14 +5931,28 @@ class BacktestEngine:
                     )
                     direction = confluence.get("direction")
                     if direction:
+                        indicators_ok, _ = validate_indicator_snapshot(bar)
+                        if not indicators_ok:
+                            continue
                         atr = float(bar.get("atr", 0))
                         if atr <= 0:
                             continue
-                        sl = price - (config.SL_ATR_MULT * atr) if direction == "buy" else price + (config.SL_ATR_MULT * atr)
-                        tp = price + (config.TP_ATR_MULT * atr) if direction == "buy" else price - (config.TP_ATR_MULT * atr)
+                        spread = float(config.BACKTEST_SPREAD_PIPS)
+                        base_entry = price + (spread / 2 if direction == 'buy' else -spread / 2)
+                        entry_price = self._slippage_adjusted_price(base_entry, direction, entering=True)
+
+                        sl = entry_price - (config.SL_ATR_MULT * atr) if direction == "buy" else entry_price + (config.SL_ATR_MULT * atr)
+                        tp = entry_price + (config.TP_ATR_MULT * atr) if direction == "buy" else entry_price - (config.TP_ATR_MULT * atr)
+
+                        risk_per_unit = abs(entry_price - sl)
+                        estimated_loss = risk_per_unit * config.LOT_FIXED * config.PAPER_CONTRACT_SIZE
+                        estimated_loss += self._trade_cost(config.LOT_FIXED)
+                        if estimated_loss > config.BACKTEST_MAX_LOSS_PER_TRADE:
+                            continue
+
                         open_position = {
                             "direction": direction,
-                            "entry_price": price,
+                            "entry_price": entry_price,
                             "sl": sl,
                             "tp": tp,
                             "volume": config.LOT_FIXED
@@ -5799,8 +5984,8 @@ class BacktestEngine:
                     'results': results
                 }, f, indent=2)
             logger.logger.info(f"Backtest report saved to {report_path}")
-        except Exception as e:
-            logger.log_error('BacktestEngine.run', f'Failed to write backtest report: {e}', 'WARNING')
+        except OSError:
+            logger.logger.exception('BacktestEngine.run: failed to write backtest report')
 
         return results
 
@@ -5928,6 +6113,12 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 continue
             
             bar = df.iloc[-1]
+            indicators_ok, indicator_reason = validate_indicator_snapshot(bar)
+            if not indicators_ok:
+                logger.logger.warning(f"{symbol}: skipping bar due to invalid indicators ({indicator_reason})")
+                time.sleep(1)
+                continue
+
             relax_mode = False
             if config.AUTO_RELAX_FILTERS:
                 last_attempt = global_state.last_trade_attempt.get(symbol, 0)
@@ -6287,6 +6478,11 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     time.sleep(0.2)
                     continue
 
+                if not has_sufficient_margin(symbol, chosen_dir, lot, entry_price):
+                    logger.logger.warning(f"{nowstr()} {symbol}: insufficient free margin for lot={lot:.3f}, skipping trade")
+                    time.sleep(1)
+                    continue
+
                 res = send_trade_safe(symbol, chosen_dir, lot, sl_price, tp_price, 
                                     short_reason, confluence_score, fvg_signal_active)
                 
@@ -6320,9 +6516,15 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             check_closed_trades_enhanced()
             time.sleep(0.2)
             
-        except Exception as e:
-            logger.logger.error(f"{nowstr()} {symbol} enhanced loop exception: {e}")
+        except (ValueError, TypeError, KeyError) as e:
+            logger.logger.exception(f"{nowstr()} {symbol} recoverable loop exception")
             logger.log_error("trade_symbol_enhanced", str(e), "ERROR", symbol)
+            global_state.register_critical_error(symbol, str(e))
+            time.sleep(2)
+        except (RuntimeError, OSError) as e:
+            logger.logger.exception(f"{nowstr()} {symbol} critical loop exception")
+            logger.log_error("trade_symbol_enhanced", str(e), "CRITICAL", symbol)
+            global_state.register_critical_error(symbol, str(e))
             time.sleep(2)
 
 # ==================== ENHANCED MAIN EXECUTION ====================
@@ -6426,16 +6628,18 @@ def main_enhanced():
             except KeyboardInterrupt:
                 logger.logger.info("Bot stopped by user (KeyboardInterrupt)")
                 break
-            except Exception as e:
-                logger.logger.error(f"Main supervisor loop exception: {e}")
+            except (RuntimeError, OSError, ValueError) as e:
+                logger.logger.exception("Main supervisor loop exception")
                 logger.log_error("main_enhanced", str(e), "CRITICAL")
+                global_state.register_critical_error('GLOBAL', str(e))
                 time.sleep(5)
                 
     except KeyboardInterrupt:
         logger.logger.info("Bot stopped by user (KeyboardInterrupt)")
-    except Exception as e:
-        logger.logger.critical(f"Critical error in main_enhanced: {e}")
+    except (RuntimeError, OSError, ValueError) as e:
+        logger.logger.exception("Critical error in main_enhanced")
         logger.log_error("main_enhanced", str(e), "CRITICAL")
+        global_state.register_critical_error('GLOBAL', str(e))
     finally:
         try:
             logger.logger.info("Shutting down bot...")
