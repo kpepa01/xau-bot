@@ -927,6 +927,8 @@ class BotConfig:
     # ==== Stability & Automation ====
     SUMMARY_INTERVAL: int = 1800
     MONITOR_INTERVAL: int = 30
+    DASHBOARD_ENABLED: bool = env_bool("DASHBOARD_ENABLED", True)
+    DASHBOARD_REFRESH_SECONDS: int = int(os.getenv("DASHBOARD_REFRESH_SECONDS", "10"))
     AUTO_RECONNECT: bool = True
     MAX_RECONNECT_ATTEMPTS: int = 10
     RECONNECT_BACKOFF_BASE: float = 2.0
@@ -3221,6 +3223,56 @@ class ThreadManager:
 
     def stop_all(self) -> None:
         self.stop_event.set()
+
+class TerminalDashboard:
+    """Lightweight terminal dashboard for real-time bot health and trading KPIs."""
+
+    def __init__(self):
+        self.last_render = 0.0
+
+    def _account_snapshot(self) -> Tuple[float, float, float]:
+        """Return balance/equity/free margin for current execution mode."""
+        if config.PAPER_TRADING_ENABLED:
+            info = paper_engine.get_account_info()
+            return float(info.balance), float(info.equity), float(max(0.0, info.equity - info.margin))
+        acct = get_account_info_safe()
+        if acct is None:
+            return 0.0, 0.0, 0.0
+        return (
+            float(getattr(acct, 'balance', 0.0)),
+            float(getattr(acct, 'equity', 0.0)),
+            float(getattr(acct, 'margin_free', 0.0)),
+        )
+
+    def render_once(self) -> None:
+        """Render a concise dashboard line in logs."""
+        balance, equity, free_margin = self._account_snapshot()
+        floating = equity - balance
+        open_positions = sum(len(active_positions(sym)) for sym in config.SYMBOLS)
+        active_threads = len([t for t in threading.enumerate() if t.name.startswith('Trader_')])
+        cb_remaining = max(0, int(getattr(global_state, 'circuit_breaker_until', 0.0) - time.time()))
+        win_rate = performance_tracker.win_rate() if performance_tracker else 0.0
+        daily_pnl = equity - STARTING_BALANCE
+
+        logger.logger.info(
+            "[DASHBOARD] "
+            f"Mode={'PAPER' if config.PAPER_TRADING_ENABLED else 'LIVE'} | "
+            f"Open={open_positions} | Threads={active_threads} | "
+            f"Balance=${balance:.2f} Equity=${equity:.2f} FreeMargin=${free_margin:.2f} "
+            f"Floating=${floating:.2f} DailyPnL=${daily_pnl:.2f} | "
+            f"WinRate={win_rate:.1f}% Trades={performance_tracker.total_trades if performance_tracker else 0} | "
+            f"CircuitBreaker={cb_remaining}s"
+        )
+
+    def run(self, stop_event: threading.Event) -> None:
+        """Run periodic dashboard refresh loop."""
+        refresh = max(3, int(config.DASHBOARD_REFRESH_SECONDS))
+        while not stop_event.is_set():
+            try:
+                self.render_once()
+            except (ValueError, TypeError, AttributeError):
+                logger.logger.exception("TerminalDashboard render failed")
+            time.sleep(refresh)
 
 performance_tracker = PerformanceTracker(STARTING_BALANCE)
 paper_engine = PaperTradingEngine(config.PAPER_INITIAL_BALANCE)
@@ -6593,6 +6645,18 @@ def main_enhanced():
         supervisor_thread.start()
         logger.logger.info("Supervisor thread started")
         thread_manager.register_thread("Supervisor", supervisor_thread)
+
+        if config.DASHBOARD_ENABLED:
+            dashboard = TerminalDashboard()
+            dashboard_thread = threading.Thread(
+                target=dashboard.run,
+                args=(thread_manager.stop_event,),
+                name="Dashboard",
+                daemon=True,
+            )
+            dashboard_thread.start()
+            logger.logger.info("Dashboard thread started")
+            thread_manager.register_thread("Dashboard", dashboard_thread)
         
         threads = []
         for symbol in config.SYMBOLS:
