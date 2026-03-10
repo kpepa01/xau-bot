@@ -858,6 +858,8 @@ class BotConfig:
     ENTRY_DELAY_BARS: int = 1
     AUTO_RELAX_FILTERS: bool = True
     NO_TRADE_RELAX_MINUTES: int = 30
+    LONG_NO_TRADE_RELAX_MINUTES: int = 120
+    LONG_NO_TRADE_MIN_CONFLUENCE: int = 1
     RELAX_MIN_RR_RATIO: float = 1.6
     RELAX_MIN_MOMENTUM: float = 0.45
     RELAX_MIN_ATR_PCT: float = 0.85
@@ -968,7 +970,7 @@ class BotConfig:
 
     # ==== NEW: FVG SETTINGS ====
     FVG_ENABLED: bool = True
-    FVG_MIN_STRENGTH: float = 0.7
+    FVG_MIN_STRENGTH: float = 0.55
     FVG_CONFLUENCE_WEIGHT: float = 1.0
     FVG_REQUIRE_HTF_CONFIRMATION: bool = True
     FVG_FRESHNESS_THRESHOLD_BARS: int = 50
@@ -4608,7 +4610,9 @@ def get_mtf_alignment(df_h1: pd.DataFrame, df_h4: pd.DataFrame, direction: str) 
     return h1_fast < h1_slow and h4_fast < h4_slow
 
 
-def evaluate_fire_conditions(confluence_result: Dict[str, Any], direction: str) -> Tuple[bool, str]:
+def evaluate_fire_conditions(confluence_result: Dict[str, Any], direction: str,
+                             min_smc: Optional[int] = None,
+                             min_classic: Optional[int] = None) -> Tuple[bool, str]:
     side = 'buy_signals' if direction == 'buy' else 'sell_signals'
     side_signals = confluence_result.get(side, {})
     smc_count = 0
@@ -4623,10 +4627,14 @@ def evaluate_fire_conditions(confluence_result: Dict[str, Any], direction: str) 
         classic_count += 1
     if side_signals.get('crt'):
         classic_count += 1
-    if smc_count < config.MIN_SMC_CONFLUENCE:
-        return False, f'smc_confluence={smc_count}<{config.MIN_SMC_CONFLUENCE}'
-    if classic_count < config.MIN_CLASSIC_CONFLUENCE:
-        return False, f'classic_confluence={classic_count}<{config.MIN_CLASSIC_CONFLUENCE}'
+
+    smc_req = config.MIN_SMC_CONFLUENCE if min_smc is None else int(min_smc)
+    classic_req = config.MIN_CLASSIC_CONFLUENCE if min_classic is None else int(min_classic)
+
+    if smc_count < smc_req:
+        return False, f'smc_confluence={smc_count}<{smc_req}'
+    if classic_count < classic_req:
+        return False, f'classic_confluence={classic_count}<{classic_req}'
     return True, 'ok'
 
 
@@ -6018,19 +6026,32 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 time.sleep(30)
                 continue
 
+            # Compute no-trade duration early so pre-entry blockers can be softened when market is idle.
+            now_ts = time.time()
+            last_trade_ts = global_state.last_trade_time.get(symbol, 0)
+            reference_ts = last_trade_ts if last_trade_ts else global_state.start_time
+            no_trade_minutes = (now_ts - reference_ts) / 60.0
+            long_no_trade_mode = no_trade_minutes >= config.LONG_NO_TRADE_RELAX_MINUTES
+
             session_preferred = is_in_trading_session(config.PREFERRED_SESSION)
             if not session_preferred:
                 logger.logger.info(f"{nowstr()} {symbol}: outside preferred session {config.PREFERRED_SESSION}, applying lower priority")
 
             if config.ECONOMIC_NEWS_FILTER and global_state.news_events and is_news_window(global_state.news_events, datetime.now()):
-                logger.logger.info(f"{nowstr()} {symbol}: news filter active, skipping trade window")
-                time.sleep(30)
-                continue
+                if long_no_trade_mode:
+                    logger.logger.info(f"{nowstr()} {symbol}: news filter softened by long_no_trade_mode")
+                else:
+                    logger.logger.info(f"{nowstr()} {symbol}: news filter active, skipping trade window")
+                    time.sleep(30)
+                    continue
 
             if global_state.correlation_data and not passes_correlation_filter(symbol, global_state.correlation_data):
-                logger.logger.info(f"{nowstr()} {symbol}: correlation filter blocked trade")
-                time.sleep(30)
-                continue
+                if long_no_trade_mode:
+                    logger.logger.info(f"{nowstr()} {symbol}: correlation filter softened by long_no_trade_mode")
+                else:
+                    logger.logger.info(f"{nowstr()} {symbol}: correlation filter blocked trade")
+                    time.sleep(30)
+                    continue
             
             if global_state.daily_trades_count >= config.MAX_DAILY_TRADES:
                 logger.logger.warning(f"{nowstr()} {symbol}: reached MAX_DAILY_TRADES")
@@ -6100,13 +6121,14 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             bar = df.iloc[-1]
             relax_mode = False
             if config.AUTO_RELAX_FILTERS:
-                last_attempt = global_state.last_trade_attempt.get(symbol, 0)
-                if last_attempt and (time.time() - last_attempt) >= config.NO_TRADE_RELAX_MINUTES * 60:
+                if no_trade_minutes >= config.NO_TRADE_RELAX_MINUTES:
                     relax_mode = True
-                elif not last_attempt and (time.time() - global_state.start_time) >= config.NO_TRADE_RELAX_MINUTES * 60:
-                    relax_mode = True
+                if no_trade_minutes >= config.LONG_NO_TRADE_RELAX_MINUTES:
+                    long_no_trade_mode = True
 
             atr_threshold = config.MIN_ATR * (config.RELAX_MIN_ATR_PCT if relax_mode else 1.0)
+            if long_no_trade_mode:
+                atr_threshold *= 0.8
             if float(bar.get('atr', 0)) < atr_threshold:
                 time.sleep(1)
                 continue
@@ -6219,13 +6241,18 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     forced_trade = True
             
             if chosen_dir:
-                ok_fire, fire_reason = evaluate_fire_conditions(confluence_result, chosen_dir)
+                ok_fire, fire_reason = evaluate_fire_conditions(
+                    confluence_result,
+                    chosen_dir,
+                    min_smc=(1 if long_no_trade_mode else config.MIN_SMC_CONFLUENCE),
+                    min_classic=(0 if long_no_trade_mode else config.MIN_CLASSIC_CONFLUENCE)
+                )
                 if not ok_fire and not forced_trade:
                     logger.logger.info(f"{nowstr()} {symbol}: fire conditions blocked ({fire_reason})")
                     time.sleep(0.2)
                     continue
 
-                if config.MTF_CONFIRMATION_REQUIRED and not get_mtf_alignment(df_h1, df_h4, chosen_dir):
+                if config.MTF_CONFIRMATION_REQUIRED and not get_mtf_alignment(df_h1, df_h4, chosen_dir) and not long_no_trade_mode:
                     logger.logger.info(f"{nowstr()} {symbol}: MTF trend misalignment on H1/H4 for {chosen_dir}")
                     time.sleep(0.2)
                     continue
@@ -6269,7 +6296,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     chosen_reasons.append('DIV_BEAR')
 
             allow_setup, setup_reason = setup_quality_gate(symbol, market_regime, confluence_score)
-            if not allow_setup and not forced_trade:
+            if not allow_setup and not forced_trade and not long_no_trade_mode:
                 logger.logger.info(f"{nowstr()} {symbol}: setup quality gate blocked ({setup_reason})")
                 time.sleep(0.2)
                 continue
