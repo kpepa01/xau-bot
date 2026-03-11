@@ -906,8 +906,8 @@ class BotConfig:
     RANGING_THRESHOLD: float = 0.25
 
     MIN_CONFIRMING_SIGNALS: int = 2
-    CONSECUTIVE_LOSS_LIMIT: int = 3
-    CONSECUTIVE_LOSS_COOLDOWN_MINUTES: int = 90
+    CONSECUTIVE_LOSS_LIMIT: int = 5
+    CONSECUTIVE_LOSS_COOLDOWN_MINUTES: int = 45
 
     # ==== Partial Close ====
     PARTIAL_CLOSE_ENABLED: bool = True
@@ -940,10 +940,10 @@ class BotConfig:
     KILL_SWITCH_MIN_SAMPLE_SIZE: int = int(os.getenv("KILL_SWITCH_MIN_SAMPLE_SIZE", "10"))
 
     # ==== Daily Protection ====
-    DAILY_LOSS_PCT: float = 5.0
+    DAILY_LOSS_PCT: float = 8.0
     DAILY_LOSS_HARD_STOP: bool = False
     DAILY_PROFIT_PCT: float = 3.0
-    MAX_DRAWDOWN_PCT: float = 5.0
+    MAX_DRAWDOWN_PCT: float = 12.0
     MAX_DAILY_TRADES: int = 60
 
     # ==== Time Restrictions ====
@@ -967,7 +967,7 @@ class BotConfig:
     DYNAMIC_RSI_LOOKBACK: int = int(os.getenv("DYNAMIC_RSI_LOOKBACK", "100"))
     DYNAMIC_RSI_LOW_Q: float = float(os.getenv("DYNAMIC_RSI_LOW_Q", "0.2"))
     DYNAMIC_RSI_HIGH_Q: float = float(os.getenv("DYNAMIC_RSI_HIGH_Q", "0.8"))
-    CIRCUIT_BREAKER_COOL_OFF_MINUTES: int = int(os.getenv("CIRCUIT_BREAKER_COOL_OFF_MINUTES", "180"))
+    CIRCUIT_BREAKER_COOL_OFF_MINUTES: int = int(os.getenv("CIRCUIT_BREAKER_COOL_OFF_MINUTES", "60"))
     CIRCUIT_BREAKER_ERROR_THRESHOLD: int = int(os.getenv("CIRCUIT_BREAKER_ERROR_THRESHOLD", "5"))
     CIRCUIT_BREAKER_ERROR_WINDOW_SECONDS: int = int(os.getenv("CIRCUIT_BREAKER_ERROR_WINDOW_SECONDS", "300"))
 
@@ -4053,9 +4053,13 @@ class EnhancedGlobalState:
         """Load high-impact events from an external economic calendar API."""
         events: List[Dict[str, Any]] = []
         req = urlrequest.Request(config.ECONOMIC_CALENDAR_API_URL, headers={"User-Agent": "xau-bot/1.0"})
-        with urlrequest.urlopen(req, timeout=8) as response:
-            payload = response.read().decode("utf-8")
-        raw_items = json.loads(payload)
+        try:
+            with urlrequest.urlopen(req, timeout=8) as response:
+                payload = response.read().decode("utf-8")
+            raw_items = json.loads(payload)
+        except (urlerror.HTTPError, urlerror.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+            logger.logger.warning(f"Calendar API unavailable ({exc}); using MT5 fallback if available.")
+            return events
         if not isinstance(raw_items, list):
             return events
 
@@ -4157,13 +4161,9 @@ class EnhancedGlobalState:
                 events = self._load_mt5_calendar_events(now)
             self.news_events = events
             self.last_news_refresh = time.time()
-        except (urlerror.URLError, TimeoutError, json.JSONDecodeError, ValueError):
-            logger.logger.exception("update_news_events: failed loading external calendar feed")
-            self.news_events = self._load_mt5_calendar_events(now)
-            self.last_news_refresh = time.time()
-        except (AttributeError, OSError):
+        except (AttributeError, OSError) as exc:
             logger.logger.exception("update_news_events: unexpected error")
-            logger.log_error('update_news_events', 'unexpected error while loading calendar events', 'WARNING')
+            logger.log_error('update_news_events', str(exc), 'WARNING')
 
     def update_correlation_data(self) -> None:
         """Populate rolling correlation data for configured symbol pairs."""
