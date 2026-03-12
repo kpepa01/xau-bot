@@ -952,6 +952,14 @@ class BotConfig:
     QUALITY_SCORE_HARD_BLOCK: bool = True
     EXECUTION_SPREAD_WINDOW: int = 50
     EXECUTION_MAX_SPREAD_RATIO: float = 1.8
+    MIN_SIGNAL_WIN_RATE: float = 0.48
+    DYNAMIC_QUALITY_BY_REGIME: bool = True
+    QUALITY_REGIME_TRENDING_BONUS: float = -3.0
+    QUALITY_REGIME_RANGING_PENALTY: float = 2.0
+    QUALITY_NON_PREFERRED_SESSION_PENALTY: float = 3.0
+    NO_TRADE_VOLATILITY_SPIKE_MULT: float = 2.2
+    NO_TRADE_LOW_TREND_THRESHOLD: float = 0.18
+    NO_TRADE_LOW_VOLUME_THRESHOLD: float = 0.9
     MAX_TRADE_DURATION_MINUTES: int = 240
 
     # ==== Paper Trading & Backtesting ====
@@ -3912,6 +3920,24 @@ class TradeFilter:
         )
         return max(0.0, min(100.0, weighted * 100.0))
 
+    def classify_no_trade_environment(self, market_data: Dict[str, Any], atr: float) -> Tuple[bool, str]:
+        """Detect hostile market states where entries should be skipped."""
+        spread_ratio = float(market_data.get("spread_ratio", 1.0))
+        trend_strength = float(market_data.get("trend_strength", 0.0))
+        volume_ratio = float(market_data.get("volume_ratio", 1.0))
+        atr_baseline = float(market_data.get("atr_baseline", atr if atr > 0 else 0.0))
+
+        if spread_ratio > max(config.EXECUTION_MAX_SPREAD_RATIO, config.NO_TRADE_VOLATILITY_SPIKE_MULT):
+            return True, f"spread_spike:{spread_ratio:.2f}"
+
+        if atr_baseline > 0 and atr > (atr_baseline * config.NO_TRADE_VOLATILITY_SPIKE_MULT):
+            return True, f"atr_spike:{atr:.4f}>{atr_baseline:.4f}"
+
+        if trend_strength < config.NO_TRADE_LOW_TREND_THRESHOLD and volume_ratio < config.NO_TRADE_LOW_VOLUME_THRESHOLD:
+            return True, f"dead_market:trend={trend_strength:.2f},vol={volume_ratio:.2f}"
+
+        return False, "ok"
+
 class AdaptiveTrading:
     """Adjust trading based on recent performance"""
     
@@ -4071,6 +4097,25 @@ class EnhancedGlobalState:
             if baseline <= 0:
                 return 1.0
             return float(spread_points) / baseline
+
+    def dynamic_quality_threshold(self, symbol: str, market_regime: str, session_preferred: bool) -> float:
+        """Adaptive entry score threshold from regime/session and recent signal learning."""
+        threshold = float(config.MIN_ENTRY_QUALITY_SCORE)
+        if config.DYNAMIC_QUALITY_BY_REGIME:
+            if market_regime == 'trending':
+                threshold += float(config.QUALITY_REGIME_TRENDING_BONUS)
+            elif market_regime == 'ranging':
+                threshold += float(config.QUALITY_REGIME_RANGING_PENALTY)
+
+        if not session_preferred:
+            threshold += float(config.QUALITY_NON_PREFERRED_SESSION_PENALTY)
+
+        sample_key = "buy"
+        wr = self.get_signal_win_rate(symbol, sample_key)
+        if wr < config.MIN_SIGNAL_WIN_RATE:
+            threshold += (config.MIN_SIGNAL_WIN_RATE - wr) * 40.0
+
+        return max(50.0, min(95.0, threshold))
     
     def _load_recent_trade_levels(self) -> List[Dict[str, Any]]:
         try:
@@ -6343,6 +6388,8 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     "last_signal_time": global_state.last_signal_time.get(symbol, 0),
                     "rr_ratio": rr
                 }
+                atr_baseline = float(df['atr'].iloc[-50:].median()) if 'atr' in df.columns and len(df) >= 10 else float(atr)
+                market_data['atr_baseline'] = atr_baseline
                 market_data.update(detect_order_flow_imbalance(df))
                 quality_score = global_state.trade_filter.compute_quality_score(
                     market_data,
@@ -6350,13 +6397,19 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     min_rr,
                     relax_mode,
                 )
+                dynamic_quality_min = global_state.dynamic_quality_threshold(symbol, market_regime, session_preferred)
                 if not forced_trade:
+                    no_trade_env, no_trade_reason = global_state.trade_filter.classify_no_trade_environment(market_data, float(atr))
+                    if no_trade_env:
+                        logger.logger.info(f"{nowstr()} {symbol}: no-trade environment ({no_trade_reason})")
+                        time.sleep(0.2)
+                        continue
                     if spread_ratio > config.EXECUTION_MAX_SPREAD_RATIO:
                         logger.logger.info(f"{nowstr()} {symbol}: execution filter blocked entry (spread_ratio={spread_ratio:.2f})")
                         time.sleep(0.2)
                         continue
-                    if config.QUALITY_SCORE_HARD_BLOCK and quality_score < config.MIN_ENTRY_QUALITY_SCORE:
-                        logger.logger.info(f"{nowstr()} {symbol}: quality gate blocked entry (score={quality_score:.1f}<{config.MIN_ENTRY_QUALITY_SCORE:.1f})")
+                    if config.QUALITY_SCORE_HARD_BLOCK and quality_score < dynamic_quality_min:
+                        logger.logger.info(f"{nowstr()} {symbol}: quality gate blocked entry (score={quality_score:.1f}<{dynamic_quality_min:.1f})")
                         time.sleep(0.2)
                         continue
                     if not global_state.trade_filter.filter_trade(
@@ -6395,7 +6448,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 
                 logger.logger.info(f"{nowstr()} {symbol} ATTEMPT {chosen_dir} lot={lot:.3f} "
                                  f"entry={entry_price:.5f} sl={sl_price:.5f} tp={tp_price:.5f} "
-                                 f"confluence={confluence_score}/5 quality={quality_score:.1f} "
+                                 f"confluence={confluence_score}/5 quality={quality_score:.1f}/{dynamic_quality_min:.1f} "
                                  f"reasons={chosen_reasons} potential_loss=${potential_loss_usd:.2f}")
                 
                 short_reason = ""
