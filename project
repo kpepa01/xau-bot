@@ -855,6 +855,7 @@ class BotConfig:
     MIN_MOMENTUM_STRENGTH: float = 0.6
     ENTRY_DELAY_BARS: int = 2
     AUTO_RELAX_FILTERS: bool = True
+    RELAX_FILTERS_LIVE_TRADING: bool = False
     NO_TRADE_RELAX_MINUTES: int = 30
     RELAX_MIN_RR_RATIO: float = 1.6
     RELAX_MIN_MOMENTUM: float = 0.45
@@ -921,6 +922,9 @@ class BotConfig:
     # ==== Time Restrictions ====
     NO_TRADE_START: dt_time = dt_time(23, 0)
     NO_TRADE_END: dt_time = dt_time(0, 10)
+    ENFORCE_DAILY_TRADE_WINDOW: bool = True
+    TRADE_WINDOW_START: dt_time = dt_time(0, 10)
+    TRADE_WINDOW_END: dt_time = dt_time(23, 0)
 
     # ==== Stability & Automation ====
     SUMMARY_INTERVAL: int = 1800
@@ -944,6 +948,18 @@ class BotConfig:
     # ==== Trade Quality Filters ====
     MAX_SPREAD_POINTS: float = 30.0
     MIN_RISK_REWARD: float = 1.5
+    MIN_ENTRY_QUALITY_SCORE: float = 70.0
+    QUALITY_SCORE_HARD_BLOCK: bool = True
+    EXECUTION_SPREAD_WINDOW: int = 50
+    EXECUTION_MAX_SPREAD_RATIO: float = 1.8
+    MIN_SIGNAL_WIN_RATE: float = 0.48
+    DYNAMIC_QUALITY_BY_REGIME: bool = True
+    QUALITY_REGIME_TRENDING_BONUS: float = -3.0
+    QUALITY_REGIME_RANGING_PENALTY: float = 2.0
+    QUALITY_NON_PREFERRED_SESSION_PENALTY: float = 3.0
+    NO_TRADE_VOLATILITY_SPIKE_MULT: float = 2.2
+    NO_TRADE_LOW_TREND_THRESHOLD: float = 0.18
+    NO_TRADE_LOW_VOLUME_THRESHOLD: float = 0.9
     MAX_TRADE_DURATION_MINUTES: int = 240
 
     # ==== Paper Trading & Backtesting ====
@@ -3878,6 +3894,50 @@ class TradeFilter:
         threshold = config.MIN_RR_RATIO if min_rr_ratio is None else min_rr_ratio
         return rr_ratio >= threshold
 
+    def compute_quality_score(self, market_data: Dict[str, Any],
+                              confluence_score: float,
+                              min_rr_ratio: float,
+                              relax_mode: bool) -> float:
+        """Compute a 0-100 entry quality score combining confluence, risk, trend, volume and execution."""
+        rr_ratio = float(market_data.get("rr_ratio", 0.0))
+        trend_strength = float(market_data.get("trend_strength", 0.0))
+        volume_ratio = float(market_data.get("volume_ratio", 1.0))
+        spread_ratio = float(market_data.get("spread_ratio", 1.0))
+
+        confluence_norm = min(1.0, max(0.0, float(confluence_score) / 5.0))
+        rr_norm = min(1.0, rr_ratio / max(1e-6, min_rr_ratio + 0.5))
+        trend_target = max(0.35, (config.RELAX_MIN_TREND_STRENGTH if relax_mode else self.min_trend_strength))
+        trend_norm = min(1.0, trend_strength / max(1e-6, trend_target + 0.25))
+        volume_norm = min(1.0, volume_ratio / max(1e-6, self.min_volume_ratio + 0.4))
+        spread_norm = max(0.0, min(1.0, 2.0 - spread_ratio))
+
+        weighted = (
+            confluence_norm * 0.30
+            + rr_norm * 0.25
+            + trend_norm * 0.20
+            + volume_norm * 0.15
+            + spread_norm * 0.10
+        )
+        return max(0.0, min(100.0, weighted * 100.0))
+
+    def classify_no_trade_environment(self, market_data: Dict[str, Any], atr: float) -> Tuple[bool, str]:
+        """Detect hostile market states where entries should be skipped."""
+        spread_ratio = float(market_data.get("spread_ratio", 1.0))
+        trend_strength = float(market_data.get("trend_strength", 0.0))
+        volume_ratio = float(market_data.get("volume_ratio", 1.0))
+        atr_baseline = float(market_data.get("atr_baseline", atr if atr > 0 else 0.0))
+
+        if spread_ratio > max(config.EXECUTION_MAX_SPREAD_RATIO, config.NO_TRADE_VOLATILITY_SPIKE_MULT):
+            return True, f"spread_spike:{spread_ratio:.2f}"
+
+        if atr_baseline > 0 and atr > (atr_baseline * config.NO_TRADE_VOLATILITY_SPIKE_MULT):
+            return True, f"atr_spike:{atr:.4f}>{atr_baseline:.4f}"
+
+        if trend_strength < config.NO_TRADE_LOW_TREND_THRESHOLD and volume_ratio < config.NO_TRADE_LOW_VOLUME_THRESHOLD:
+            return True, f"dead_market:trend={trend_strength:.2f},vol={volume_ratio:.2f}"
+
+        return False, "ok"
+
 class AdaptiveTrading:
     """Adjust trading based on recent performance"""
     
@@ -3971,8 +4031,91 @@ class EnhancedGlobalState:
         self.last_news_refresh = 0.0
         self.last_correlation_refresh = 0.0
         self.trade_memory_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'recent_trades.json')
+        self.daily_trade_state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'daily_trade_state.json')
         self.recent_trade_levels: List[Dict[str, Any]] = self._load_recent_trade_levels()
+        self.spread_history = {s: deque(maxlen=max(20, config.EXECUTION_SPREAD_WINDOW)) for s in config.SYMBOLS}
         self.lock = threading.RLock()
+        self._load_daily_trade_state()
+
+    def _load_daily_trade_state(self) -> None:
+        """Load persisted daily trade counter so restarts do not bypass MAX_DAILY_TRADES."""
+        try:
+            if not os.path.exists(self.daily_trade_state_file):
+                return
+            with open(self.daily_trade_state_file, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+            stored_date = state.get('date')
+            stored_count = int(state.get('count', 0))
+            if stored_date == date.today().isoformat() and stored_count >= 0:
+                self.daily_start_date = date.today()
+                self.daily_trades_count = stored_count
+                logger.logger.info(f"Restored daily trade count: {self.daily_trades_count}/{config.MAX_DAILY_TRADES}")
+        except Exception as e:
+            logger.log_error('_load_daily_trade_state', str(e), 'WARNING')
+
+    def _persist_daily_trade_state(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.daily_trade_state_file), exist_ok=True)
+            with open(self.daily_trade_state_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'date': self.daily_start_date.isoformat(),
+                    'count': int(self.daily_trades_count)
+                }, f, indent=2)
+        except Exception as e:
+            logger.log_error('_persist_daily_trade_state', str(e), 'WARNING')
+
+    def try_reserve_daily_trade_slot(self, symbol: str) -> bool:
+        """Atomically reserve one daily trade slot to enforce MAX_DAILY_TRADES across threads."""
+        with self.lock:
+            if date.today() != self.daily_start_date:
+                self.reset_daily_stats()
+            if self.daily_trades_count >= config.MAX_DAILY_TRADES:
+                logger.logger.warning(f"{nowstr()} {symbol}: daily trade cap reached ({self.daily_trades_count}/{config.MAX_DAILY_TRADES})")
+                return False
+            self.daily_trades_count += 1
+            self._persist_daily_trade_state()
+            return True
+
+    def release_daily_trade_slot(self) -> None:
+        """Rollback reserved slot if order placement fails."""
+        with self.lock:
+            self.daily_trades_count = max(0, self.daily_trades_count - 1)
+            self._persist_daily_trade_state()
+
+    def record_spread(self, symbol: str, spread_points: float) -> None:
+        with self.lock:
+            if symbol not in self.spread_history:
+                self.spread_history[symbol] = deque(maxlen=max(20, config.EXECUTION_SPREAD_WINDOW))
+            self.spread_history[symbol].append(float(spread_points))
+
+    def spread_ratio(self, symbol: str, spread_points: float) -> float:
+        with self.lock:
+            hist = self.spread_history.get(symbol)
+            if not hist:
+                return 1.0
+            baseline = float(np.nanmedian(list(hist))) if len(hist) else 0.0
+            if baseline <= 0:
+                return 1.0
+            return float(spread_points) / baseline
+
+    def dynamic_quality_threshold(self, symbol: str, market_regime: str, session_preferred: bool) -> float:
+        """Adaptive entry score threshold from regime/session and recent signal learning."""
+        threshold = float(config.MIN_ENTRY_QUALITY_SCORE)
+        if config.DYNAMIC_QUALITY_BY_REGIME:
+            if market_regime == 'trending':
+                threshold += float(config.QUALITY_REGIME_TRENDING_BONUS)
+            elif market_regime == 'ranging':
+                threshold += float(config.QUALITY_REGIME_RANGING_PENALTY)
+
+        if not session_preferred:
+            threshold += float(config.QUALITY_NON_PREFERRED_SESSION_PENALTY)
+
+        sample_key = "buy"
+        wr = self.get_signal_win_rate(symbol, sample_key)
+        if wr < config.MIN_SIGNAL_WIN_RATE:
+            threshold += (config.MIN_SIGNAL_WIN_RATE - wr) * 40.0
+
+        return max(50.0, min(95.0, threshold))
     
     def _load_recent_trade_levels(self) -> List[Dict[str, Any]]:
         try:
@@ -4261,6 +4404,7 @@ class EnhancedGlobalState:
             except:
                 self.peak_equity = STARTING_BALANCE
             self.max_drawdown = 0.0
+            self._persist_daily_trade_state()
             logger.logger.info("Daily stats reset for new trading day")
 
 global_state = EnhancedGlobalState(STARTING_BALANCE)
@@ -4286,6 +4430,17 @@ def is_in_trading_session(session_name: str) -> bool:
     now_time = datetime.now().time()
     start = session['start']
     end = session['end']
+    if start <= end:
+        return start <= now_time <= end
+    return now_time >= start or now_time <= end
+
+def is_within_daily_trade_window() -> bool:
+    """Return True when new entries are allowed for configured trade window."""
+    if not config.ENFORCE_DAILY_TRADE_WINDOW:
+        return True
+    now_time = datetime.now().time()
+    start = config.TRADE_WINDOW_START
+    end = config.TRADE_WINDOW_END
     if start <= end:
         return start <= now_time <= end
     return now_time >= start or now_time <= end
@@ -5845,6 +6000,15 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             
             if is_in_no_trade_zone():
                 logger.logger.debug(f"{nowstr()} {symbol}: inside no-trade zone; skipping")
+                manage_hybrid_trailing_enhanced(symbol)
+                check_closed_trades_enhanced()
+                time.sleep(30)
+                continue
+
+            if not is_within_daily_trade_window():
+                logger.logger.info(f"{nowstr()} {symbol}: outside configured trade window {config.TRADE_WINDOW_START}-{config.TRADE_WINDOW_END}; waiting")
+                manage_hybrid_trailing_enhanced(symbol)
+                check_closed_trades_enhanced()
                 time.sleep(30)
                 continue
 
@@ -5929,7 +6093,10 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             
             bar = df.iloc[-1]
             relax_mode = False
-            if config.AUTO_RELAX_FILTERS:
+            allow_relax = config.AUTO_RELAX_FILTERS and (
+                config.PAPER_TRADING_ENABLED or config.BACKTEST_MODE or config.RELAX_FILTERS_LIVE_TRADING
+            )
+            if allow_relax:
                 last_attempt = global_state.last_trade_attempt.get(symbol, 0)
                 if last_attempt and (time.time() - last_attempt) >= config.NO_TRADE_RELAX_MINUTES * 60:
                     relax_mode = True
@@ -6208,16 +6375,43 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     rr = (reward / risk) if risk > 0 else 0
                     logger.logger.info(f"{nowstr()} {symbol}: adjusted TP to satisfy minimum R:R -> {rr:.2f}")
 
+                current_spread = float(spread_points or 0.0)
+                global_state.record_spread(symbol, current_spread)
+                spread_ratio = global_state.spread_ratio(symbol, current_spread)
+
                 market_data = {
                     "volume_ratio": float(df['tick_volume'].iloc[-1]) / max(float(df['tick_volume'].iloc[-20:].mean()), 1.0) if 'tick_volume' in df.columns else 1.0,
                     "trend_strength": detect_market_condition_enhanced(df).get("trend_strength", 0.0),
-                    "spread_points": spread_points or 0.0,
-                    "avg_spread_points": spread_points or 0.0,
+                    "spread_points": current_spread,
+                    "avg_spread_points": current_spread / max(1e-6, spread_ratio),
+                    "spread_ratio": spread_ratio,
                     "last_signal_time": global_state.last_signal_time.get(symbol, 0),
                     "rr_ratio": rr
                 }
+                atr_baseline = float(df['atr'].iloc[-50:].median()) if 'atr' in df.columns and len(df) >= 10 else float(atr)
+                market_data['atr_baseline'] = atr_baseline
                 market_data.update(detect_order_flow_imbalance(df))
+                quality_score = global_state.trade_filter.compute_quality_score(
+                    market_data,
+                    confluence_score,
+                    min_rr,
+                    relax_mode,
+                )
+                dynamic_quality_min = global_state.dynamic_quality_threshold(symbol, market_regime, session_preferred)
                 if not forced_trade:
+                    no_trade_env, no_trade_reason = global_state.trade_filter.classify_no_trade_environment(market_data, float(atr))
+                    if no_trade_env:
+                        logger.logger.info(f"{nowstr()} {symbol}: no-trade environment ({no_trade_reason})")
+                        time.sleep(0.2)
+                        continue
+                    if spread_ratio > config.EXECUTION_MAX_SPREAD_RATIO:
+                        logger.logger.info(f"{nowstr()} {symbol}: execution filter blocked entry (spread_ratio={spread_ratio:.2f})")
+                        time.sleep(0.2)
+                        continue
+                    if config.QUALITY_SCORE_HARD_BLOCK and quality_score < dynamic_quality_min:
+                        logger.logger.info(f"{nowstr()} {symbol}: quality gate blocked entry (score={quality_score:.1f}<{dynamic_quality_min:.1f})")
+                        time.sleep(0.2)
+                        continue
                     if not global_state.trade_filter.filter_trade(
                         {"direction": chosen_dir},
                         market_data,
@@ -6254,7 +6448,8 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 
                 logger.logger.info(f"{nowstr()} {symbol} ATTEMPT {chosen_dir} lot={lot:.3f} "
                                  f"entry={entry_price:.5f} sl={sl_price:.5f} tp={tp_price:.5f} "
-                                 f"confluence={confluence_score}/5 reasons={chosen_reasons} potential_loss=${potential_loss_usd:.2f}")
+                                 f"confluence={confluence_score}/5 quality={quality_score:.1f}/{dynamic_quality_min:.1f} "
+                                 f"reasons={chosen_reasons} potential_loss=${potential_loss_usd:.2f}")
                 
                 short_reason = ""
                 if chosen_reasons:
@@ -6287,10 +6482,15 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     time.sleep(0.2)
                     continue
 
+                if not global_state.try_reserve_daily_trade_slot(symbol):
+                    time.sleep(0.2)
+                    continue
+
                 res = send_trade_safe(symbol, chosen_dir, lot, sl_price, tp_price, 
                                     short_reason, confluence_score, fvg_signal_active)
                 
                 if res is None:
+                    global_state.release_daily_trade_slot()
                     logger.logger.warning(f"{nowstr()} {symbol}: trade attempt failed. mt5.last_error={mt5.last_error()}")
                     debug_mt5_error()
                 else:
@@ -6312,7 +6512,6 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     except Exception:
                         pass
                     
-                    global_state.daily_trades_count += 1
                     global_state.last_trade_time[symbol] = time.time()
                     global_state.record_trade_level(symbol, chosen_dir, entry_price)
             
@@ -6392,12 +6591,12 @@ def main_enhanced():
         logger.logger.info("Supervisor thread started")
         thread_manager.register_thread("Supervisor", supervisor_thread)
         
-        threads = []
+        trader_threads: Dict[str, threading.Thread] = {}
         for symbol in config.SYMBOLS:
             t = threading.Thread(target=trade_symbol_enhanced, args=(symbol, thread_manager.stop_event), 
                                name=f"Trader_{symbol}", daemon=True)
             t.start()
-            threads.append(t)
+            trader_threads[symbol] = t
             time.sleep(0.5)
             logger.logger.info(f"Trading thread started for {symbol}")
             thread_manager.register_thread(t.name, t, symbol)
@@ -6420,6 +6619,20 @@ def main_enhanced():
                 if active_threads < len(config.SYMBOLS) + 2:
                     logger.logger.warning(f"Thread count low: {active_threads}")
                     thread_manager.cleanup_stale_threads(timeout=300)
+
+                for symbol in config.SYMBOLS:
+                    worker = trader_threads.get(symbol)
+                    if worker is None or not worker.is_alive():
+                        logger.logger.warning(f"Respawning trader thread for {symbol}")
+                        new_worker = threading.Thread(
+                            target=trade_symbol_enhanced,
+                            args=(symbol, thread_manager.stop_event),
+                            name=f"Trader_{symbol}",
+                            daemon=True,
+                        )
+                        new_worker.start()
+                        trader_threads[symbol] = new_worker
+                        thread_manager.register_thread(new_worker.name, new_worker, symbol)
                 
                 time.sleep(10)
                 
