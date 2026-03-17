@@ -820,8 +820,8 @@ class BotConfig:
     # ==== Risk Management ====
     USE_FIXED_LOT: bool = True
     LOT_FIXED: float = 0.01
-    MAX_TRADES_PER_SYMBOL: int = 2
-    MAX_POSITIONS_TOTAL: int = 4
+    MAX_TRADES_PER_SYMBOL: int = 1
+    MAX_POSITIONS_TOTAL: int = 2
     MAX_LOSS_PER_TRADE: float = 15.0
     MIN_RISK_PER_TRADE_USD: float = 5.0
     DYNAMIC_POSITION_SIZING: bool = False
@@ -831,7 +831,7 @@ class BotConfig:
 
     COOLDOWN: int = 1800
     FORCE_TRADE_EVERY: int = 1400
-    FORCE_TRADE_ENABLED: bool = True
+    FORCE_TRADE_ENABLED: bool = False
 
     # ==== Indicator Settings ====
     EMA_FAST: int = 12
@@ -855,6 +855,7 @@ class BotConfig:
     MIN_MOMENTUM_STRENGTH: float = 0.6
     ENTRY_DELAY_BARS: int = 2
     AUTO_RELAX_FILTERS: bool = True
+    RELAX_FILTERS_LIVE_TRADING: bool = False
     NO_TRADE_RELAX_MINUTES: int = 30
     RELAX_MIN_RR_RATIO: float = 1.6
     RELAX_MIN_MOMENTUM: float = 0.45
@@ -912,15 +913,21 @@ class BotConfig:
     ENTRY_RSI_SELL_MIN: float = 28.0
 
     # ==== Daily Protection ====
-    DAILY_LOSS_PCT: float = 5.0
-    DAILY_LOSS_HARD_STOP: bool = False
+    DAILY_LOSS_PCT: float = 2.0
+    DAILY_MAX_LOSS_USD: float = 100.0
+    DAILY_CONSECUTIVE_LOSS_STOP: int = 4
+    DAILY_CONSECUTIVE_LOSS_HARD_STOP: bool = True
+    DAILY_LOSS_HARD_STOP: bool = True
     DAILY_PROFIT_PCT: float = 3.0
     MAX_DRAWDOWN_PCT: float = 5.0
-    MAX_DAILY_TRADES: int = 60
+    MAX_DAILY_TRADES: int = 20
 
     # ==== Time Restrictions ====
     NO_TRADE_START: dt_time = dt_time(23, 0)
     NO_TRADE_END: dt_time = dt_time(0, 10)
+    ENFORCE_DAILY_TRADE_WINDOW: bool = True
+    TRADE_WINDOW_START: dt_time = dt_time(0, 10)
+    TRADE_WINDOW_END: dt_time = dt_time(23, 0)
 
     # ==== Stability & Automation ====
     SUMMARY_INTERVAL: int = 1800
@@ -944,6 +951,22 @@ class BotConfig:
     # ==== Trade Quality Filters ====
     MAX_SPREAD_POINTS: float = 30.0
     MIN_RISK_REWARD: float = 1.5
+    MIN_ENTRY_QUALITY_SCORE: float = 80.0
+    QUALITY_SCORE_HARD_BLOCK: bool = True
+    EXECUTION_SPREAD_WINDOW: int = 50
+    EXECUTION_MAX_SPREAD_RATIO: float = 1.4
+    ENTRY_DRIFT_WINDOW: int = 30
+    MAX_AVG_ENTRY_DRIFT_PIPS: float = 2.5
+    REASON_BLOCK_ENABLED: bool = True
+    REASON_BLOCK_MIN_TRADES: int = 8
+    REASON_BLOCK_MAX_WIN_RATE: float = 0.35
+    REASON_BLOCK_LOOKBACK: int = 200
+    SESSION_QUALITY_THRESHOLDS: Dict[str, float] = field(default_factory=lambda: {
+        'LONDON': 80.0,
+        'NEW_YORK': 80.0,
+        'ASIA': 86.0,
+        'OFF_HOURS': 90.0,
+    })
     MAX_TRADE_DURATION_MINUTES: int = 240
 
     # ==== Paper Trading & Backtesting ====
@@ -1120,6 +1143,10 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("MIN_CONFLUENCE_SCORE must be at least 1.")
     if not (0 <= bot_config.DAILY_LOSS_PCT <= 100):
         errors.append("DAILY_LOSS_PCT must be between 0 and 100.")
+    if bot_config.DAILY_MAX_LOSS_USD <= 0:
+        errors.append("DAILY_MAX_LOSS_USD must be greater than 0.")
+    if bot_config.DAILY_CONSECUTIVE_LOSS_STOP < 1:
+        errors.append("DAILY_CONSECUTIVE_LOSS_STOP must be at least 1.")
     if not (0 <= bot_config.DAILY_PROFIT_PCT <= 100):
         errors.append("DAILY_PROFIT_PCT must be between 0 and 100.")
     if not (0 <= bot_config.MAX_DRAWDOWN_PCT <= 100):
@@ -1133,6 +1160,16 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("MAX_SPREAD_POINTS must be greater than 0.")
     if bot_config.MIN_RISK_REWARD <= 0:
         errors.append("MIN_RISK_REWARD must be greater than 0.")
+    if not (0 <= bot_config.MIN_ENTRY_QUALITY_SCORE <= 100):
+        errors.append("MIN_ENTRY_QUALITY_SCORE must be between 0 and 100.")
+    if bot_config.EXECUTION_MAX_SPREAD_RATIO <= 0:
+        errors.append("EXECUTION_MAX_SPREAD_RATIO must be greater than 0.")
+    if bot_config.MAX_AVG_ENTRY_DRIFT_PIPS <= 0:
+        errors.append("MAX_AVG_ENTRY_DRIFT_PIPS must be greater than 0.")
+    if bot_config.REASON_BLOCK_MIN_TRADES < 1:
+        errors.append("REASON_BLOCK_MIN_TRADES must be at least 1.")
+    if not (0 <= bot_config.REASON_BLOCK_MAX_WIN_RATE <= 1):
+        errors.append("REASON_BLOCK_MAX_WIN_RATE must be between 0 and 1.")
     if bot_config.MIN_RR_RATIO <= 0:
         errors.append("MIN_RR_RATIO must be greater than 0.")
     if bot_config.RELAX_MIN_RR_RATIO <= 0:
@@ -2635,7 +2672,8 @@ class TradeTracker:
     def add_trade(self, ticket: int, symbol: str, direction: str, 
                   entry_price: float, sl_price: float, tp_price: float,
                   confluence_score: int = 0, fvg_signal: bool = False,
-                  lot_size: Optional[float] = None):
+                  lot_size: Optional[float] = None,
+                  reason_key: str = ""):
         """Add a new trade to track with safety checks"""
         with self.lock:
             info = get_symbol_info_safe(symbol)
@@ -2692,7 +2730,8 @@ class TradeTracker:
                 'lot_size': resolved_lot,
                 'max_loss_exceeded': potential_loss > self.max_loss_per_trade,
                 'confluence_score': confluence_score,
-                'fvg_signal': fvg_signal
+                'fvg_signal': fvg_signal,
+                'reason_key': reason_key
             }
             
             logger.logger.info(f"Trade {ticket} added to tracker. Potential loss: ${potential_loss:.2f}")
@@ -3878,6 +3917,32 @@ class TradeFilter:
         threshold = config.MIN_RR_RATIO if min_rr_ratio is None else min_rr_ratio
         return rr_ratio >= threshold
 
+    def compute_quality_score(self, market_data: Dict[str, Any],
+                              confluence_score: float,
+                              min_rr_ratio: float,
+                              relax_mode: bool) -> float:
+        """Compute a 0-100 entry quality score combining confluence, risk, trend, volume and execution."""
+        rr_ratio = float(market_data.get("rr_ratio", 0.0))
+        trend_strength = float(market_data.get("trend_strength", 0.0))
+        volume_ratio = float(market_data.get("volume_ratio", 1.0))
+        spread_ratio = float(market_data.get("spread_ratio", 1.0))
+
+        confluence_norm = min(1.0, max(0.0, float(confluence_score) / 5.0))
+        rr_norm = min(1.0, rr_ratio / max(1e-6, min_rr_ratio + 0.5))
+        trend_target = max(0.35, (config.RELAX_MIN_TREND_STRENGTH if relax_mode else self.min_trend_strength))
+        trend_norm = min(1.0, trend_strength / max(1e-6, trend_target + 0.25))
+        volume_norm = min(1.0, volume_ratio / max(1e-6, self.min_volume_ratio + 0.4))
+        spread_norm = max(0.0, min(1.0, 2.0 - spread_ratio))
+
+        weighted = (
+            confluence_norm * 0.30
+            + rr_norm * 0.25
+            + trend_norm * 0.20
+            + volume_norm * 0.15
+            + spread_norm * 0.10
+        )
+        return max(0.0, min(100.0, weighted * 100.0))
+
 class AdaptiveTrading:
     """Adjust trading based on recent performance"""
     
@@ -3948,6 +4013,8 @@ class EnhancedGlobalState:
         self.daily_loss_triggered = False
         self.last_summary_time = time.time()
         self.start_time = time.time()
+        self.daily_start_balance = starting_balance
+        self.daily_consecutive_losses = 0
         self.peak_equity = starting_balance
         self.max_drawdown = 0.0
         self.circuit_breaker_until = 0.0
@@ -3971,8 +4038,111 @@ class EnhancedGlobalState:
         self.last_news_refresh = 0.0
         self.last_correlation_refresh = 0.0
         self.trade_memory_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'recent_trades.json')
+        self.daily_trade_state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'daily_trade_state.json')
         self.recent_trade_levels: List[Dict[str, Any]] = self._load_recent_trade_levels()
+        self.spread_history = {s: deque(maxlen=max(20, config.EXECUTION_SPREAD_WINDOW)) for s in config.SYMBOLS}
+        self.entry_drift_history = {s: deque(maxlen=max(10, config.ENTRY_DRIFT_WINDOW)) for s in config.SYMBOLS}
+        self.reason_performance = deque(maxlen=max(50, config.REASON_BLOCK_LOOKBACK))
         self.lock = threading.RLock()
+        self._load_daily_trade_state()
+
+    def _load_daily_trade_state(self) -> None:
+        """Load persisted daily trade counter so restarts do not bypass MAX_DAILY_TRADES."""
+        try:
+            if not os.path.exists(self.daily_trade_state_file):
+                return
+            with open(self.daily_trade_state_file, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+            stored_date = state.get('date')
+            stored_count = int(state.get('count', 0))
+            if stored_date == date.today().isoformat() and stored_count >= 0:
+                self.daily_start_date = date.today()
+                self.daily_trades_count = stored_count
+                logger.logger.info(f"Restored daily trade count: {self.daily_trades_count}/{config.MAX_DAILY_TRADES}")
+        except Exception as e:
+            logger.log_error('_load_daily_trade_state', str(e), 'WARNING')
+
+    def _persist_daily_trade_state(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.daily_trade_state_file), exist_ok=True)
+            with open(self.daily_trade_state_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'date': self.daily_start_date.isoformat(),
+                    'count': int(self.daily_trades_count)
+                }, f, indent=2)
+        except Exception as e:
+            logger.log_error('_persist_daily_trade_state', str(e), 'WARNING')
+
+    def try_reserve_daily_trade_slot(self, symbol: str) -> bool:
+        """Atomically reserve one daily trade slot to enforce MAX_DAILY_TRADES across threads."""
+        with self.lock:
+            if date.today() != self.daily_start_date:
+                self.reset_daily_stats()
+            if self.daily_trades_count >= config.MAX_DAILY_TRADES:
+                logger.logger.warning(f"{nowstr()} {symbol}: daily trade cap reached ({self.daily_trades_count}/{config.MAX_DAILY_TRADES})")
+                return False
+            self.daily_trades_count += 1
+            self._persist_daily_trade_state()
+            return True
+
+    def release_daily_trade_slot(self) -> None:
+        """Rollback reserved slot if order placement fails."""
+        with self.lock:
+            self.daily_trades_count = max(0, self.daily_trades_count - 1)
+            self._persist_daily_trade_state()
+
+    def record_spread(self, symbol: str, spread_points: float) -> None:
+        with self.lock:
+            if symbol not in self.spread_history:
+                self.spread_history[symbol] = deque(maxlen=max(20, config.EXECUTION_SPREAD_WINDOW))
+            self.spread_history[symbol].append(float(spread_points))
+
+    def spread_ratio(self, symbol: str, spread_points: float) -> float:
+        with self.lock:
+            hist = self.spread_history.get(symbol)
+            if not hist:
+                return 1.0
+            baseline = float(np.nanmedian(list(hist))) if len(hist) else 0.0
+            if baseline <= 0:
+                return 1.0
+            return float(spread_points) / baseline
+
+    def record_entry_drift(self, symbol: str, drift_pips: float) -> None:
+        with self.lock:
+            if symbol not in self.entry_drift_history:
+                self.entry_drift_history[symbol] = deque(maxlen=max(10, config.ENTRY_DRIFT_WINDOW))
+            self.entry_drift_history[symbol].append(float(drift_pips))
+
+    def avg_entry_drift(self, symbol: str) -> float:
+        with self.lock:
+            hist = self.entry_drift_history.get(symbol)
+            if not hist:
+                return 0.0
+            return float(np.nanmean(list(hist))) if len(hist) else 0.0
+
+    def update_reason_performance(self, reason_key: str, profit: float) -> None:
+        if not reason_key:
+            return
+        with self.lock:
+            self.reason_performance.append({
+                'reason_key': reason_key,
+                'profit': float(profit),
+                'time': datetime.now().isoformat(),
+            })
+
+    def should_block_reason(self, reason_key: str) -> bool:
+        if not config.REASON_BLOCK_ENABLED or not reason_key:
+            return False
+        with self.lock:
+            records = [
+                r for r in list(self.reason_performance)[-config.REASON_BLOCK_LOOKBACK:]
+                if r.get('reason_key') == reason_key
+            ]
+            if len(records) < config.REASON_BLOCK_MIN_TRADES:
+                return False
+            wins = sum(1 for r in records if float(r.get('profit', 0.0)) > 0)
+            win_rate = wins / max(1, len(records))
+            return win_rate <= config.REASON_BLOCK_MAX_WIN_RATE
     
     def _load_recent_trade_levels(self) -> List[Dict[str, Any]]:
         try:
@@ -4118,17 +4288,44 @@ class EnhancedGlobalState:
         return stats
     
     def update_consecutive_losses(self, symbol: str, profit: float):
-        """Update per-symbol consecutive losses with timed cooldown."""
+        """Update per-symbol and daily consecutive losses with protection stops."""
         with self.lock:
             if profit < 0:
                 self.consecutive_losses_by_symbol[symbol] += 1
-                logger.logger.warning(f"{symbol}: Consecutive losses: {self.consecutive_losses_by_symbol[symbol]}")
+                self.daily_consecutive_losses += 1
+                logger.logger.warning(
+                    f"{symbol}: Consecutive losses: {self.consecutive_losses_by_symbol[symbol]} | "
+                    f"daily streak={self.daily_consecutive_losses}/{config.DAILY_CONSECUTIVE_LOSS_STOP}"
+                )
                 if self.consecutive_losses_by_symbol[symbol] >= config.CONSECUTIVE_LOSS_LIMIT:
                     cooldown = max(15, int(config.CONSECUTIVE_LOSS_COOLDOWN_MINUTES)) * 60
                     self.symbol_paused_until[symbol] = max(self.symbol_paused_until.get(symbol, 0.0), time.time() + cooldown)
+
+                if self.daily_consecutive_losses >= config.DAILY_CONSECUTIVE_LOSS_STOP:
+                    if config.DAILY_CONSECUTIVE_LOSS_HARD_STOP:
+                        self.daily_loss_triggered = True
+                        tomorrow = datetime.now().date() + timedelta(days=1)
+                        next_midnight = datetime.combine(tomorrow, dt_time(0, 0)).timestamp()
+                        self.circuit_breaker_until = max(self.circuit_breaker_until, next_midnight)
+                    else:
+                        self.circuit_breaker_until = max(
+                            self.circuit_breaker_until,
+                            time.time() + config.CIRCUIT_BREAKER_COOL_OFF_MINUTES * 60,
+                        )
+                    logger.logger.warning(
+                        f"Daily consecutive loss stop triggered: {self.daily_consecutive_losses}/"
+                        f"{config.DAILY_CONSECUTIVE_LOSS_STOP}"
+                    )
+                    logger.log_error(
+                        "update_consecutive_losses",
+                        f"Daily consecutive loss stop triggered at {self.daily_consecutive_losses}",
+                        "CRITICAL",
+                        symbol,
+                    )
             else:
                 self.consecutive_losses_by_symbol[symbol] = 0
                 self.symbol_paused_until[symbol] = 0.0
+                self.daily_consecutive_losses = 0
 
     def should_pause_symbol(self, symbol: str) -> bool:
         """Check whether symbol cooldown is active and auto-resume when elapsed."""
@@ -4220,7 +4417,19 @@ class EnhancedGlobalState:
                     current_balance = float(acct.balance)
                     daily_reference = max(1e-6, self.peak_equity if self.peak_equity > 0 else STARTING_BALANCE)
                     equity_drawdown_pct = ((current_equity - daily_reference) / daily_reference) * 100.0
+                    day_pnl_usd = current_balance - self.daily_start_balance
                     profit_pct = ((current_balance - STARTING_BALANCE) / max(1e-6, STARTING_BALANCE)) * 100.0
+
+                    if day_pnl_usd <= -abs(config.DAILY_MAX_LOSS_USD):
+                        self.daily_loss_triggered = True
+                        self.circuit_breaker_until = max(
+                            self.circuit_breaker_until,
+                            time.time() + config.CIRCUIT_BREAKER_COOL_OFF_MINUTES * 60,
+                        )
+                        logger.logger.warning(f"Daily USD loss limit triggered: ${day_pnl_usd:.2f}")
+                        logger.log_error("update_daily_stats", 
+                                       f"Daily USD loss ${day_pnl_usd:.2f} triggered",
+                                       "CRITICAL")
 
                     if equity_drawdown_pct <= -config.DAILY_LOSS_PCT:
                         self.daily_loss_triggered = bool(config.DAILY_LOSS_HARD_STOP)
@@ -4252,15 +4461,20 @@ class EnhancedGlobalState:
         with self.lock:
             self.daily_start_date = date.today()
             self.daily_trades_count = 0
+            self.daily_consecutive_losses = 0
             self.daily_loss_triggered = False
             self.circuit_breaker_until = 0.0
             try:
                 acct = get_account_info_safe()
                 if acct:
-                    self.peak_equity = float(acct.balance)
+                    bal = float(acct.balance)
+                    self.daily_start_balance = bal
+                    self.peak_equity = bal
             except:
+                self.daily_start_balance = STARTING_BALANCE
                 self.peak_equity = STARTING_BALANCE
             self.max_drawdown = 0.0
+            self._persist_daily_trade_state()
             logger.logger.info("Daily stats reset for new trading day")
 
 global_state = EnhancedGlobalState(STARTING_BALANCE)
@@ -4286,6 +4500,32 @@ def is_in_trading_session(session_name: str) -> bool:
     now_time = datetime.now().time()
     start = session['start']
     end = session['end']
+    if start <= end:
+        return start <= now_time <= end
+    return now_time >= start or now_time <= end
+
+def get_current_session_label() -> str:
+    now_time = datetime.now().time()
+    for name, session in config.TRADING_SESSIONS.items():
+        start = session.get('start')
+        end = session.get('end')
+        if start is None or end is None:
+            continue
+        if start <= end:
+            if start <= now_time <= end:
+                return name
+        else:
+            if now_time >= start or now_time <= end:
+                return name
+    return 'OFF_HOURS'
+
+def is_within_daily_trade_window() -> bool:
+    """Return True when new entries are allowed for configured trade window."""
+    if not config.ENFORCE_DAILY_TRADE_WINDOW:
+        return True
+    now_time = datetime.now().time()
+    start = config.TRADE_WINDOW_START
+    end = config.TRADE_WINDOW_END
     if start <= end:
         return start <= now_time <= end
     return now_time >= start or now_time <= end
@@ -5191,7 +5431,7 @@ def close_position_safe(symbol: str, reason: str = "timeout"):
         logger.log_error("close_position_safe", str(e), "ERROR", symbol)
         return None
 
-def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp_price: float, reason: str, confluence_score: int = 0, fvg_signal: bool = False):
+def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp_price: float, reason: str, confluence_score: int = 0, fvg_signal: bool = False, reason_key: str = ""):
     """Safe trade execution with comprehensive logging"""
     comment_base = f"{config.MODE}_{direction}_{reason}"
     comment = sanitize_comment(comment_base)
@@ -5214,7 +5454,7 @@ def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp
             paper_engine.update_price(symbol, float(tick.bid), float(tick.ask))
             res = paper_engine.open_position(symbol, direction, lot, price, sl_price, tp_price, comment)
             ticket = res.get("order", 0)
-            trade_tracker.add_trade(ticket, symbol, direction, price, sl_price, tp_price, confluence_score, fvg_signal, lot)
+            trade_tracker.add_trade(ticket, symbol, direction, price, sl_price, tp_price, confluence_score, fvg_signal, lot, reason_key)
             logger.log_trade({
                 'symbol': symbol,
                 'direction': direction.upper(),
@@ -5340,7 +5580,7 @@ def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp
         
         ticket = getattr(res, 'order', 0)
         if ticket > 0:
-            trade_tracker.add_trade(ticket, symbol, direction, price, sl_price, tp_price, confluence_score, fvg_signal, lot)
+            trade_tracker.add_trade(ticket, symbol, direction, price, sl_price, tp_price, confluence_score, fvg_signal, lot, reason_key)
         
         return res
         
@@ -5590,6 +5830,7 @@ def check_closed_trades_enhanced():
                                 "confluence_score": trade_info.get("confluence_score", 0)
                             })
                             global_state.trade_learning.analyze_trade_patterns()
+                            global_state.update_reason_performance(trade_info.get('reason_key', ''), profit)
                             
                             logger.logger.info(f"Trade {ticket} closed: ${profit:.2f} ({outcome})")
                             break
@@ -5845,6 +6086,15 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             
             if is_in_no_trade_zone():
                 logger.logger.debug(f"{nowstr()} {symbol}: inside no-trade zone; skipping")
+                manage_hybrid_trailing_enhanced(symbol)
+                check_closed_trades_enhanced()
+                time.sleep(30)
+                continue
+
+            if not is_within_daily_trade_window():
+                logger.logger.info(f"{nowstr()} {symbol}: outside configured trade window {config.TRADE_WINDOW_START}-{config.TRADE_WINDOW_END}; waiting")
+                manage_hybrid_trailing_enhanced(symbol)
+                check_closed_trades_enhanced()
                 time.sleep(30)
                 continue
 
@@ -5929,7 +6179,10 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             
             bar = df.iloc[-1]
             relax_mode = False
-            if config.AUTO_RELAX_FILTERS:
+            allow_relax = config.AUTO_RELAX_FILTERS and (
+                config.PAPER_TRADING_ENABLED or config.BACKTEST_MODE or config.RELAX_FILTERS_LIVE_TRADING
+            )
+            if allow_relax:
                 last_attempt = global_state.last_trade_attempt.get(symbol, 0)
                 if last_attempt and (time.time() - last_attempt) >= config.NO_TRADE_RELAX_MINUTES * 60:
                     relax_mode = True
@@ -6208,16 +6461,47 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     rr = (reward / risk) if risk > 0 else 0
                     logger.logger.info(f"{nowstr()} {symbol}: adjusted TP to satisfy minimum R:R -> {rr:.2f}")
 
+                current_spread = float(spread_points or 0.0)
+                global_state.record_spread(symbol, current_spread)
+                spread_ratio = global_state.spread_ratio(symbol, current_spread)
+
                 market_data = {
                     "volume_ratio": float(df['tick_volume'].iloc[-1]) / max(float(df['tick_volume'].iloc[-20:].mean()), 1.0) if 'tick_volume' in df.columns else 1.0,
                     "trend_strength": detect_market_condition_enhanced(df).get("trend_strength", 0.0),
-                    "spread_points": spread_points or 0.0,
-                    "avg_spread_points": spread_points or 0.0,
+                    "spread_points": current_spread,
+                    "avg_spread_points": current_spread / max(1e-6, spread_ratio),
+                    "spread_ratio": spread_ratio,
                     "last_signal_time": global_state.last_signal_time.get(symbol, 0),
                     "rr_ratio": rr
                 }
                 market_data.update(detect_order_flow_imbalance(df))
+                quality_score = global_state.trade_filter.compute_quality_score(
+                    market_data,
+                    confluence_score,
+                    min_rr,
+                    relax_mode,
+                )
+                session_label = get_current_session_label()
+                session_quality_min = float(config.SESSION_QUALITY_THRESHOLDS.get(session_label, config.MIN_ENTRY_QUALITY_SCORE))
+                reason_key = "|".join(sorted(set(chosen_reasons[:3]))) if chosen_reasons else "Signal"
+                avg_entry_drift = global_state.avg_entry_drift(symbol)
                 if not forced_trade:
+                    if spread_ratio > config.EXECUTION_MAX_SPREAD_RATIO:
+                        logger.logger.info(f"{nowstr()} {symbol}: execution filter blocked entry (spread_ratio={spread_ratio:.2f})")
+                        time.sleep(0.2)
+                        continue
+                    if config.QUALITY_SCORE_HARD_BLOCK and quality_score < session_quality_min:
+                        logger.logger.info(f"{nowstr()} {symbol}: quality gate blocked entry (score={quality_score:.1f}<{session_quality_min:.1f}, session={session_label})")
+                        time.sleep(0.2)
+                        continue
+                    if avg_entry_drift > config.MAX_AVG_ENTRY_DRIFT_PIPS:
+                        logger.logger.info(f"{nowstr()} {symbol}: entry-drift gate blocked entry (avg_drift={avg_entry_drift:.2f} pips)")
+                        time.sleep(0.2)
+                        continue
+                    if global_state.should_block_reason(reason_key):
+                        logger.logger.info(f"{nowstr()} {symbol}: reason blocker skipped low-edge setup '{reason_key}'")
+                        time.sleep(0.2)
+                        continue
                     if not global_state.trade_filter.filter_trade(
                         {"direction": chosen_dir},
                         market_data,
@@ -6254,7 +6538,8 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 
                 logger.logger.info(f"{nowstr()} {symbol} ATTEMPT {chosen_dir} lot={lot:.3f} "
                                  f"entry={entry_price:.5f} sl={sl_price:.5f} tp={tp_price:.5f} "
-                                 f"confluence={confluence_score}/5 reasons={chosen_reasons} potential_loss=${potential_loss_usd:.2f}")
+                                 f"confluence={confluence_score}/5 quality={quality_score:.1f} session={session_label} "
+                                 f"reason_key={reason_key} potential_loss=${potential_loss_usd:.2f}")
                 
                 short_reason = ""
                 if chosen_reasons:
@@ -6287,13 +6572,24 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     time.sleep(0.2)
                     continue
 
+                if not global_state.try_reserve_daily_trade_slot(symbol):
+                    time.sleep(0.2)
+                    continue
+
                 res = send_trade_safe(symbol, chosen_dir, lot, sl_price, tp_price, 
-                                    short_reason, confluence_score, fvg_signal_active)
+                                    short_reason, confluence_score, fvg_signal_active, reason_key)
                 
                 if res is None:
+                    global_state.release_daily_trade_slot()
                     logger.logger.warning(f"{nowstr()} {symbol}: trade attempt failed. mt5.last_error={mt5.last_error()}")
                     debug_mt5_error()
                 else:
+                    fill_price = getattr(res, 'price', None)
+                    if fill_price is not None:
+                        info = get_symbol_info_safe(symbol)
+                        pip_value = (info.point * 10.0) if info and getattr(info, 'point', 0) else 0.01
+                        drift_pips = abs(float(fill_price) - float(entry_price)) / max(1e-9, pip_value)
+                        global_state.record_entry_drift(symbol, drift_pips)
                     logger.logger.info(f"{nowstr()} {symbol}: TRADE EXECUTED ✅ direction={chosen_dir} confluence={confluence_score}/5")
                     
                     if fvg_signal_active and confluence_result.get('fvg_signals'):
@@ -6312,7 +6608,6 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     except Exception:
                         pass
                     
-                    global_state.daily_trades_count += 1
                     global_state.last_trade_time[symbol] = time.time()
                     global_state.record_trade_level(symbol, chosen_dir, entry_price)
             
@@ -6350,6 +6645,13 @@ def main_enhanced():
         logger.logger.info(f"  • Cooldown: {config.COOLDOWN} seconds")
         logger.logger.info(f"  • SL Multiplier: {config.SL_ATR_MULT}")
         logger.logger.info(f"  • Max loss per trade: ${config.MAX_LOSS_PER_TRADE}")
+        logger.logger.info(f"  • Daily loss pct stop: {config.DAILY_LOSS_PCT}%")
+        logger.logger.info(f"  • Daily loss USD stop: ${config.DAILY_MAX_LOSS_USD}")
+        logger.logger.info(f"  • Daily consecutive loss stop: {config.DAILY_CONSECUTIVE_LOSS_STOP}")
+        logger.logger.info(f"  • Max daily trades: {config.MAX_DAILY_TRADES}")
+        logger.logger.info(f"  • Min entry quality score: {config.MIN_ENTRY_QUALITY_SCORE}")
+        logger.logger.info(f"  • Max avg entry drift pips: {config.MAX_AVG_ENTRY_DRIFT_PIPS}")
+        logger.logger.info(f"  • Reason blocker: enabled={config.REASON_BLOCK_ENABLED} min_trades={config.REASON_BLOCK_MIN_TRADES} max_win_rate={config.REASON_BLOCK_MAX_WIN_RATE}")
         logger.logger.info(f"  • Consecutive loss limit: {config.CONSECUTIVE_LOSS_LIMIT}")
         logger.logger.info("=" * 80)
         logger.logger.info("STRATEGY CONFIGURATION:")
@@ -6392,12 +6694,12 @@ def main_enhanced():
         logger.logger.info("Supervisor thread started")
         thread_manager.register_thread("Supervisor", supervisor_thread)
         
-        threads = []
+        trader_threads: Dict[str, threading.Thread] = {}
         for symbol in config.SYMBOLS:
             t = threading.Thread(target=trade_symbol_enhanced, args=(symbol, thread_manager.stop_event), 
                                name=f"Trader_{symbol}", daemon=True)
             t.start()
-            threads.append(t)
+            trader_threads[symbol] = t
             time.sleep(0.5)
             logger.logger.info(f"Trading thread started for {symbol}")
             thread_manager.register_thread(t.name, t, symbol)
@@ -6420,6 +6722,20 @@ def main_enhanced():
                 if active_threads < len(config.SYMBOLS) + 2:
                     logger.logger.warning(f"Thread count low: {active_threads}")
                     thread_manager.cleanup_stale_threads(timeout=300)
+
+                for symbol in config.SYMBOLS:
+                    worker = trader_threads.get(symbol)
+                    if worker is None or not worker.is_alive():
+                        logger.logger.warning(f"Respawning trader thread for {symbol}")
+                        new_worker = threading.Thread(
+                            target=trade_symbol_enhanced,
+                            args=(symbol, thread_manager.stop_event),
+                            name=f"Trader_{symbol}",
+                            daemon=True,
+                        )
+                        new_worker.start()
+                        trader_threads[symbol] = new_worker
+                        thread_manager.register_thread(new_worker.name, new_worker, symbol)
                 
                 time.sleep(10)
                 
