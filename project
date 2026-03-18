@@ -832,8 +832,10 @@ class BotConfig:
     COOLDOWN: int = 1800
     FORCE_TRADE_EVERY: int = 900
     FORCE_TRADE_ENABLED: bool = True
-    FORCE_TRADE_MIN_TREND_STRENGTH: float = 0.45
-    FORCE_TRADE_ALLOWED_SESSIONS: Tuple[str, ...] = ('LONDON', 'NEW_YORK', 'ALL_DAY')
+    FORCE_TRADE_MIN_TREND_STRENGTH: float = 0.25
+    FORCE_TRADE_ALLOWED_SESSIONS: Tuple[str, ...] = ('ALL_DAY', 'LONDON', 'NEW_YORK', 'ASIA', 'OFF_HOURS')
+    FORCE_TRADE_REQUIRE_MTF_ALIGNMENT: bool = False
+    FORCE_TRADE_STARTUP_DELAY_SECONDS: int = 60
 
     # ==== Indicator Settings ====
     EMA_FAST: int = 12
@@ -1168,6 +1170,8 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("MIN_CONFLUENCE_SCORE must be at least 1.")
     if not (0 <= bot_config.FORCE_TRADE_MIN_TREND_STRENGTH <= 1):
         errors.append("FORCE_TRADE_MIN_TREND_STRENGTH must be between 0 and 1.")
+    if bot_config.FORCE_TRADE_STARTUP_DELAY_SECONDS < 0:
+        errors.append("FORCE_TRADE_STARTUP_DELAY_SECONDS cannot be negative.")
     if not (0 <= bot_config.DAILY_LOSS_PCT <= 100):
         errors.append("DAILY_LOSS_PCT must be between 0 and 100.")
     if bot_config.DAILY_MAX_LOSS_USD <= 0:
@@ -6579,8 +6583,13 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     liquidity_signal_active = True
             
             # SMART FORCE TRADE LOGIC
-            if (config.FORCE_TRADE_ENABLED and chosen_dir is None and 
-                time.time() - global_state.last_forced_time.get(symbol, 0) >= config.FORCE_TRADE_EVERY):
+            startup_force_ready = (
+                global_state.last_trade_time.get(symbol, 0) == 0 and
+                (time.time() - global_state.start_time) >= config.FORCE_TRADE_STARTUP_DELAY_SECONDS
+            )
+            periodic_force_ready = time.time() - global_state.last_forced_time.get(symbol, 0) >= config.FORCE_TRADE_EVERY
+            if (config.FORCE_TRADE_ENABLED and (chosen_dir is None or confluence_score < config.MIN_CONFLUENCE_SCORE) and
+                (startup_force_ready or periodic_force_ready)):
 
                 current_session = get_current_session_label()
                 allowed_sessions = {s.upper() for s in config.FORCE_TRADE_ALLOWED_SESSIONS}
@@ -6590,11 +6599,12 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 force_candidate = None
 
                 session_ok = (not config.USE_SESSION_FILTERS) or (current_session.upper() in allowed_sessions)
-                if session_ok and trend_strength_now >= config.FORCE_TRADE_MIN_TREND_STRENGTH:
-                    if pd.notna(ema_fast) and pd.notna(ema_slow):
-                        if ema_fast > ema_slow and get_mtf_alignment(df_h1, df_h4, 'buy'):
+                if session_ok and trend_strength_now >= config.FORCE_TRADE_MIN_TREND_STRENGTH and pd.notna(ema_fast) and pd.notna(ema_slow):
+                    if ema_fast > ema_slow:
+                        if (not config.FORCE_TRADE_REQUIRE_MTF_ALIGNMENT) or get_mtf_alignment(df_h1, df_h4, 'buy'):
                             force_candidate = 'buy'
-                        elif ema_fast < ema_slow and get_mtf_alignment(df_h1, df_h4, 'sell'):
+                    elif ema_fast < ema_slow:
+                        if (not config.FORCE_TRADE_REQUIRE_MTF_ALIGNMENT) or get_mtf_alignment(df_h1, df_h4, 'sell'):
                             force_candidate = 'sell'
 
                 if force_candidate:
@@ -6604,7 +6614,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     global_state.last_forced_time[symbol] = time.time()
                     global_state.last_signal_time[symbol] = coerce_timestamp(bar['time'])
                     global_state.last_signal_dir[symbol] = chosen_dir
-                    logger.logger.info(f"{nowstr()} {symbol}: SMART FORCE TRADE -> {chosen_dir} session={current_session} trend_strength={trend_strength_now:.2f}")
+                    logger.logger.info(f"{nowstr()} {symbol}: SMART FORCE TRADE -> {chosen_dir} session={current_session} trend_strength={trend_strength_now:.2f} startup={startup_force_ready}")
                     forced_trade = True
             
             if chosen_dir:
@@ -6964,7 +6974,7 @@ def main_enhanced():
         logger.logger.info("SAFETY CONFIGURATION:")
         logger.logger.info(f"  • Lot size: {config.LOT_FIXED}")
         logger.logger.info(f"  • Cooldown: {config.COOLDOWN} seconds")
-        logger.logger.info(f"  • Force trade enabled: {config.FORCE_TRADE_ENABLED} every {config.FORCE_TRADE_EVERY}s min_trend={config.FORCE_TRADE_MIN_TREND_STRENGTH}")
+        logger.logger.info(f"  • Force trade enabled: {config.FORCE_TRADE_ENABLED} every {config.FORCE_TRADE_EVERY}s min_trend={config.FORCE_TRADE_MIN_TREND_STRENGTH} startup_delay={config.FORCE_TRADE_STARTUP_DELAY_SECONDS}s mtf_required={config.FORCE_TRADE_REQUIRE_MTF_ALIGNMENT}")
         logger.logger.info(f"  • SL Multiplier: {config.SL_ATR_MULT}")
         logger.logger.info(f"  • Max loss per trade: ${config.MAX_LOSS_PER_TRADE}")
         logger.logger.info(f"  • Daily loss pct stop: {config.DAILY_LOSS_PCT}%")
