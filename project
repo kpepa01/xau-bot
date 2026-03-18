@@ -968,6 +968,12 @@ class BotConfig:
         'ASIA': 76.0,
         'OFF_HOURS': 80.0,
     })
+    ADAPTIVE_MODE_ENABLED: bool = True
+    ADAPTIVE_LOOKBACK_TRADES: int = 8
+    ATTACK_MODE_MIN_WIN_RATE: float = 0.62
+    DEFENSIVE_MODE_MAX_WIN_RATE: float = 0.45
+    ADAPTIVE_QUALITY_DELTA: float = 6.0
+    ADAPTIVE_DAILY_TRADE_DELTA: int = 6
     MAX_TRADE_DURATION_MINUTES: int = 240
 
     # ==== Paper Trading & Backtesting ====
@@ -1173,6 +1179,14 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("REASON_BLOCK_MIN_TRADES must be at least 1.")
     if not (0 <= bot_config.REASON_BLOCK_MAX_WIN_RATE <= 1):
         errors.append("REASON_BLOCK_MAX_WIN_RATE must be between 0 and 1.")
+    if bot_config.ADAPTIVE_LOOKBACK_TRADES < 1:
+        errors.append("ADAPTIVE_LOOKBACK_TRADES must be at least 1.")
+    if not (0 <= bot_config.ATTACK_MODE_MIN_WIN_RATE <= 1):
+        errors.append("ATTACK_MODE_MIN_WIN_RATE must be between 0 and 1.")
+    if not (0 <= bot_config.DEFENSIVE_MODE_MAX_WIN_RATE <= 1):
+        errors.append("DEFENSIVE_MODE_MAX_WIN_RATE must be between 0 and 1.")
+    if bot_config.ADAPTIVE_DAILY_TRADE_DELTA < 0:
+        errors.append("ADAPTIVE_DAILY_TRADE_DELTA cannot be negative.")
     if bot_config.MIN_RR_RATIO <= 0:
         errors.append("MIN_RR_RATIO must be greater than 0.")
     if bot_config.RELAX_MIN_RR_RATIO <= 0:
@@ -4036,6 +4050,7 @@ class EnhancedGlobalState:
         self.adaptive_trading = AdaptiveTrading()
         self.trade_learning = TradeLearningSystem()
         self.recent_performance = deque(maxlen=20)
+        self.current_operating_mode = "normal"
         self.correlation_data: Dict[str, Dict[str, float]] = {}
         self.news_events: List[Dict[str, Any]] = []
         self.last_news_refresh = 0.0
@@ -4076,13 +4091,14 @@ class EnhancedGlobalState:
         except Exception as e:
             logger.log_error('_persist_daily_trade_state', str(e), 'WARNING')
 
-    def try_reserve_daily_trade_slot(self, symbol: str) -> bool:
-        """Atomically reserve one daily trade slot to enforce MAX_DAILY_TRADES across threads."""
+    def try_reserve_daily_trade_slot(self, symbol: str, max_daily_trades: Optional[int] = None) -> bool:
+        """Atomically reserve one daily trade slot to enforce current daily trade cap across threads."""
         with self.lock:
             if date.today() != self.daily_start_date:
                 self.reset_daily_stats()
-            if self.daily_trades_count >= config.MAX_DAILY_TRADES:
-                logger.logger.warning(f"{nowstr()} {symbol}: daily trade cap reached ({self.daily_trades_count}/{config.MAX_DAILY_TRADES})")
+            cap = int(max_daily_trades if max_daily_trades is not None else config.MAX_DAILY_TRADES)
+            if self.daily_trades_count >= cap:
+                logger.logger.warning(f"{nowstr()} {symbol}: daily trade cap reached ({self.daily_trades_count}/{cap})")
                 return False
             self.daily_trades_count += 1
             self._persist_daily_trade_state()
@@ -4151,6 +4167,43 @@ class EnhancedGlobalState:
             wins = sum(1 for r in records if float(r.get('profit', 0.0)) > 0)
             win_rate = wins / max(1, len(records))
             return win_rate <= config.REASON_BLOCK_MAX_WIN_RATE
+
+    def refresh_operating_mode(self) -> str:
+        """Adaptive mode: attack in strong streaks, defensive in weak streaks."""
+        if not config.ADAPTIVE_MODE_ENABLED:
+            self.current_operating_mode = "normal"
+            return self.current_operating_mode
+        with self.lock:
+            recent = list(self.recent_performance)[-config.ADAPTIVE_LOOKBACK_TRADES:]
+            if len(recent) < max(3, min(config.ADAPTIVE_LOOKBACK_TRADES, 5)):
+                self.current_operating_mode = "normal"
+                return self.current_operating_mode
+            wins = sum(1 for p in recent if p > 0)
+            win_rate = wins / max(1, len(recent))
+            pnl = float(sum(recent))
+            if win_rate >= config.ATTACK_MODE_MIN_WIN_RATE and pnl > 0:
+                self.current_operating_mode = "attack"
+            elif win_rate <= config.DEFENSIVE_MODE_MAX_WIN_RATE or pnl < 0:
+                self.current_operating_mode = "defensive"
+            else:
+                self.current_operating_mode = "normal"
+            return self.current_operating_mode
+
+    def get_adaptive_trade_controls(self) -> Dict[str, Any]:
+        mode = self.refresh_operating_mode()
+        quality_delta = 0.0
+        trade_cap = config.MAX_DAILY_TRADES
+        if mode == "attack":
+            quality_delta = -config.ADAPTIVE_QUALITY_DELTA
+            trade_cap = config.MAX_DAILY_TRADES + config.ADAPTIVE_DAILY_TRADE_DELTA
+        elif mode == "defensive":
+            quality_delta = config.ADAPTIVE_QUALITY_DELTA
+            trade_cap = max(6, config.MAX_DAILY_TRADES - config.ADAPTIVE_DAILY_TRADE_DELTA)
+        return {
+            "mode": mode,
+            "quality_delta": quality_delta,
+            "daily_trade_cap": trade_cap,
+        }
     
     def _load_recent_trade_levels(self) -> List[Dict[str, Any]]:
         try:
@@ -5830,6 +5883,7 @@ def check_closed_trades_enhanced():
                             if performance_tracker:
                                 performance_tracker.record_trade(profit)
                             global_state.recent_performance.append(profit)
+                            global_state.refresh_operating_mode()
                             global_state.trade_learning.add_trade({
                                 "symbol": symbol,
                                 "profit": profit,
@@ -6120,8 +6174,12 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 time.sleep(30)
                 continue
             
-            if global_state.daily_trades_count >= config.MAX_DAILY_TRADES:
-                logger.logger.warning(f"{nowstr()} {symbol}: reached MAX_DAILY_TRADES")
+            adaptive_controls = global_state.get_adaptive_trade_controls()
+            adaptive_mode = adaptive_controls['mode']
+            adaptive_daily_cap = int(adaptive_controls['daily_trade_cap'])
+
+            if global_state.daily_trades_count >= adaptive_daily_cap:
+                logger.logger.warning(f"{nowstr()} {symbol}: reached adaptive daily trade cap {adaptive_daily_cap} (mode={adaptive_mode})")
                 time.sleep(60)
                 continue
             
@@ -6222,7 +6280,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             logger.logger.info(f"{nowstr()} {symbol} | Price={bar['close']:.2f} | "
                              f"EMAfast={ema_fast_val:.3f} | EMAslow={ema_slow_val:.3f} | "
                              f"RSI={rsi_val:.2f} | ATR={atr_val:.4f} | "
-                             f"Regime={market_regime} | Confluence={confluence_result['confluence_score']}/5")
+                             f"Regime={market_regime} | Confluence={confluence_result['confluence_score']}/5 | Mode={adaptive_mode}")
             
             if last_bar_time is not None and bar['time'] == last_bar_time:
                 manage_hybrid_trailing_enhanced(symbol)
@@ -6490,7 +6548,8 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     relax_mode,
                 )
                 session_label = get_current_session_label()
-                session_quality_min = float(config.SESSION_QUALITY_THRESHOLDS.get(session_label, config.MIN_ENTRY_QUALITY_SCORE))
+                base_session_quality = float(config.SESSION_QUALITY_THRESHOLDS.get(session_label, config.MIN_ENTRY_QUALITY_SCORE))
+                session_quality_min = max(55.0, min(95.0, base_session_quality + float(adaptive_controls.get('quality_delta', 0.0))))
                 reason_key = "|".join(sorted(set(chosen_reasons[:3]))) if chosen_reasons else "Signal"
                 avg_entry_drift = global_state.avg_entry_drift(symbol)
                 drift_samples = global_state.entry_drift_samples(symbol)
@@ -6547,8 +6606,8 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 
                 logger.logger.info(f"{nowstr()} {symbol} ATTEMPT {chosen_dir} lot={lot:.3f} "
                                  f"entry={entry_price:.5f} sl={sl_price:.5f} tp={tp_price:.5f} "
-                                 f"confluence={confluence_score}/5 quality={quality_score:.1f} session={session_label} "
-                                 f"reason_key={reason_key} potential_loss=${potential_loss_usd:.2f}")
+                                 f"confluence={confluence_score}/5 quality={quality_score:.1f} session={session_label} mode={adaptive_mode} "
+                                 f"reason_key={reason_key} daily_cap={adaptive_daily_cap} potential_loss=${potential_loss_usd:.2f}")
                 
                 short_reason = ""
                 if chosen_reasons:
@@ -6581,7 +6640,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     time.sleep(0.2)
                     continue
 
-                if not global_state.try_reserve_daily_trade_slot(symbol):
+                if not global_state.try_reserve_daily_trade_slot(symbol, adaptive_daily_cap):
                     time.sleep(0.2)
                     continue
 
@@ -6663,6 +6722,7 @@ def main_enhanced():
         logger.logger.info(f"  • Min entry drift samples: {config.MIN_ENTRY_DRIFT_SAMPLES}")
         logger.logger.info(f"  • Session quality thresholds: {config.SESSION_QUALITY_THRESHOLDS}")
         logger.logger.info(f"  • Reason blocker: enabled={config.REASON_BLOCK_ENABLED} min_trades={config.REASON_BLOCK_MIN_TRADES} max_win_rate={config.REASON_BLOCK_MAX_WIN_RATE}")
+        logger.logger.info(f"  • Adaptive mode: enabled={config.ADAPTIVE_MODE_ENABLED} lookback={config.ADAPTIVE_LOOKBACK_TRADES} attack_win_rate={config.ATTACK_MODE_MIN_WIN_RATE} defensive_win_rate={config.DEFENSIVE_MODE_MAX_WIN_RATE}")
         logger.logger.info(f"  • Consecutive loss limit: {config.CONSECUTIVE_LOSS_LIMIT}")
         logger.logger.info("=" * 80)
         logger.logger.info("STRATEGY CONFIGURATION:")
