@@ -964,11 +964,13 @@ class BotConfig:
     REASON_BLOCK_MIN_TRADES: int = 8
     REASON_BLOCK_MAX_WIN_RATE: float = 0.35
     REASON_BLOCK_LOOKBACK: int = 200
+    USE_SESSION_FILTERS: bool = False
     SESSION_QUALITY_THRESHOLDS: Dict[str, float] = field(default_factory=lambda: {
+        'ALL_DAY': 72.0,
         'LONDON': 72.0,
         'NEW_YORK': 72.0,
-        'ASIA': 76.0,
-        'OFF_HOURS': 80.0,
+        'ASIA': 72.0,
+        'OFF_HOURS': 72.0,
     })
     ADAPTIVE_MODE_ENABLED: bool = True
     ADAPTIVE_LOOKBACK_TRADES: int = 8
@@ -4793,6 +4795,8 @@ def is_in_no_trade_zone() -> bool:
         return t >= config.NO_TRADE_START or t <= config.NO_TRADE_END
 
 def is_in_trading_session(session_name: str) -> bool:
+    if not config.USE_SESSION_FILTERS:
+        return True
     if not session_name or session_name.upper() in {"ALL", "ALL_DAY", "ANY"}:
         return True
     session = config.TRADING_SESSIONS.get(session_name)
@@ -4806,6 +4810,8 @@ def is_in_trading_session(session_name: str) -> bool:
     return now_time >= start or now_time <= end
 
 def get_current_session_label() -> str:
+    if not config.USE_SESSION_FILTERS:
+        return 'ALL_DAY'
     now_time = datetime.now().time()
     for name, session in config.TRADING_SESSIONS.items():
         start = session.get('start')
@@ -6583,7 +6589,8 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 ema_slow = bar.get('ema_slow')
                 force_candidate = None
 
-                if current_session.upper() in allowed_sessions and trend_strength_now >= config.FORCE_TRADE_MIN_TREND_STRENGTH:
+                session_ok = (not config.USE_SESSION_FILTERS) or (current_session.upper() in allowed_sessions)
+                if session_ok and trend_strength_now >= config.FORCE_TRADE_MIN_TREND_STRENGTH:
                     if pd.notna(ema_fast) and pd.notna(ema_slow):
                         if ema_fast > ema_slow and get_mtf_alignment(df_h1, df_h4, 'buy'):
                             force_candidate = 'buy'
@@ -6967,6 +6974,7 @@ def main_enhanced():
         logger.logger.info(f"  • Min entry quality score: {config.MIN_ENTRY_QUALITY_SCORE}")
         logger.logger.info(f"  • Max avg entry drift pips: {config.MAX_AVG_ENTRY_DRIFT_PIPS}")
         logger.logger.info(f"  • Min entry drift samples: {config.MIN_ENTRY_DRIFT_SAMPLES}")
+        logger.logger.info(f"  • Session filters enabled: {config.USE_SESSION_FILTERS}")
         logger.logger.info(f"  • Session quality thresholds: {config.SESSION_QUALITY_THRESHOLDS}")
         logger.logger.info(f"  • Reason blocker: enabled={config.REASON_BLOCK_ENABLED} min_trades={config.REASON_BLOCK_MIN_TRADES} max_win_rate={config.REASON_BLOCK_MAX_WIN_RATE}")
         logger.logger.info(f"  • Adaptive mode: enabled={config.ADAPTIVE_MODE_ENABLED} lookback={config.ADAPTIVE_LOOKBACK_TRADES} attack_win_rate={config.ATTACK_MODE_MIN_WIN_RATE} defensive_win_rate={config.DEFENSIVE_MODE_MAX_WIN_RATE}")
