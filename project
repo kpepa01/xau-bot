@@ -974,6 +974,9 @@ class BotConfig:
     DEFENSIVE_MODE_MAX_WIN_RATE: float = 0.45
     ADAPTIVE_QUALITY_DELTA: float = 6.0
     ADAPTIVE_DAILY_TRADE_DELTA: int = 6
+    EXPECTANCY_ENGINE_ENABLED: bool = True
+    EXPECTANCY_MIN_SAMPLES: int = 6
+    EXPECTANCY_QUALITY_DELTA: float = 4.0
     MAX_TRADE_DURATION_MINUTES: int = 240
 
     # ==== Paper Trading & Backtesting ====
@@ -1187,6 +1190,10 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("DEFENSIVE_MODE_MAX_WIN_RATE must be between 0 and 1.")
     if bot_config.ADAPTIVE_DAILY_TRADE_DELTA < 0:
         errors.append("ADAPTIVE_DAILY_TRADE_DELTA cannot be negative.")
+    if bot_config.EXPECTANCY_MIN_SAMPLES < 1:
+        errors.append("EXPECTANCY_MIN_SAMPLES must be at least 1.")
+    if bot_config.EXPECTANCY_QUALITY_DELTA < 0:
+        errors.append("EXPECTANCY_QUALITY_DELTA cannot be negative.")
     if bot_config.MIN_RR_RATIO <= 0:
         errors.append("MIN_RR_RATIO must be greater than 0.")
     if bot_config.RELAX_MIN_RR_RATIO <= 0:
@@ -4061,6 +4068,13 @@ class EnhancedGlobalState:
         self.spread_history = {s: deque(maxlen=max(20, config.EXECUTION_SPREAD_WINDOW)) for s in config.SYMBOLS}
         self.entry_drift_history = {s: deque(maxlen=max(10, config.ENTRY_DRIFT_WINDOW)) for s in config.SYMBOLS}
         self.reason_performance = deque(maxlen=max(50, config.REASON_BLOCK_LOOKBACK))
+        self.expectancy_stats = defaultdict(lambda: {
+            'trades': 0,
+            'wins': 0,
+            'losses': 0,
+            'gross_profit': 0.0,
+            'gross_loss': 0.0,
+        })
         self.lock = threading.RLock()
         self._load_daily_trade_state()
 
@@ -4204,6 +4218,74 @@ class EnhancedGlobalState:
             "quality_delta": quality_delta,
             "daily_trade_cap": trade_cap,
         }
+
+    def _bucket_key(self, bucket_type: str, bucket_value: str) -> str:
+        return f"{bucket_type}:{bucket_value}"
+
+    def update_expectancy_stats(self, symbol: str, session_label: str, market_regime: str,
+                                reason_key: str, profit: float) -> None:
+        if not config.EXPECTANCY_ENGINE_ENABLED:
+            return
+        bucket_pairs = [
+            ('symbol', symbol or 'unknown'),
+            ('session', session_label or 'unknown'),
+            ('regime', market_regime or 'unknown'),
+            ('setup', reason_key or 'Signal'),
+        ]
+        with self.lock:
+            for bucket_type, bucket_value in bucket_pairs:
+                stats = self.expectancy_stats[self._bucket_key(bucket_type, bucket_value)]
+                stats['trades'] += 1
+                if profit > 0:
+                    stats['wins'] += 1
+                    stats['gross_profit'] += float(profit)
+                else:
+                    stats['losses'] += 1
+                    stats['gross_loss'] += abs(float(profit))
+
+    def get_expectancy_snapshot(self, bucket_type: str, bucket_value: str) -> Dict[str, float]:
+        key = self._bucket_key(bucket_type, bucket_value)
+        with self.lock:
+            stats = dict(self.expectancy_stats.get(key, {}))
+        trades = int(stats.get('trades', 0))
+        wins = int(stats.get('wins', 0))
+        losses = int(stats.get('losses', 0))
+        gross_profit = float(stats.get('gross_profit', 0.0))
+        gross_loss = float(stats.get('gross_loss', 0.0))
+        avg_win = (gross_profit / wins) if wins > 0 else 0.0
+        avg_loss = (gross_loss / losses) if losses > 0 else 0.0
+        win_rate = (wins / trades) if trades > 0 else 0.0
+        expectancy = ((win_rate * avg_win) - ((1.0 - win_rate) * avg_loss)) if trades > 0 else 0.0
+        return {
+            'trades': trades,
+            'wins': wins,
+            'losses': losses,
+            'win_rate': win_rate,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'expectancy': expectancy,
+        }
+
+    def get_expectancy_quality_delta(self, symbol: str, session_label: str,
+                                     market_regime: str, reason_key: str) -> float:
+        if not config.EXPECTANCY_ENGINE_ENABLED:
+            return 0.0
+        buckets = [
+            ('setup', reason_key or 'Signal', 0.40),
+            ('symbol', symbol or 'unknown', 0.25),
+            ('session', session_label or 'unknown', 0.20),
+            ('regime', market_regime or 'unknown', 0.15),
+        ]
+        total_delta = 0.0
+        for bucket_type, bucket_value, weight in buckets:
+            snapshot = self.get_expectancy_snapshot(bucket_type, bucket_value)
+            if snapshot['trades'] < config.EXPECTANCY_MIN_SAMPLES:
+                continue
+            if snapshot['expectancy'] > 0:
+                total_delta -= config.EXPECTANCY_QUALITY_DELTA * weight
+            elif snapshot['expectancy'] < 0:
+                total_delta += config.EXPECTANCY_QUALITY_DELTA * weight
+        return total_delta
     
     def _load_recent_trade_levels(self) -> List[Dict[str, Any]]:
         try:
@@ -5892,7 +5974,11 @@ def check_closed_trades_enhanced():
                                 "confluence_score": trade_info.get("confluence_score", 0)
                             })
                             global_state.trade_learning.analyze_trade_patterns()
-                            global_state.update_reason_performance(trade_info.get('reason_key', ''), profit)
+                            session_label = get_current_session_label()
+                            reason_key = trade_info.get('reason_key', '')
+                            regime = global_state.market_regimes.get(symbol, 'unknown')
+                            global_state.update_reason_performance(reason_key, profit)
+                            global_state.update_expectancy_stats(symbol, session_label, regime, reason_key, profit)
                             
                             logger.logger.info(f"Trade {ticket} closed: ${profit:.2f} ({outcome})")
                             break
@@ -6548,9 +6634,10 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     relax_mode,
                 )
                 session_label = get_current_session_label()
-                base_session_quality = float(config.SESSION_QUALITY_THRESHOLDS.get(session_label, config.MIN_ENTRY_QUALITY_SCORE))
-                session_quality_min = max(55.0, min(95.0, base_session_quality + float(adaptive_controls.get('quality_delta', 0.0))))
                 reason_key = "|".join(sorted(set(chosen_reasons[:3]))) if chosen_reasons else "Signal"
+                base_session_quality = float(config.SESSION_QUALITY_THRESHOLDS.get(session_label, config.MIN_ENTRY_QUALITY_SCORE))
+                expectancy_quality_delta = global_state.get_expectancy_quality_delta(symbol, session_label, market_regime, reason_key)
+                session_quality_min = max(55.0, min(95.0, base_session_quality + float(adaptive_controls.get('quality_delta', 0.0)) + expectancy_quality_delta))
                 avg_entry_drift = global_state.avg_entry_drift(symbol)
                 drift_samples = global_state.entry_drift_samples(symbol)
                 if not forced_trade:
@@ -6607,7 +6694,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 logger.logger.info(f"{nowstr()} {symbol} ATTEMPT {chosen_dir} lot={lot:.3f} "
                                  f"entry={entry_price:.5f} sl={sl_price:.5f} tp={tp_price:.5f} "
                                  f"confluence={confluence_score}/5 quality={quality_score:.1f} session={session_label} mode={adaptive_mode} "
-                                 f"reason_key={reason_key} daily_cap={adaptive_daily_cap} potential_loss=${potential_loss_usd:.2f}")
+                                 f"reason_key={reason_key} expectancy_delta={expectancy_quality_delta:.2f} daily_cap={adaptive_daily_cap} potential_loss=${potential_loss_usd:.2f}")
                 
                 short_reason = ""
                 if chosen_reasons:
@@ -6723,6 +6810,7 @@ def main_enhanced():
         logger.logger.info(f"  • Session quality thresholds: {config.SESSION_QUALITY_THRESHOLDS}")
         logger.logger.info(f"  • Reason blocker: enabled={config.REASON_BLOCK_ENABLED} min_trades={config.REASON_BLOCK_MIN_TRADES} max_win_rate={config.REASON_BLOCK_MAX_WIN_RATE}")
         logger.logger.info(f"  • Adaptive mode: enabled={config.ADAPTIVE_MODE_ENABLED} lookback={config.ADAPTIVE_LOOKBACK_TRADES} attack_win_rate={config.ATTACK_MODE_MIN_WIN_RATE} defensive_win_rate={config.DEFENSIVE_MODE_MAX_WIN_RATE}")
+        logger.logger.info(f"  • Expectancy engine: enabled={config.EXPECTANCY_ENGINE_ENABLED} min_samples={config.EXPECTANCY_MIN_SAMPLES} quality_delta={config.EXPECTANCY_QUALITY_DELTA}")
         logger.logger.info(f"  • Consecutive loss limit: {config.CONSECUTIVE_LOSS_LIMIT}")
         logger.logger.info("=" * 80)
         logger.logger.info("STRATEGY CONFIGURATION:")
