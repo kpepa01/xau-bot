@@ -951,21 +951,22 @@ class BotConfig:
     # ==== Trade Quality Filters ====
     MAX_SPREAD_POINTS: float = 30.0
     MIN_RISK_REWARD: float = 1.5
-    MIN_ENTRY_QUALITY_SCORE: float = 80.0
+    MIN_ENTRY_QUALITY_SCORE: float = 72.0
     QUALITY_SCORE_HARD_BLOCK: bool = True
     EXECUTION_SPREAD_WINDOW: int = 50
-    EXECUTION_MAX_SPREAD_RATIO: float = 1.4
+    EXECUTION_MAX_SPREAD_RATIO: float = 1.6
     ENTRY_DRIFT_WINDOW: int = 30
+    MIN_ENTRY_DRIFT_SAMPLES: int = 5
     MAX_AVG_ENTRY_DRIFT_PIPS: float = 2.5
     REASON_BLOCK_ENABLED: bool = True
     REASON_BLOCK_MIN_TRADES: int = 8
     REASON_BLOCK_MAX_WIN_RATE: float = 0.35
     REASON_BLOCK_LOOKBACK: int = 200
     SESSION_QUALITY_THRESHOLDS: Dict[str, float] = field(default_factory=lambda: {
-        'LONDON': 80.0,
-        'NEW_YORK': 80.0,
-        'ASIA': 86.0,
-        'OFF_HOURS': 90.0,
+        'LONDON': 72.0,
+        'NEW_YORK': 72.0,
+        'ASIA': 76.0,
+        'OFF_HOURS': 80.0,
     })
     MAX_TRADE_DURATION_MINUTES: int = 240
 
@@ -1166,6 +1167,8 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("EXECUTION_MAX_SPREAD_RATIO must be greater than 0.")
     if bot_config.MAX_AVG_ENTRY_DRIFT_PIPS <= 0:
         errors.append("MAX_AVG_ENTRY_DRIFT_PIPS must be greater than 0.")
+    if bot_config.MIN_ENTRY_DRIFT_SAMPLES < 1:
+        errors.append("MIN_ENTRY_DRIFT_SAMPLES must be at least 1.")
     if bot_config.REASON_BLOCK_MIN_TRADES < 1:
         errors.append("REASON_BLOCK_MIN_TRADES must be at least 1.")
     if not (0 <= bot_config.REASON_BLOCK_MAX_WIN_RATE <= 1):
@@ -4120,6 +4123,11 @@ class EnhancedGlobalState:
                 return 0.0
             return float(np.nanmean(list(hist))) if len(hist) else 0.0
 
+    def entry_drift_samples(self, symbol: str) -> int:
+        with self.lock:
+            hist = self.entry_drift_history.get(symbol)
+            return len(hist) if hist else 0
+
     def update_reason_performance(self, reason_key: str, profit: float) -> None:
         if not reason_key:
             return
@@ -6485,6 +6493,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 session_quality_min = float(config.SESSION_QUALITY_THRESHOLDS.get(session_label, config.MIN_ENTRY_QUALITY_SCORE))
                 reason_key = "|".join(sorted(set(chosen_reasons[:3]))) if chosen_reasons else "Signal"
                 avg_entry_drift = global_state.avg_entry_drift(symbol)
+                drift_samples = global_state.entry_drift_samples(symbol)
                 if not forced_trade:
                     if spread_ratio > config.EXECUTION_MAX_SPREAD_RATIO:
                         logger.logger.info(f"{nowstr()} {symbol}: execution filter blocked entry (spread_ratio={spread_ratio:.2f})")
@@ -6494,11 +6503,11 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                         logger.logger.info(f"{nowstr()} {symbol}: quality gate blocked entry (score={quality_score:.1f}<{session_quality_min:.1f}, session={session_label})")
                         time.sleep(0.2)
                         continue
-                    if avg_entry_drift > config.MAX_AVG_ENTRY_DRIFT_PIPS:
-                        logger.logger.info(f"{nowstr()} {symbol}: entry-drift gate blocked entry (avg_drift={avg_entry_drift:.2f} pips)")
+                    if drift_samples >= config.MIN_ENTRY_DRIFT_SAMPLES and avg_entry_drift > config.MAX_AVG_ENTRY_DRIFT_PIPS:
+                        logger.logger.info(f"{nowstr()} {symbol}: entry-drift gate blocked entry (avg_drift={avg_entry_drift:.2f} pips samples={drift_samples})")
                         time.sleep(0.2)
                         continue
-                    if global_state.should_block_reason(reason_key):
+                    if global_state.should_block_reason(reason_key) and confluence_score < max(4, config.IDEAL_CONFLUENCE_SCORE):
                         logger.logger.info(f"{nowstr()} {symbol}: reason blocker skipped low-edge setup '{reason_key}'")
                         time.sleep(0.2)
                         continue
@@ -6651,6 +6660,8 @@ def main_enhanced():
         logger.logger.info(f"  • Max daily trades: {config.MAX_DAILY_TRADES}")
         logger.logger.info(f"  • Min entry quality score: {config.MIN_ENTRY_QUALITY_SCORE}")
         logger.logger.info(f"  • Max avg entry drift pips: {config.MAX_AVG_ENTRY_DRIFT_PIPS}")
+        logger.logger.info(f"  • Min entry drift samples: {config.MIN_ENTRY_DRIFT_SAMPLES}")
+        logger.logger.info(f"  • Session quality thresholds: {config.SESSION_QUALITY_THRESHOLDS}")
         logger.logger.info(f"  • Reason blocker: enabled={config.REASON_BLOCK_ENABLED} min_trades={config.REASON_BLOCK_MIN_TRADES} max_win_rate={config.REASON_BLOCK_MAX_WIN_RATE}")
         logger.logger.info(f"  • Consecutive loss limit: {config.CONSECUTIVE_LOSS_LIMIT}")
         logger.logger.info("=" * 80)
