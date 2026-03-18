@@ -983,6 +983,11 @@ class BotConfig:
     KPI_RED_DAY_PNL_USD: float = -25.0
     KPI_NEXT_DAY_QUALITY_DELTA: float = 4.0
     KPI_NEXT_DAY_TRADE_DELTA: int = 4
+    AUTO_RETUNE_ENABLED: bool = True
+    AUTO_RETUNE_MIN_REPORTS: int = 5
+    AUTO_RETUNE_LOOKBACK_DAYS: int = 7
+    AUTO_RETUNE_QUALITY_DELTA: float = 3.0
+    AUTO_RETUNE_TRADE_DELTA: int = 3
     MAX_TRADE_DURATION_MINUTES: int = 240
 
     # ==== Paper Trading & Backtesting ====
@@ -1206,6 +1211,14 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("KPI_NEXT_DAY_QUALITY_DELTA cannot be negative.")
     if bot_config.KPI_NEXT_DAY_TRADE_DELTA < 0:
         errors.append("KPI_NEXT_DAY_TRADE_DELTA cannot be negative.")
+    if bot_config.AUTO_RETUNE_MIN_REPORTS < 1:
+        errors.append("AUTO_RETUNE_MIN_REPORTS must be at least 1.")
+    if bot_config.AUTO_RETUNE_LOOKBACK_DAYS < 1:
+        errors.append("AUTO_RETUNE_LOOKBACK_DAYS must be at least 1.")
+    if bot_config.AUTO_RETUNE_QUALITY_DELTA < 0:
+        errors.append("AUTO_RETUNE_QUALITY_DELTA cannot be negative.")
+    if bot_config.AUTO_RETUNE_TRADE_DELTA < 0:
+        errors.append("AUTO_RETUNE_TRADE_DELTA cannot be negative.")
     if bot_config.MIN_RR_RATIO <= 0:
         errors.append("MIN_RR_RATIO must be greater than 0.")
     if bot_config.RELAX_MIN_RR_RATIO <= 0:
@@ -4075,6 +4088,10 @@ class EnhancedGlobalState:
         self.next_day_quality_bias = 0.0
         self.next_day_trade_bias = 0
         self.kpi_report_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'daily_kpi_reports.json')
+        self.daily_operator_report_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'daily_operator_reports.json')
+        self.weekly_operator_report_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'weekly_operator_reports.json')
+        self.retune_quality_bias = 0.0
+        self.retune_trade_bias = 0
         self.correlation_data: Dict[str, Dict[str, float]] = {}
         self.news_events: List[Dict[str, Any]] = []
         self.last_news_refresh = 0.0
@@ -4094,6 +4111,7 @@ class EnhancedGlobalState:
         })
         self.lock = threading.RLock()
         self._load_daily_trade_state()
+        self.apply_auto_retune_from_reports()
 
     def _load_daily_trade_state(self) -> None:
         """Load persisted daily trade counter so restarts do not bypass MAX_DAILY_TRADES."""
@@ -4222,8 +4240,8 @@ class EnhancedGlobalState:
 
     def get_adaptive_trade_controls(self) -> Dict[str, Any]:
         mode = self.refresh_operating_mode()
-        quality_delta = self.next_day_quality_bias
-        trade_cap = config.MAX_DAILY_TRADES + self.next_day_trade_bias
+        quality_delta = self.next_day_quality_bias + self.retune_quality_bias
+        trade_cap = config.MAX_DAILY_TRADES + self.next_day_trade_bias + self.retune_trade_bias
         if mode == "attack":
             quality_delta += -config.ADAPTIVE_QUALITY_DELTA
             trade_cap += config.ADAPTIVE_DAILY_TRADE_DELTA
@@ -4267,9 +4285,13 @@ class EnhancedGlobalState:
                 'operating_mode': self.current_operating_mode,
             }
             self._append_daily_kpi_report(report)
+            self._write_report_payload(self.daily_operator_report_file, self.build_operator_report('daily'))
+            if self.daily_start_date.weekday() == 6:
+                self._write_report_payload(self.weekly_operator_report_file, self.build_operator_report('weekly'), keep=52)
             if not config.DAILY_KPI_ADAPTATION_ENABLED or self.daily_closed_trades < config.KPI_MIN_TRADES_FOR_ADAPTATION:
                 self.next_day_quality_bias = 0.0
                 self.next_day_trade_bias = 0
+                self.apply_auto_retune_from_reports()
                 return
             if self.daily_realized_pnl >= config.KPI_GREEN_DAY_PNL_USD:
                 self.next_day_quality_bias = -config.KPI_NEXT_DAY_QUALITY_DELTA
@@ -4280,6 +4302,72 @@ class EnhancedGlobalState:
             else:
                 self.next_day_quality_bias = 0.0
                 self.next_day_trade_bias = 0
+            self.apply_auto_retune_from_reports()
+
+    def _write_report_payload(self, path: str, report: Dict[str, Any], keep: int = 90) -> None:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            payload = []
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, list):
+                        payload = loaded[-keep:]
+            payload.append(report)
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(payload[-keep:], f, indent=2)
+        except Exception as e:
+            logger.log_error('_write_report_payload', str(e), 'WARNING')
+
+    def _collect_expectancy_rows(self, bucket_type: str) -> List[Dict[str, Any]]:
+        rows = []
+        with self.lock:
+            keys = [k for k in self.expectancy_stats.keys() if k.startswith(f"{bucket_type}:")]
+        for key in keys:
+            _, bucket_value = key.split(':', 1)
+            snapshot = self.get_expectancy_snapshot(bucket_type, bucket_value)
+            snapshot['bucket'] = bucket_value
+            rows.append(snapshot)
+        rows.sort(key=lambda item: item.get('expectancy', 0.0), reverse=True)
+        return rows
+
+    def build_operator_report(self, scope: str = 'daily') -> Dict[str, Any]:
+        return {
+            'scope': scope,
+            'generated_at': datetime.now().isoformat(),
+            'date': self.daily_start_date.isoformat(),
+            'operating_mode': self.current_operating_mode,
+            'daily_closed_trades': int(self.daily_closed_trades),
+            'daily_realized_pnl': float(self.daily_realized_pnl),
+            'symbol_expectancy': self._collect_expectancy_rows('symbol')[:10],
+            'session_expectancy': self._collect_expectancy_rows('session')[:10],
+            'regime_expectancy': self._collect_expectancy_rows('regime')[:10],
+            'setup_expectancy': self._collect_expectancy_rows('setup')[:15],
+        }
+
+    def apply_auto_retune_from_reports(self) -> None:
+        self.retune_quality_bias = 0.0
+        self.retune_trade_bias = 0
+        if not config.AUTO_RETUNE_ENABLED or not os.path.exists(self.kpi_report_file):
+            return
+        try:
+            with open(self.kpi_report_file, 'r', encoding='utf-8') as f:
+                reports = json.load(f)
+            if not isinstance(reports, list):
+                return
+            recent = reports[-config.AUTO_RETUNE_LOOKBACK_DAYS:]
+            if len(recent) < config.AUTO_RETUNE_MIN_REPORTS:
+                return
+            total_pnl = sum(float(item.get('realized_pnl', 0.0)) for item in recent)
+            avg_pnl = total_pnl / max(1, len(recent))
+            if avg_pnl >= config.KPI_GREEN_DAY_PNL_USD:
+                self.retune_quality_bias = -config.AUTO_RETUNE_QUALITY_DELTA
+                self.retune_trade_bias = config.AUTO_RETUNE_TRADE_DELTA
+            elif avg_pnl <= config.KPI_RED_DAY_PNL_USD:
+                self.retune_quality_bias = config.AUTO_RETUNE_QUALITY_DELTA
+                self.retune_trade_bias = -config.AUTO_RETUNE_TRADE_DELTA
+        except Exception as e:
+            logger.log_error('apply_auto_retune_from_reports', str(e), 'WARNING')
 
     def _bucket_key(self, bucket_type: str, bucket_value: str) -> str:
         return f"{bucket_type}:{bucket_value}"
@@ -6879,6 +6967,7 @@ def main_enhanced():
         logger.logger.info(f"  • Adaptive mode: enabled={config.ADAPTIVE_MODE_ENABLED} lookback={config.ADAPTIVE_LOOKBACK_TRADES} attack_win_rate={config.ATTACK_MODE_MIN_WIN_RATE} defensive_win_rate={config.DEFENSIVE_MODE_MAX_WIN_RATE}")
         logger.logger.info(f"  • Expectancy engine: enabled={config.EXPECTANCY_ENGINE_ENABLED} min_samples={config.EXPECTANCY_MIN_SAMPLES} quality_delta={config.EXPECTANCY_QUALITY_DELTA}")
         logger.logger.info(f"  • Daily KPI adaptation: enabled={config.DAILY_KPI_ADAPTATION_ENABLED} min_trades={config.KPI_MIN_TRADES_FOR_ADAPTATION} green_day={config.KPI_GREEN_DAY_PNL_USD} red_day={config.KPI_RED_DAY_PNL_USD}")
+        logger.logger.info(f"  • Auto-retune: enabled={config.AUTO_RETUNE_ENABLED} min_reports={config.AUTO_RETUNE_MIN_REPORTS} lookback_days={config.AUTO_RETUNE_LOOKBACK_DAYS} quality_delta={config.AUTO_RETUNE_QUALITY_DELTA} trade_delta={config.AUTO_RETUNE_TRADE_DELTA}")
         logger.logger.info(f"  • Consecutive loss limit: {config.CONSECUTIVE_LOSS_LIMIT}")
         logger.logger.info("=" * 80)
         logger.logger.info("STRATEGY CONFIGURATION:")
