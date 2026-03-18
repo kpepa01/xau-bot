@@ -977,6 +977,12 @@ class BotConfig:
     EXPECTANCY_ENGINE_ENABLED: bool = True
     EXPECTANCY_MIN_SAMPLES: int = 6
     EXPECTANCY_QUALITY_DELTA: float = 4.0
+    DAILY_KPI_ADAPTATION_ENABLED: bool = True
+    KPI_MIN_TRADES_FOR_ADAPTATION: int = 4
+    KPI_GREEN_DAY_PNL_USD: float = 25.0
+    KPI_RED_DAY_PNL_USD: float = -25.0
+    KPI_NEXT_DAY_QUALITY_DELTA: float = 4.0
+    KPI_NEXT_DAY_TRADE_DELTA: int = 4
     MAX_TRADE_DURATION_MINUTES: int = 240
 
     # ==== Paper Trading & Backtesting ====
@@ -1194,6 +1200,12 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("EXPECTANCY_MIN_SAMPLES must be at least 1.")
     if bot_config.EXPECTANCY_QUALITY_DELTA < 0:
         errors.append("EXPECTANCY_QUALITY_DELTA cannot be negative.")
+    if bot_config.KPI_MIN_TRADES_FOR_ADAPTATION < 1:
+        errors.append("KPI_MIN_TRADES_FOR_ADAPTATION must be at least 1.")
+    if bot_config.KPI_NEXT_DAY_QUALITY_DELTA < 0:
+        errors.append("KPI_NEXT_DAY_QUALITY_DELTA cannot be negative.")
+    if bot_config.KPI_NEXT_DAY_TRADE_DELTA < 0:
+        errors.append("KPI_NEXT_DAY_TRADE_DELTA cannot be negative.")
     if bot_config.MIN_RR_RATIO <= 0:
         errors.append("MIN_RR_RATIO must be greater than 0.")
     if bot_config.RELAX_MIN_RR_RATIO <= 0:
@@ -4058,6 +4070,11 @@ class EnhancedGlobalState:
         self.trade_learning = TradeLearningSystem()
         self.recent_performance = deque(maxlen=20)
         self.current_operating_mode = "normal"
+        self.daily_closed_trades = 0
+        self.daily_realized_pnl = 0.0
+        self.next_day_quality_bias = 0.0
+        self.next_day_trade_bias = 0
+        self.kpi_report_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'daily_kpi_reports.json')
         self.correlation_data: Dict[str, Dict[str, float]] = {}
         self.news_events: List[Dict[str, Any]] = []
         self.last_news_refresh = 0.0
@@ -4205,19 +4222,64 @@ class EnhancedGlobalState:
 
     def get_adaptive_trade_controls(self) -> Dict[str, Any]:
         mode = self.refresh_operating_mode()
-        quality_delta = 0.0
-        trade_cap = config.MAX_DAILY_TRADES
+        quality_delta = self.next_day_quality_bias
+        trade_cap = config.MAX_DAILY_TRADES + self.next_day_trade_bias
         if mode == "attack":
-            quality_delta = -config.ADAPTIVE_QUALITY_DELTA
-            trade_cap = config.MAX_DAILY_TRADES + config.ADAPTIVE_DAILY_TRADE_DELTA
+            quality_delta += -config.ADAPTIVE_QUALITY_DELTA
+            trade_cap += config.ADAPTIVE_DAILY_TRADE_DELTA
         elif mode == "defensive":
-            quality_delta = config.ADAPTIVE_QUALITY_DELTA
-            trade_cap = max(6, config.MAX_DAILY_TRADES - config.ADAPTIVE_DAILY_TRADE_DELTA)
+            quality_delta += config.ADAPTIVE_QUALITY_DELTA
+            trade_cap -= config.ADAPTIVE_DAILY_TRADE_DELTA
+        trade_cap = max(6, trade_cap)
         return {
             "mode": mode,
             "quality_delta": quality_delta,
             "daily_trade_cap": trade_cap,
         }
+
+    def record_daily_trade_result(self, profit: float) -> None:
+        with self.lock:
+            self.daily_closed_trades += 1
+            self.daily_realized_pnl += float(profit)
+
+    def _append_daily_kpi_report(self, report: Dict[str, Any]) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.kpi_report_file), exist_ok=True)
+            payload = []
+            if os.path.exists(self.kpi_report_file):
+                with open(self.kpi_report_file, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, list):
+                        payload = loaded[-90:]
+            payload.append(report)
+            with open(self.kpi_report_file, 'w', encoding='utf-8') as f:
+                json.dump(payload[-90:], f, indent=2)
+        except Exception as e:
+            logger.log_error('_append_daily_kpi_report', str(e), 'WARNING')
+
+    def finalize_daily_kpi_state(self) -> None:
+        """Use completed-day KPI results to bias the next trading day."""
+        with self.lock:
+            report = {
+                'date': self.daily_start_date.isoformat(),
+                'closed_trades': int(self.daily_closed_trades),
+                'realized_pnl': float(self.daily_realized_pnl),
+                'operating_mode': self.current_operating_mode,
+            }
+            self._append_daily_kpi_report(report)
+            if not config.DAILY_KPI_ADAPTATION_ENABLED or self.daily_closed_trades < config.KPI_MIN_TRADES_FOR_ADAPTATION:
+                self.next_day_quality_bias = 0.0
+                self.next_day_trade_bias = 0
+                return
+            if self.daily_realized_pnl >= config.KPI_GREEN_DAY_PNL_USD:
+                self.next_day_quality_bias = -config.KPI_NEXT_DAY_QUALITY_DELTA
+                self.next_day_trade_bias = config.KPI_NEXT_DAY_TRADE_DELTA
+            elif self.daily_realized_pnl <= config.KPI_RED_DAY_PNL_USD:
+                self.next_day_quality_bias = config.KPI_NEXT_DAY_QUALITY_DELTA
+                self.next_day_trade_bias = -config.KPI_NEXT_DAY_TRADE_DELTA
+            else:
+                self.next_day_quality_bias = 0.0
+                self.next_day_trade_bias = 0
 
     def _bucket_key(self, bucket_type: str, bucket_value: str) -> str:
         return f"{bucket_type}:{bucket_value}"
@@ -4602,9 +4664,13 @@ class EnhancedGlobalState:
     
     def reset_daily_stats(self):
         with self.lock:
+            if self.daily_closed_trades > 0 or abs(self.daily_realized_pnl) > 0:
+                self.finalize_daily_kpi_state()
             self.daily_start_date = date.today()
             self.daily_trades_count = 0
             self.daily_consecutive_losses = 0
+            self.daily_closed_trades = 0
+            self.daily_realized_pnl = 0.0
             self.daily_loss_triggered = False
             self.circuit_breaker_until = 0.0
             try:
@@ -5964,6 +6030,7 @@ def check_closed_trades_enhanced():
                             trade_tracker.update_consecutive_losses(profit)
                             if performance_tracker:
                                 performance_tracker.record_trade(profit)
+                            global_state.record_daily_trade_result(profit)
                             global_state.recent_performance.append(profit)
                             global_state.refresh_operating_mode()
                             global_state.trade_learning.add_trade({
@@ -6811,6 +6878,7 @@ def main_enhanced():
         logger.logger.info(f"  • Reason blocker: enabled={config.REASON_BLOCK_ENABLED} min_trades={config.REASON_BLOCK_MIN_TRADES} max_win_rate={config.REASON_BLOCK_MAX_WIN_RATE}")
         logger.logger.info(f"  • Adaptive mode: enabled={config.ADAPTIVE_MODE_ENABLED} lookback={config.ADAPTIVE_LOOKBACK_TRADES} attack_win_rate={config.ATTACK_MODE_MIN_WIN_RATE} defensive_win_rate={config.DEFENSIVE_MODE_MAX_WIN_RATE}")
         logger.logger.info(f"  • Expectancy engine: enabled={config.EXPECTANCY_ENGINE_ENABLED} min_samples={config.EXPECTANCY_MIN_SAMPLES} quality_delta={config.EXPECTANCY_QUALITY_DELTA}")
+        logger.logger.info(f"  • Daily KPI adaptation: enabled={config.DAILY_KPI_ADAPTATION_ENABLED} min_trades={config.KPI_MIN_TRADES_FOR_ADAPTATION} green_day={config.KPI_GREEN_DAY_PNL_USD} red_day={config.KPI_RED_DAY_PNL_USD}")
         logger.logger.info(f"  • Consecutive loss limit: {config.CONSECUTIVE_LOSS_LIMIT}")
         logger.logger.info("=" * 80)
         logger.logger.info("STRATEGY CONFIGURATION:")
