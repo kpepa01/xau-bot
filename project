@@ -832,12 +832,12 @@ class BotConfig:
     COOLDOWN: int = 1800
     FORCE_TRADE_EVERY: int = 900
     FORCE_TRADE_ENABLED: bool = True
-    FORCE_TRADE_MIN_TREND_STRENGTH: float = 0.4
+    FORCE_TRADE_MIN_TREND_STRENGTH: float = 0.25
     FORCE_TRADE_ALLOWED_SESSIONS: Tuple[str, ...] = ('ALL_DAY', 'LONDON', 'NEW_YORK', 'ASIA', 'OFF_HOURS')
-    FORCE_TRADE_REQUIRE_MTF_ALIGNMENT: bool = True
-    FORCE_TRADE_STARTUP_DELAY_SECONDS: int = 60
-    FORCE_TRADE_MIN_QUALITY_SCORE: float = 74.0
-    FORCE_TRADE_MAX_SPREAD_RATIO: float = 1.3
+    FORCE_TRADE_REQUIRE_MTF_ALIGNMENT: bool = False
+    FORCE_TRADE_STARTUP_DELAY_SECONDS: int = 30
+    FORCE_TRADE_MIN_QUALITY_SCORE: float = 62.0
+    FORCE_TRADE_MAX_SPREAD_RATIO: float = 1.8
 
     # ==== Indicator Settings ====
     EMA_FAST: int = 12
@@ -6823,7 +6823,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 avg_entry_drift = global_state.avg_entry_drift(symbol)
                 drift_samples = global_state.entry_drift_samples(symbol)
                 max_spread_ratio_allowed = config.FORCE_TRADE_MAX_SPREAD_RATIO if forced_trade else config.EXECUTION_MAX_SPREAD_RATIO
-                quality_min_required = max(session_quality_min, config.FORCE_TRADE_MIN_QUALITY_SCORE) if forced_trade else session_quality_min
+                quality_min_required = config.FORCE_TRADE_MIN_QUALITY_SCORE if forced_trade else session_quality_min
                 if spread_ratio > max_spread_ratio_allowed:
                     logger.logger.info(f"{nowstr()} {symbol}: execution filter blocked entry (spread_ratio={spread_ratio:.2f} max={max_spread_ratio_allowed:.2f})")
                     time.sleep(0.2)
