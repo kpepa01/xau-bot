@@ -829,13 +829,15 @@ class BotConfig:
     VOLATILITY_ADJUSTED_SL: bool = False
     MIN_RR_RATIO: float = 2.0
 
-    COOLDOWN: int = 1800
-    FORCE_TRADE_EVERY: int = 900
+    COOLDOWN: int = 600
+    FORCE_TRADE_EVERY: int = 300
     FORCE_TRADE_ENABLED: bool = True
     FORCE_TRADE_MIN_TREND_STRENGTH: float = 0.25
     FORCE_TRADE_ALLOWED_SESSIONS: Tuple[str, ...] = ('ALL_DAY', 'LONDON', 'NEW_YORK', 'ASIA', 'OFF_HOURS')
     FORCE_TRADE_REQUIRE_MTF_ALIGNMENT: bool = False
     FORCE_TRADE_STARTUP_DELAY_SECONDS: int = 30
+    FORCE_TRADE_IMMEDIATE_ON_START: bool = True
+    FORCE_TRADE_BOOTSTRAP_WINDOW_SECONDS: int = 300
     FORCE_TRADE_MIN_QUALITY_SCORE: float = 62.0
     FORCE_TRADE_MAX_SPREAD_RATIO: float = 1.8
 
@@ -1174,6 +1176,8 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("FORCE_TRADE_MIN_TREND_STRENGTH must be between 0 and 1.")
     if bot_config.FORCE_TRADE_STARTUP_DELAY_SECONDS < 0:
         errors.append("FORCE_TRADE_STARTUP_DELAY_SECONDS cannot be negative.")
+    if bot_config.FORCE_TRADE_BOOTSTRAP_WINDOW_SECONDS < 0:
+        errors.append("FORCE_TRADE_BOOTSTRAP_WINDOW_SECONDS cannot be negative.")
     if not (0 <= bot_config.FORCE_TRADE_MIN_QUALITY_SCORE <= 100):
         errors.append("FORCE_TRADE_MIN_QUALITY_SCORE must be between 0 and 100.")
     if bot_config.FORCE_TRADE_MAX_SPREAD_RATIO <= 0:
@@ -6407,19 +6411,30 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 print_daily_summary_enhanced()
                 global_state.last_summary_time = time.time()
             
-            if is_in_no_trade_zone():
+            startup_force_override = (
+                config.FORCE_TRADE_ENABLED and
+                config.FORCE_TRADE_IMMEDIATE_ON_START and
+                global_state.last_trade_time.get(symbol, 0) == 0 and
+                (time.time() - global_state.start_time) <= config.FORCE_TRADE_BOOTSTRAP_WINDOW_SECONDS
+            )
+
+            if is_in_no_trade_zone() and not startup_force_override:
                 logger.logger.debug(f"{nowstr()} {symbol}: inside no-trade zone; skipping")
                 manage_hybrid_trailing_enhanced(symbol)
                 check_closed_trades_enhanced()
                 time.sleep(30)
                 continue
+            elif is_in_no_trade_zone() and startup_force_override:
+                logger.logger.info(f"{nowstr()} {symbol}: startup override active, bypassing no-trade zone once for force-trade bootstrap")
 
-            if not is_within_daily_trade_window():
+            if not is_within_daily_trade_window() and not startup_force_override:
                 logger.logger.info(f"{nowstr()} {symbol}: outside configured trade window {config.TRADE_WINDOW_START}-{config.TRADE_WINDOW_END}; waiting")
                 manage_hybrid_trailing_enhanced(symbol)
                 check_closed_trades_enhanced()
                 time.sleep(30)
                 continue
+            elif not is_within_daily_trade_window() and startup_force_override:
+                logger.logger.info(f"{nowstr()} {symbol}: startup override active, bypassing daily trade window once for force-trade bootstrap")
 
             session_preferred = is_in_trading_session(config.PREFERRED_SESSION)
             if not session_preferred:
@@ -6589,12 +6604,20 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     liquidity_signal_active = True
             
             # SMART FORCE TRADE LOGIC
+            startup_immediate_mode = (
+                startup_force_override and
+                config.FORCE_TRADE_BOOTSTRAP_WINDOW_SECONDS > 0
+            )
             startup_force_ready = (
                 global_state.last_trade_time.get(symbol, 0) == 0 and
-                (time.time() - global_state.start_time) >= config.FORCE_TRADE_STARTUP_DELAY_SECONDS
+                (
+                    startup_immediate_mode or
+                    (time.time() - global_state.start_time) >= config.FORCE_TRADE_STARTUP_DELAY_SECONDS
+                )
             )
             periodic_force_ready = time.time() - global_state.last_forced_time.get(symbol, 0) >= config.FORCE_TRADE_EVERY
-            if (config.FORCE_TRADE_ENABLED and (chosen_dir is None or confluence_score < config.MIN_CONFLUENCE_SCORE) and
+            should_force_attempt = (chosen_dir is None or confluence_score < config.MIN_CONFLUENCE_SCORE or startup_immediate_mode)
+            if (config.FORCE_TRADE_ENABLED and should_force_attempt and
                 (startup_force_ready or periodic_force_ready)):
 
                 current_session = get_current_session_label()
@@ -6981,7 +7004,7 @@ def main_enhanced():
         logger.logger.info("SAFETY CONFIGURATION:")
         logger.logger.info(f"  • Lot size: {config.LOT_FIXED}")
         logger.logger.info(f"  • Cooldown: {config.COOLDOWN} seconds")
-        logger.logger.info(f"  • Force trade enabled: {config.FORCE_TRADE_ENABLED} every {config.FORCE_TRADE_EVERY}s min_trend={config.FORCE_TRADE_MIN_TREND_STRENGTH} startup_delay={config.FORCE_TRADE_STARTUP_DELAY_SECONDS}s mtf_required={config.FORCE_TRADE_REQUIRE_MTF_ALIGNMENT} min_quality={config.FORCE_TRADE_MIN_QUALITY_SCORE} max_spread_ratio={config.FORCE_TRADE_MAX_SPREAD_RATIO}")
+        logger.logger.info(f"  • Force trade enabled: {config.FORCE_TRADE_ENABLED} every {config.FORCE_TRADE_EVERY}s min_trend={config.FORCE_TRADE_MIN_TREND_STRENGTH} startup_delay={config.FORCE_TRADE_STARTUP_DELAY_SECONDS}s immediate_on_start={config.FORCE_TRADE_IMMEDIATE_ON_START} bootstrap_window={config.FORCE_TRADE_BOOTSTRAP_WINDOW_SECONDS}s mtf_required={config.FORCE_TRADE_REQUIRE_MTF_ALIGNMENT} min_quality={config.FORCE_TRADE_MIN_QUALITY_SCORE} max_spread_ratio={config.FORCE_TRADE_MAX_SPREAD_RATIO}")
         logger.logger.info(f"  • SL Multiplier: {config.SL_ATR_MULT}")
         logger.logger.info(f"  • Max loss per trade: ${config.MAX_LOSS_PER_TRADE}")
         logger.logger.info(f"  • Daily loss pct stop: {config.DAILY_LOSS_PCT}%")
