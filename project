@@ -832,10 +832,12 @@ class BotConfig:
     COOLDOWN: int = 1800
     FORCE_TRADE_EVERY: int = 900
     FORCE_TRADE_ENABLED: bool = True
-    FORCE_TRADE_MIN_TREND_STRENGTH: float = 0.25
+    FORCE_TRADE_MIN_TREND_STRENGTH: float = 0.4
     FORCE_TRADE_ALLOWED_SESSIONS: Tuple[str, ...] = ('ALL_DAY', 'LONDON', 'NEW_YORK', 'ASIA', 'OFF_HOURS')
-    FORCE_TRADE_REQUIRE_MTF_ALIGNMENT: bool = False
+    FORCE_TRADE_REQUIRE_MTF_ALIGNMENT: bool = True
     FORCE_TRADE_STARTUP_DELAY_SECONDS: int = 60
+    FORCE_TRADE_MIN_QUALITY_SCORE: float = 74.0
+    FORCE_TRADE_MAX_SPREAD_RATIO: float = 1.3
 
     # ==== Indicator Settings ====
     EMA_FAST: int = 12
@@ -1172,6 +1174,10 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("FORCE_TRADE_MIN_TREND_STRENGTH must be between 0 and 1.")
     if bot_config.FORCE_TRADE_STARTUP_DELAY_SECONDS < 0:
         errors.append("FORCE_TRADE_STARTUP_DELAY_SECONDS cannot be negative.")
+    if not (0 <= bot_config.FORCE_TRADE_MIN_QUALITY_SCORE <= 100):
+        errors.append("FORCE_TRADE_MIN_QUALITY_SCORE must be between 0 and 100.")
+    if bot_config.FORCE_TRADE_MAX_SPREAD_RATIO <= 0:
+        errors.append("FORCE_TRADE_MAX_SPREAD_RATIO must be greater than 0.")
     if not (0 <= bot_config.DAILY_LOSS_PCT <= 100):
         errors.append("DAILY_LOSS_PCT must be between 0 and 100.")
     if bot_config.DAILY_MAX_LOSS_USD <= 0:
@@ -6816,33 +6822,34 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 session_quality_min = max(55.0, min(95.0, base_session_quality + float(adaptive_controls.get('quality_delta', 0.0)) + expectancy_quality_delta))
                 avg_entry_drift = global_state.avg_entry_drift(symbol)
                 drift_samples = global_state.entry_drift_samples(symbol)
-                if not forced_trade:
-                    if spread_ratio > config.EXECUTION_MAX_SPREAD_RATIO:
-                        logger.logger.info(f"{nowstr()} {symbol}: execution filter blocked entry (spread_ratio={spread_ratio:.2f})")
-                        time.sleep(0.2)
-                        continue
-                    if config.QUALITY_SCORE_HARD_BLOCK and quality_score < session_quality_min:
-                        logger.logger.info(f"{nowstr()} {symbol}: quality gate blocked entry (score={quality_score:.1f}<{session_quality_min:.1f}, session={session_label})")
-                        time.sleep(0.2)
-                        continue
-                    if drift_samples >= config.MIN_ENTRY_DRIFT_SAMPLES and avg_entry_drift > config.MAX_AVG_ENTRY_DRIFT_PIPS:
-                        logger.logger.info(f"{nowstr()} {symbol}: entry-drift gate blocked entry (avg_drift={avg_entry_drift:.2f} pips samples={drift_samples})")
-                        time.sleep(0.2)
-                        continue
-                    if global_state.should_block_reason(reason_key) and confluence_score < max(4, config.IDEAL_CONFLUENCE_SCORE):
-                        logger.logger.info(f"{nowstr()} {symbol}: reason blocker skipped low-edge setup '{reason_key}'")
-                        time.sleep(0.2)
-                        continue
-                    if not global_state.trade_filter.filter_trade(
-                        {"direction": chosen_dir},
-                        market_data,
-                        min_trend_strength=(config.RELAX_MIN_TREND_STRENGTH if relax_mode else None),
-                        max_spread_multiplier=(config.RELAX_MAX_SPREAD_MULTIPLIER if relax_mode else None),
-                        min_rr_ratio=min_rr
-                    ):
-                        logger.logger.info(f"{nowstr()} {symbol}: trade filter blocked entry")
-                        time.sleep(0.2)
-                        continue
+                max_spread_ratio_allowed = config.FORCE_TRADE_MAX_SPREAD_RATIO if forced_trade else config.EXECUTION_MAX_SPREAD_RATIO
+                quality_min_required = max(session_quality_min, config.FORCE_TRADE_MIN_QUALITY_SCORE) if forced_trade else session_quality_min
+                if spread_ratio > max_spread_ratio_allowed:
+                    logger.logger.info(f"{nowstr()} {symbol}: execution filter blocked entry (spread_ratio={spread_ratio:.2f} max={max_spread_ratio_allowed:.2f})")
+                    time.sleep(0.2)
+                    continue
+                if config.QUALITY_SCORE_HARD_BLOCK and quality_score < quality_min_required:
+                    logger.logger.info(f"{nowstr()} {symbol}: quality gate blocked entry (score={quality_score:.1f}<{quality_min_required:.1f}, session={session_label}, forced={forced_trade})")
+                    time.sleep(0.2)
+                    continue
+                if drift_samples >= config.MIN_ENTRY_DRIFT_SAMPLES and avg_entry_drift > config.MAX_AVG_ENTRY_DRIFT_PIPS:
+                    logger.logger.info(f"{nowstr()} {symbol}: entry-drift gate blocked entry (avg_drift={avg_entry_drift:.2f} pips samples={drift_samples})")
+                    time.sleep(0.2)
+                    continue
+                if (not forced_trade) and global_state.should_block_reason(reason_key) and confluence_score < max(4, config.IDEAL_CONFLUENCE_SCORE):
+                    logger.logger.info(f"{nowstr()} {symbol}: reason blocker skipped low-edge setup '{reason_key}'")
+                    time.sleep(0.2)
+                    continue
+                if not global_state.trade_filter.filter_trade(
+                    {"direction": chosen_dir},
+                    market_data,
+                    min_trend_strength=(config.RELAX_MIN_TREND_STRENGTH if relax_mode else None),
+                    max_spread_multiplier=(config.RELAX_MAX_SPREAD_MULTIPLIER if relax_mode else None),
+                    min_rr_ratio=min_rr
+                ):
+                    logger.logger.info(f"{nowstr()} {symbol}: trade filter blocked entry")
+                    time.sleep(0.2)
+                    continue
 
                 if config.USE_FIXED_LOT:
                     lot = round_lot(symbol, config.LOT_FIXED)
@@ -6974,7 +6981,7 @@ def main_enhanced():
         logger.logger.info("SAFETY CONFIGURATION:")
         logger.logger.info(f"  • Lot size: {config.LOT_FIXED}")
         logger.logger.info(f"  • Cooldown: {config.COOLDOWN} seconds")
-        logger.logger.info(f"  • Force trade enabled: {config.FORCE_TRADE_ENABLED} every {config.FORCE_TRADE_EVERY}s min_trend={config.FORCE_TRADE_MIN_TREND_STRENGTH} startup_delay={config.FORCE_TRADE_STARTUP_DELAY_SECONDS}s mtf_required={config.FORCE_TRADE_REQUIRE_MTF_ALIGNMENT}")
+        logger.logger.info(f"  • Force trade enabled: {config.FORCE_TRADE_ENABLED} every {config.FORCE_TRADE_EVERY}s min_trend={config.FORCE_TRADE_MIN_TREND_STRENGTH} startup_delay={config.FORCE_TRADE_STARTUP_DELAY_SECONDS}s mtf_required={config.FORCE_TRADE_REQUIRE_MTF_ALIGNMENT} min_quality={config.FORCE_TRADE_MIN_QUALITY_SCORE} max_spread_ratio={config.FORCE_TRADE_MAX_SPREAD_RATIO}")
         logger.logger.info(f"  • SL Multiplier: {config.SL_ATR_MULT}")
         logger.logger.info(f"  • Max loss per trade: ${config.MAX_LOSS_PER_TRADE}")
         logger.logger.info(f"  • Daily loss pct stop: {config.DAILY_LOSS_PCT}%")
