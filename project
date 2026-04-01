@@ -826,6 +826,13 @@ class BotConfig:
     MIN_RISK_PER_TRADE_USD: float = 5.0
     DYNAMIC_POSITION_SIZING: bool = False
     RISK_PER_TRADE_PCT: float = 1.0
+    SMART_RISK_SCALING: bool = True
+    RISK_SCALE_MIN: float = 0.55
+    RISK_SCALE_MAX: float = 1.35
+    RISK_SCALE_QUALITY_WEIGHT: float = 0.45
+    RISK_SCALE_CONFLUENCE_WEIGHT: float = 0.30
+    RISK_SCALE_REGIME_WEIGHT: float = 0.15
+    RISK_SCALE_EXECUTION_WEIGHT: float = 0.10
     VOLATILITY_ADJUSTED_SL: bool = False
     MIN_RR_RATIO: float = 2.0
 
@@ -1038,6 +1045,12 @@ class BotConfig:
         'snr': 0.25,
         'fvg': 0.2
     })
+    AUTO_TUNE_STRATEGY_WEIGHTS: bool = True
+    AUTO_TUNE_MIN_SAMPLES: int = 8
+    AUTO_TUNE_EXPECTANCY_CLAMP: float = 25.0
+    AUTO_TUNE_WEIGHT_ADJUST_RATE: float = 0.20
+    AUTO_TUNE_WEIGHT_MIN: float = 0.08
+    AUTO_TUNE_WEIGHT_MAX: float = 0.60
     
     # ==== Confluence Scoring ====
     MIN_CONFLUENCE_SCORE: int = 2
@@ -2651,7 +2664,8 @@ class TradeTracker:
     def add_trade(self, ticket: int, symbol: str, direction: str, 
                   entry_price: float, sl_price: float, tp_price: float,
                   confluence_score: int = 0, fvg_signal: bool = False,
-                  lot_size: Optional[float] = None):
+                  lot_size: Optional[float] = None,
+                  strategy_hits: Optional[Dict[str, bool]] = None):
         """Add a new trade to track with safety checks"""
         with self.lock:
             info = get_symbol_info_safe(symbol)
@@ -2708,7 +2722,8 @@ class TradeTracker:
                 'lot_size': resolved_lot,
                 'max_loss_exceeded': potential_loss > self.max_loss_per_trade,
                 'confluence_score': confluence_score,
-                'fvg_signal': fvg_signal
+                'fvg_signal': fvg_signal,
+                'strategy_hits': strategy_hits or {}
             }
             
             logger.logger.info(f"Trade {ticket} added to tracker. Potential loss: ${potential_loss:.2f}")
@@ -3755,7 +3770,11 @@ class ConfluenceManager:
             'liquidity': [s for s in liquidity_signals if s['direction'] == 'sell']
         }
         
-        weights = self.get_strategy_weights(market_regime)
+        base_weights = self.get_strategy_weights(market_regime)
+        try:
+            weights = global_state.get_auto_tuned_weights(symbol, base_weights)
+        except Exception:
+            weights = base_weights
         
         buy_confidence = (
             sum(s.get('confidence', 0.5) for s in buy_signals['trend']) * weights['trend_following'] +
@@ -3823,6 +3842,8 @@ class ConfluenceManager:
             'final_decision': final_direction if final_direction else 'none',
             'action_taken': 'monitoring'
         }
+        if config.AUTO_TUNE_STRATEGY_WEIGHTS:
+            confluence_data['dynamic_weights'] = json.dumps({k: round(v, 4) for k, v in weights.items()})
         
         logger.log_confluence(confluence_data)
         
@@ -4034,8 +4055,64 @@ class EnhancedGlobalState:
         self.daily_trade_state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'daily_trade_state.json')
         self.recent_trade_levels: List[Dict[str, Any]] = self._load_recent_trade_levels()
         self.spread_history = {s: deque(maxlen=max(20, config.EXECUTION_SPREAD_WINDOW)) for s in config.SYMBOLS}
+        self.strategy_expectancy: Dict[str, Dict[str, Dict[str, float]]] = {
+            s: {
+                "trend_following": {"profit_sum": 0.0, "count": 0.0},
+                "crt": {"profit_sum": 0.0, "count": 0.0},
+                "snr": {"profit_sum": 0.0, "count": 0.0},
+                "fvg": {"profit_sum": 0.0, "count": 0.0},
+                "liquidity": {"profit_sum": 0.0, "count": 0.0},
+            } for s in config.SYMBOLS
+        }
         self.lock = threading.RLock()
         self._load_daily_trade_state()
+
+    def update_strategy_expectancy(self, symbol: str, strategy_hits: Dict[str, bool], profit: float) -> None:
+        """Update per-strategy expectancy using closed-trade outcomes."""
+        if not config.AUTO_TUNE_STRATEGY_WEIGHTS:
+            return
+        with self.lock:
+            if symbol not in self.strategy_expectancy:
+                self.strategy_expectancy[symbol] = {}
+            for name, active in (strategy_hits or {}).items():
+                if not active:
+                    continue
+                if name not in self.strategy_expectancy[symbol]:
+                    self.strategy_expectancy[symbol][name] = {"profit_sum": 0.0, "count": 0.0}
+                self.strategy_expectancy[symbol][name]["profit_sum"] += float(profit)
+                self.strategy_expectancy[symbol][name]["count"] += 1.0
+
+    def get_auto_tuned_weights(self, symbol: str, base_weights: Dict[str, float]) -> Dict[str, float]:
+        """
+        Auto-tune weights from expectancy:
+        - Positive expectancy nudges weight up
+        - Negative expectancy nudges weight down
+        """
+        tuned = dict(base_weights or {})
+        if (not config.AUTO_TUNE_STRATEGY_WEIGHTS) or symbol not in self.strategy_expectancy:
+            return tuned
+
+        stats = self.strategy_expectancy.get(symbol, {})
+        sample_ready = any(v.get("count", 0) >= config.AUTO_TUNE_MIN_SAMPLES for v in stats.values())
+        if not sample_ready:
+            return tuned
+
+        for strategy_name in ("crt", "snr", "trend_following", "fvg", "liquidity"):
+            if strategy_name not in tuned:
+                continue
+            st = stats.get(strategy_name, {})
+            count = float(st.get("count", 0.0) or 0.0)
+            if count < config.AUTO_TUNE_MIN_SAMPLES:
+                continue
+            expectancy = float(st.get("profit_sum", 0.0) or 0.0) / max(1.0, count)
+            capped = max(-config.AUTO_TUNE_EXPECTANCY_CLAMP, min(config.AUTO_TUNE_EXPECTANCY_CLAMP, expectancy))
+            nudged = tuned[strategy_name] * (1.0 + (capped / config.AUTO_TUNE_EXPECTANCY_CLAMP) * config.AUTO_TUNE_WEIGHT_ADJUST_RATE)
+            tuned[strategy_name] = max(config.AUTO_TUNE_WEIGHT_MIN, min(config.AUTO_TUNE_WEIGHT_MAX, nudged))
+
+        total = sum(tuned.values())
+        if total > 0:
+            tuned = {k: float(v) / total for k, v in tuned.items()}
+        return tuned
 
     def _load_daily_trade_state(self) -> None:
         """Load persisted daily trade counter so restarts do not bypass MAX_DAILY_TRADES."""
@@ -4831,6 +4908,55 @@ def calculate_position_size(symbol: str, entry_price: float, sl_price: float) ->
         return config.LOT_FIXED
     lots = risk_amount / (stop_points * value_per_point)
     return round_lot(symbol, lots)
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+def compute_smart_risk_multiplier(
+    quality_score: float,
+    confluence_score: int,
+    market_regime: str,
+    spread_ratio: float,
+    recent_performance: List[float],
+) -> float:
+    """
+    Compute a bounded risk multiplier based on setup quality/execution context.
+    Keeps fast-trade logic unchanged while adapting lot sizing confidence.
+    """
+    if not config.SMART_RISK_SCALING:
+        return 1.0
+
+    q_norm = clamp((quality_score - 50.0) / 35.0, 0.0, 1.0)
+    c_norm = clamp(confluence_score / 5.0, 0.0, 1.0)
+
+    if market_regime == "trending":
+        regime_boost = 1.0
+    elif market_regime == "ranging":
+        regime_boost = 0.55
+    elif market_regime == "volatile":
+        regime_boost = 0.75
+    else:
+        regime_boost = 0.65
+
+    exec_score = clamp((2.0 - max(0.0, spread_ratio)) / 2.0, 0.0, 1.0)
+
+    perf_score = 0.5
+    if recent_performance:
+        window = recent_performance[-20:]
+        wins = sum(1 for p in window if p > 0)
+        perf_score = wins / max(1, len(window))
+    perf_blend = 0.75 + (perf_score - 0.5) * 0.5
+    perf_blend = clamp(perf_blend, 0.55, 1.20)
+
+    weighted = (
+        q_norm * config.RISK_SCALE_QUALITY_WEIGHT +
+        c_norm * config.RISK_SCALE_CONFLUENCE_WEIGHT +
+        regime_boost * config.RISK_SCALE_REGIME_WEIGHT +
+        exec_score * config.RISK_SCALE_EXECUTION_WEIGHT
+    )
+    base_mult = 0.6 + weighted
+    scaled = base_mult * perf_blend
+    return clamp(scaled, config.RISK_SCALE_MIN, config.RISK_SCALE_MAX)
 def calc_indicators_safe(df: pd.DataFrame) -> pd.DataFrame:
     """Safe indicator calculation with error handling"""
     if df is None or df.empty or len(df) < max(config.EMA_SLOW, config.ATR_PERIOD, config.RSI_PERIOD) + 5:
@@ -5346,7 +5472,7 @@ def close_position_safe(symbol: str, reason: str = "timeout"):
         logger.log_error("close_position_safe", str(e), "ERROR", symbol)
         return None
 
-def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp_price: float, reason: str, confluence_score: int = 0, fvg_signal: bool = False):
+def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp_price: float, reason: str, confluence_score: int = 0, fvg_signal: bool = False, strategy_hits: Optional[Dict[str, bool]] = None):
     """Safe trade execution with comprehensive logging"""
     comment_base = f"{config.MODE}_{direction}_{reason}"
     comment = sanitize_comment(comment_base)
@@ -5369,7 +5495,7 @@ def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp
             paper_engine.update_price(symbol, float(tick.bid), float(tick.ask))
             res = paper_engine.open_position(symbol, direction, lot, price, sl_price, tp_price, comment)
             ticket = res.get("order", 0)
-            trade_tracker.add_trade(ticket, symbol, direction, price, sl_price, tp_price, confluence_score, fvg_signal, lot)
+            trade_tracker.add_trade(ticket, symbol, direction, price, sl_price, tp_price, confluence_score, fvg_signal, lot, strategy_hits)
             logger.log_trade({
                 'symbol': symbol,
                 'direction': direction.upper(),
@@ -5495,7 +5621,7 @@ def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp
         
         ticket = getattr(res, 'order', 0)
         if ticket > 0:
-            trade_tracker.add_trade(ticket, symbol, direction, price, sl_price, tp_price, confluence_score, fvg_signal, lot)
+            trade_tracker.add_trade(ticket, symbol, direction, price, sl_price, tp_price, confluence_score, fvg_signal, lot, strategy_hits)
         
         return res
         
@@ -5734,6 +5860,11 @@ def check_closed_trades_enhanced():
                             
                             global_state.update_consecutive_losses(symbol, profit)
                             trade_tracker.update_consecutive_losses(profit)
+                            global_state.update_strategy_expectancy(
+                                symbol,
+                                trade_info.get("strategy_hits", {}),
+                                profit
+                            )
                             if performance_tracker:
                                 performance_tracker.record_trade(profit)
                             global_state.recent_performance.append(profit)
@@ -6427,6 +6558,14 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     lot = round_lot(symbol, config.LOT_FIXED)
                 elif config.DYNAMIC_POSITION_SIZING:
                     lot = calculate_position_size(symbol, entry_price, sl_price)
+                    smart_risk_mult = compute_smart_risk_multiplier(
+                        quality_score=quality_score,
+                        confluence_score=confluence_score,
+                        market_regime=market_regime,
+                        spread_ratio=spread_ratio,
+                        recent_performance=list(global_state.recent_performance),
+                    )
+                    lot = lot * smart_risk_mult
                     lot = global_state.adaptive_trading.adjust_position_size(
                         lot, list(global_state.recent_performance)
                     )
@@ -6435,6 +6574,10 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     lot = round_lot(symbol, config.LOT_FIXED)
                 
                 lot = round_lot(symbol, correlated_exposure_lot_adjustment(symbol, chosen_dir, lot))
+                if lot <= 0:
+                    logger.logger.warning(f"{nowstr()} {symbol}: invalid lot after adjustments, skipping trade")
+                    time.sleep(0.2)
+                    continue
 
                 potential_loss_usd = estimate_loss_usd(symbol, entry_price, sl_price, lot)
 
@@ -6476,6 +6619,16 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     confluence_score += config.FVG_CONFLUENCE_WEIGHT
                 if liquidity_signal_active:
                     confluence_score += config.LIQUIDITY_CONFLUENCE_WEIGHT
+
+                side_key = 'buy_signals' if chosen_dir == 'buy' else 'sell_signals'
+                selected_side = confluence_result.get(side_key, {})
+                strategy_hits = {
+                    'trend_following': bool(selected_side.get('trend')),
+                    'crt': bool(selected_side.get('crt')),
+                    'snr': bool(selected_side.get('snr')),
+                    'fvg': bool(selected_side.get('fvg')),
+                    'liquidity': bool(selected_side.get('liquidity')),
+                }
                 
                 if is_duplicate_trade_level(symbol, chosen_dir, entry_price, atr):
                     logger.logger.info(f"{nowstr()} {symbol}: duplicate level filter blocked entry at {entry_price:.5f}")
@@ -6487,7 +6640,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     continue
 
                 res = send_trade_safe(symbol, chosen_dir, lot, sl_price, tp_price, 
-                                    short_reason, confluence_score, fvg_signal_active)
+                                    short_reason, confluence_score, fvg_signal_active, strategy_hits)
                 
                 if res is None:
                     global_state.release_daily_trade_slot()
