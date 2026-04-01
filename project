@@ -4259,16 +4259,11 @@ class EnhancedGlobalState:
             return self.current_operating_mode
 
     def get_adaptive_trade_controls(self) -> Dict[str, Any]:
-        mode = self.refresh_operating_mode()
-        quality_delta = self.next_day_quality_bias + self.retune_quality_bias
-        trade_cap = config.MAX_DAILY_TRADES + self.next_day_trade_bias + self.retune_trade_bias
-        if mode == "attack":
-            quality_delta += -config.ADAPTIVE_QUALITY_DELTA
-            trade_cap += config.ADAPTIVE_DAILY_TRADE_DELTA
-        elif mode == "defensive":
-            quality_delta += config.ADAPTIVE_QUALITY_DELTA
-            trade_cap -= config.ADAPTIVE_DAILY_TRADE_DELTA
-        trade_cap = max(6, trade_cap)
+        # Mode-free controls: keep trade gating deterministic and equivalent to the
+        # classic behavior requested by the operator.
+        mode = "off"
+        quality_delta = 0.0
+        trade_cap = max(6, int(config.MAX_DAILY_TRADES))
         return {
             "mode": mode,
             "quality_delta": quality_delta,
@@ -6451,11 +6446,10 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 continue
             
             adaptive_controls = global_state.get_adaptive_trade_controls()
-            adaptive_mode = adaptive_controls['mode']
             adaptive_daily_cap = int(adaptive_controls['daily_trade_cap'])
 
             if global_state.daily_trades_count >= adaptive_daily_cap:
-                logger.logger.warning(f"{nowstr()} {symbol}: reached adaptive daily trade cap {adaptive_daily_cap} (mode={adaptive_mode})")
+                logger.logger.warning(f"{nowstr()} {symbol}: reached daily trade cap {adaptive_daily_cap}")
                 time.sleep(60)
                 continue
             
@@ -6556,7 +6550,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             logger.logger.info(f"{nowstr()} {symbol} | Price={bar['close']:.2f} | "
                              f"EMAfast={ema_fast_val:.3f} | EMAslow={ema_slow_val:.3f} | "
                              f"RSI={rsi_val:.2f} | ATR={atr_val:.4f} | "
-                             f"Regime={market_regime} | Confluence={confluence_result['confluence_score']}/5 | Mode={adaptive_mode}")
+                             f"Regime={market_regime} | Confluence={confluence_result['confluence_score']}/5")
             
             if last_bar_time is not None and bar['time'] == last_bar_time:
                 manage_hybrid_trailing_enhanced(symbol)
@@ -6851,7 +6845,8 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     logger.logger.info(f"{nowstr()} {symbol}: execution filter blocked entry (spread_ratio={spread_ratio:.2f} max={max_spread_ratio_allowed:.2f})")
                     time.sleep(0.2)
                     continue
-                if config.QUALITY_SCORE_HARD_BLOCK and quality_score < quality_min_required:
+                startup_quality_buffer = 5.0 if (forced_trade and startup_immediate_mode) else 0.0
+                if config.QUALITY_SCORE_HARD_BLOCK and (quality_score + startup_quality_buffer) < quality_min_required:
                     logger.logger.info(f"{nowstr()} {symbol}: quality gate blocked entry (score={quality_score:.1f}<{quality_min_required:.1f}, session={session_label}, forced={forced_trade})")
                     time.sleep(0.2)
                     continue
@@ -6899,7 +6894,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 
                 logger.logger.info(f"{nowstr()} {symbol} ATTEMPT {chosen_dir} lot={lot:.3f} "
                                  f"entry={entry_price:.5f} sl={sl_price:.5f} tp={tp_price:.5f} "
-                                 f"confluence={confluence_score}/5 quality={quality_score:.1f} session={session_label} mode={adaptive_mode} "
+                                 f"confluence={confluence_score}/5 quality={quality_score:.1f} session={session_label} "
                                  f"reason_key={reason_key} expectancy_delta={expectancy_quality_delta:.2f} daily_cap={adaptive_daily_cap} potential_loss=${potential_loss_usd:.2f}")
                 
                 short_reason = ""
@@ -7017,7 +7012,7 @@ def main_enhanced():
         logger.logger.info(f"  • Session filters enabled: {config.USE_SESSION_FILTERS}")
         logger.logger.info(f"  • Session quality thresholds: {config.SESSION_QUALITY_THRESHOLDS}")
         logger.logger.info(f"  • Reason blocker: enabled={config.REASON_BLOCK_ENABLED} min_trades={config.REASON_BLOCK_MIN_TRADES} max_win_rate={config.REASON_BLOCK_MAX_WIN_RATE}")
-        logger.logger.info(f"  • Adaptive mode: enabled={config.ADAPTIVE_MODE_ENABLED} lookback={config.ADAPTIVE_LOOKBACK_TRADES} attack_win_rate={config.ATTACK_MODE_MIN_WIN_RATE} defensive_win_rate={config.DEFENSIVE_MODE_MAX_WIN_RATE}")
+        logger.logger.info("  • Adaptive mode: OFF (mode-free execution)")
         logger.logger.info(f"  • Expectancy engine: enabled={config.EXPECTANCY_ENGINE_ENABLED} min_samples={config.EXPECTANCY_MIN_SAMPLES} quality_delta={config.EXPECTANCY_QUALITY_DELTA}")
         logger.logger.info(f"  • Daily KPI adaptation: enabled={config.DAILY_KPI_ADAPTATION_ENABLED} min_trades={config.KPI_MIN_TRADES_FOR_ADAPTATION} green_day={config.KPI_GREEN_DAY_PNL_USD} red_day={config.KPI_RED_DAY_PNL_USD}")
         logger.logger.info(f"  • Auto-retune: enabled={config.AUTO_RETUNE_ENABLED} min_reports={config.AUTO_RETUNE_MIN_REPORTS} lookback_days={config.AUTO_RETUNE_LOOKBACK_DAYS} quality_delta={config.AUTO_RETUNE_QUALITY_DELTA} trade_delta={config.AUTO_RETUNE_TRADE_DELTA}")
