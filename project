@@ -1051,6 +1051,12 @@ class BotConfig:
     AUTO_TUNE_WEIGHT_ADJUST_RATE: float = 0.20
     AUTO_TUNE_WEIGHT_MIN: float = 0.08
     AUTO_TUNE_WEIGHT_MAX: float = 0.60
+    ENFORCE_READINESS_GATE: bool = False
+    READINESS_MIN_TRADES: int = 40
+    READINESS_MIN_WIN_RATE: float = 48.0
+    READINESS_MIN_PROFIT_FACTOR: float = 1.20
+    READINESS_MIN_SHARPE: float = 0.20
+    READINESS_MAX_DRAWDOWN: float = 8.0
     
     # ==== Confluence Scoring ====
     MIN_CONFLUENCE_SCORE: int = 2
@@ -1160,6 +1166,16 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
             errors.append("PAPER_CONTRACT_SIZE must be greater than 0.")
     if bot_config.MAX_SPREAD_POINTS <= 0:
         errors.append("MAX_SPREAD_POINTS must be greater than 0.")
+    if bot_config.AUTO_TUNE_MIN_SAMPLES < 1:
+        errors.append("AUTO_TUNE_MIN_SAMPLES must be at least 1.")
+    if not (0 < bot_config.AUTO_TUNE_WEIGHT_ADJUST_RATE <= 1):
+        errors.append("AUTO_TUNE_WEIGHT_ADJUST_RATE must be between 0 and 1.")
+    if not (0 < bot_config.READINESS_MIN_WIN_RATE <= 100):
+        errors.append("READINESS_MIN_WIN_RATE must be between 0 and 100.")
+    if bot_config.READINESS_MIN_PROFIT_FACTOR <= 0:
+        errors.append("READINESS_MIN_PROFIT_FACTOR must be greater than 0.")
+    if bot_config.READINESS_MAX_DRAWDOWN <= 0:
+        errors.append("READINESS_MAX_DRAWDOWN must be greater than 0.")
     if bot_config.MIN_RISK_REWARD <= 0:
         errors.append("MIN_RISK_REWARD must be greater than 0.")
     if bot_config.MIN_RR_RATIO <= 0:
@@ -5961,6 +5977,12 @@ def print_daily_summary_enhanced():
         logger.logger.info(f"Max Drawdown: {global_state.max_drawdown:.2f}%")
         logger.logger.info(f"Consecutive Losses: {trade_tracker.consecutive_losses}/{config.CONSECUTIVE_LOSS_LIMIT}")
         logger.logger.info(f"Tracked Trades: {len(trade_tracker.trades)}")
+        readiness_ok, readiness_reason, readiness_snapshot = evaluate_readiness_gate()
+        logger.logger.info(
+            f"Readiness Gate: {'PASS' if readiness_ok else 'BLOCK'} ({readiness_reason}) "
+            f"[WR={readiness_snapshot['win_rate']:.1f}% PF={readiness_snapshot['profit_factor']:.2f} "
+            f"Sharpe={readiness_snapshot['sharpe_ratio']:.2f} DD={readiness_snapshot['max_drawdown']:.2f}%]"
+        )
         logger.logger.info("=" * 80)
         
         logger.log_performance({
@@ -5982,6 +6004,36 @@ def print_daily_summary_enhanced():
     except Exception as e:
         logger.logger.error(f"print_daily_summary_enhanced error: {e}")
         logger.log_error("print_daily_summary_enhanced", str(e), "ERROR")
+
+def get_readiness_snapshot() -> Dict[str, float]:
+    """Compute objective performance metrics used by readiness gate."""
+    trades = performance_tracker.total_trades if performance_tracker else 0
+    return {
+        "total_trades": float(trades),
+        "win_rate": float(performance_tracker.win_rate() if performance_tracker else 0.0),
+        "profit_factor": float(performance_tracker.profit_factor() if performance_tracker else 0.0),
+        "sharpe_ratio": float(performance_tracker.sharpe_ratio() if performance_tracker else 0.0),
+        "max_drawdown": float(global_state.max_drawdown if global_state else 0.0),
+    }
+
+def evaluate_readiness_gate() -> Tuple[bool, str, Dict[str, float]]:
+    """
+    Returns (allowed, reason, snapshot).
+    Gate blocks new entries when objective KPIs are below configured thresholds.
+    """
+    snap = get_readiness_snapshot()
+    total_trades = int(snap["total_trades"])
+    if total_trades < int(config.READINESS_MIN_TRADES):
+        return True, f"warmup({total_trades}/{config.READINESS_MIN_TRADES})", snap
+    if snap["win_rate"] < float(config.READINESS_MIN_WIN_RATE):
+        return False, f"win_rate {snap['win_rate']:.1f}% < {config.READINESS_MIN_WIN_RATE:.1f}%", snap
+    if snap["profit_factor"] < float(config.READINESS_MIN_PROFIT_FACTOR):
+        return False, f"profit_factor {snap['profit_factor']:.2f} < {config.READINESS_MIN_PROFIT_FACTOR:.2f}", snap
+    if snap["sharpe_ratio"] < float(config.READINESS_MIN_SHARPE):
+        return False, f"sharpe {snap['sharpe_ratio']:.2f} < {config.READINESS_MIN_SHARPE:.2f}", snap
+    if snap["max_drawdown"] > float(config.READINESS_MAX_DRAWDOWN):
+        return False, f"max_dd {snap['max_drawdown']:.2f}% > {config.READINESS_MAX_DRAWDOWN:.2f}%", snap
+    return True, "ready", snap
 
 # ==================== BACKTESTING FRAMEWORK ====================
 class BacktestEngine:
@@ -6186,6 +6238,15 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 logger.logger.warning(f"{nowstr()} {symbol}: Symbol consecutive loss limit reached")
                 time.sleep(60)
                 continue
+
+            if config.ENFORCE_READINESS_GATE:
+                ready, reason, _ = evaluate_readiness_gate()
+                if not ready:
+                    logger.logger.warning(f"{nowstr()} {symbol}: readiness gate blocked new entries ({reason})")
+                    manage_hybrid_trailing_enhanced(symbol)
+                    check_closed_trades_enhanced()
+                    time.sleep(30)
+                    continue
             
             total_positions = 0
             for sym in config.SYMBOLS:
