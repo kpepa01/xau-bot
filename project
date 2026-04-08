@@ -4069,6 +4069,7 @@ class EnhancedGlobalState:
         self.last_correlation_refresh = 0.0
         self.trade_memory_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'recent_trades.json')
         self.daily_trade_state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'daily_trade_state.json')
+        self.readiness_state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'readiness_state.json')
         self.recent_trade_levels: List[Dict[str, Any]] = self._load_recent_trade_levels()
         self.spread_history = {s: deque(maxlen=max(20, config.EXECUTION_SPREAD_WINDOW)) for s in config.SYMBOLS}
         self.strategy_expectancy: Dict[str, Dict[str, Dict[str, float]]] = {
@@ -4082,6 +4083,7 @@ class EnhancedGlobalState:
         }
         self.lock = threading.RLock()
         self._load_daily_trade_state()
+        self.persisted_readiness = self._load_readiness_state()
 
     def update_strategy_expectancy(self, symbol: str, strategy_hits: Dict[str, bool], profit: float) -> None:
         """Update per-strategy expectancy using closed-trade outcomes."""
@@ -4156,6 +4158,42 @@ class EnhancedGlobalState:
                 }, f, indent=2)
         except Exception as e:
             logger.log_error('_persist_daily_trade_state', str(e), 'WARNING')
+
+    def _load_readiness_state(self) -> Dict[str, float]:
+        try:
+            if not os.path.exists(self.readiness_state_file):
+                return {}
+            with open(self.readiness_state_file, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+            if not isinstance(state, dict):
+                return {}
+            return {
+                "total_trades": float(state.get("total_trades", 0.0)),
+                "win_rate": float(state.get("win_rate", 0.0)),
+                "profit_factor": float(state.get("profit_factor", 0.0)),
+                "sharpe_ratio": float(state.get("sharpe_ratio", 0.0)),
+                "max_drawdown": float(state.get("max_drawdown", 0.0)),
+            }
+        except Exception as e:
+            logger.log_error('_load_readiness_state', str(e), 'WARNING')
+            return {}
+
+    def persist_readiness_state(self, snapshot: Dict[str, float]) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.readiness_state_file), exist_ok=True)
+            clean = {
+                "updated_at": datetime.now().isoformat(),
+                "total_trades": float(snapshot.get("total_trades", 0.0)),
+                "win_rate": float(snapshot.get("win_rate", 0.0)),
+                "profit_factor": float(snapshot.get("profit_factor", 0.0)),
+                "sharpe_ratio": float(snapshot.get("sharpe_ratio", 0.0)),
+                "max_drawdown": float(snapshot.get("max_drawdown", 0.0)),
+            }
+            with open(self.readiness_state_file, 'w', encoding='utf-8') as f:
+                json.dump(clean, f, indent=2)
+            self.persisted_readiness = clean
+        except Exception as e:
+            logger.log_error('persist_readiness_state', str(e), 'WARNING')
 
     def try_reserve_daily_trade_slot(self, symbol: str) -> bool:
         """Atomically reserve one daily trade slot to enforce MAX_DAILY_TRADES across threads."""
@@ -5884,6 +5922,7 @@ def check_closed_trades_enhanced():
                             if performance_tracker:
                                 performance_tracker.record_trade(profit)
                             global_state.recent_performance.append(profit)
+                            global_state.persist_readiness_state(get_readiness_snapshot())
                             global_state.trade_learning.add_trade({
                                 "symbol": symbol,
                                 "profit": profit,
@@ -5983,6 +6022,7 @@ def print_daily_summary_enhanced():
             f"[WR={readiness_snapshot['win_rate']:.1f}% PF={readiness_snapshot['profit_factor']:.2f} "
             f"Sharpe={readiness_snapshot['sharpe_ratio']:.2f} DD={readiness_snapshot['max_drawdown']:.2f}%]"
         )
+        global_state.persist_readiness_state(readiness_snapshot)
         logger.logger.info("=" * 80)
         
         logger.log_performance({
@@ -6007,14 +6047,26 @@ def print_daily_summary_enhanced():
 
 def get_readiness_snapshot() -> Dict[str, float]:
     """Compute objective performance metrics used by readiness gate."""
-    trades = performance_tracker.total_trades if performance_tracker else 0
-    return {
-        "total_trades": float(trades),
+    in_mem = {
+        "total_trades": float(performance_tracker.total_trades if performance_tracker else 0.0),
         "win_rate": float(performance_tracker.win_rate() if performance_tracker else 0.0),
         "profit_factor": float(performance_tracker.profit_factor() if performance_tracker else 0.0),
         "sharpe_ratio": float(performance_tracker.sharpe_ratio() if performance_tracker else 0.0),
         "max_drawdown": float(global_state.max_drawdown if global_state else 0.0),
     }
+    persisted = getattr(global_state, "persisted_readiness", {}) if global_state else {}
+    persisted_trades = float(persisted.get("total_trades", 0.0) or 0.0)
+
+    # Prevent readiness bypass after restart: keep the richer sample source.
+    base = in_mem if in_mem["total_trades"] >= persisted_trades else {
+        "total_trades": persisted_trades,
+        "win_rate": float(persisted.get("win_rate", 0.0) or 0.0),
+        "profit_factor": float(persisted.get("profit_factor", 0.0) or 0.0),
+        "sharpe_ratio": float(persisted.get("sharpe_ratio", 0.0) or 0.0),
+        "max_drawdown": float(persisted.get("max_drawdown", 0.0) or 0.0),
+    }
+    base["max_drawdown"] = max(base["max_drawdown"], in_mem["max_drawdown"])
+    return base
 
 def evaluate_readiness_gate() -> Tuple[bool, str, Dict[str, float]]:
     """
