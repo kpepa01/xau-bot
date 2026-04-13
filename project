@@ -913,9 +913,9 @@ class BotConfig:
     SMART_TRAIL_MAX_GIVEBACK_USD: float = 2.5
     SMART_TRAIL_MIN_INCREMENT_USD: float = 1.25
     FAST_SL_MODE: bool = True
-    FAST_SL_START_MULT: float = 0.70
-    FAST_SL_LOCK_BOOST: float = 0.08
-    FAST_SL_MIN_INCREMENT_MULT: float = 0.80
+    FAST_SL_START_MULT: float = 0.85
+    FAST_SL_LOCK_BOOST: float = 0.04
+    FAST_SL_MIN_INCREMENT_MULT: float = 0.90
     DYNAMIC_TP_TRENDING_ATR_MULT: float = 2.0
     DYNAMIC_TP_RANGING_ATR_MULT: float = 1.0
     DYNAMIC_TP_VOLATILE_ATR_MULT: float = 1.4
@@ -1173,6 +1173,12 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
             errors.append("PAPER_CONTRACT_SIZE must be greater than 0.")
     if bot_config.MAX_SPREAD_POINTS <= 0:
         errors.append("MAX_SPREAD_POINTS must be greater than 0.")
+    if bot_config.AUTO_TUNE_EXPECTANCY_CLAMP <= 0:
+        errors.append("AUTO_TUNE_EXPECTANCY_CLAMP must be greater than 0.")
+    if bot_config.AUTO_TUNE_WEIGHT_MIN <= 0 or bot_config.AUTO_TUNE_WEIGHT_MAX <= 0:
+        errors.append("AUTO_TUNE weight bounds must be greater than 0.")
+    if bot_config.AUTO_TUNE_WEIGHT_MIN > bot_config.AUTO_TUNE_WEIGHT_MAX:
+        errors.append("AUTO_TUNE_WEIGHT_MIN cannot exceed AUTO_TUNE_WEIGHT_MAX.")
     if bot_config.AUTO_TUNE_MIN_SAMPLES < 1:
         errors.append("AUTO_TUNE_MIN_SAMPLES must be at least 1.")
     if not (0 < bot_config.AUTO_TUNE_WEIGHT_ADJUST_RATE <= 1):
@@ -1195,6 +1201,10 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("RELAX_MIN_TREND_STRENGTH must be between 0 and 1.")
     if not (0 < bot_config.RISK_PER_TRADE_PCT <= 100):
         errors.append("RISK_PER_TRADE_PCT must be between 0 and 100.")
+    if bot_config.RISK_SCALE_MIN <= 0 or bot_config.RISK_SCALE_MAX <= 0:
+        errors.append("RISK_SCALE_MIN/MAX must be greater than 0.")
+    if bot_config.RISK_SCALE_MIN > bot_config.RISK_SCALE_MAX:
+        errors.append("RISK_SCALE_MIN cannot exceed RISK_SCALE_MAX.")
     if not (0.2 <= bot_config.FAST_SL_START_MULT <= 1.0):
         errors.append("FAST_SL_START_MULT must be between 0.2 and 1.0.")
     if not (0.0 <= bot_config.FAST_SL_LOCK_BOOST <= 0.2):
@@ -1403,7 +1413,7 @@ class AutomatedLogger:
             writer = csv.writer(f)
             writer.writerow([
                 'timestamp', 'symbol', 'trend_signals', 'crt_signals', 'snr_signals',
-                'fvg_signals', 'liquidity_signals', 'confluence_score', 'market_regime', 'final_decision', 'action_taken'
+                'fvg_signals', 'liquidity_signals', 'confluence_score', 'market_regime', 'final_decision', 'action_taken', 'dynamic_weights'
             ])
         
         # FVG Signals Log
@@ -1611,7 +1621,8 @@ class AutomatedLogger:
                     confluence_data.get('confluence_score', 0),
                     confluence_data.get('market_regime', ''),
                     confluence_data.get('final_decision', ''),
-                    confluence_data.get('action_taken', '')
+                    confluence_data.get('action_taken', ''),
+                    confluence_data.get('dynamic_weights', '')
                 ])
         except Exception as e:
             self.logger.error(f"Failed to log confluence: {e}")
@@ -4102,6 +4113,7 @@ class EnhancedGlobalState:
         self.lock = threading.RLock()
         self._load_daily_trade_state()
         self.persisted_readiness = self._load_readiness_state()
+        self.readiness_baseline = dict(self.persisted_readiness) if isinstance(self.persisted_readiness, dict) else {}
 
     def update_strategy_expectancy(self, symbol: str, strategy_hits: Dict[str, bool], profit: float) -> None:
         """Update per-strategy expectancy using closed-trade outcomes."""
@@ -4144,11 +4156,55 @@ class EnhancedGlobalState:
             capped = max(-config.AUTO_TUNE_EXPECTANCY_CLAMP, min(config.AUTO_TUNE_EXPECTANCY_CLAMP, expectancy))
             nudged = tuned[strategy_name] * (1.0 + (capped / config.AUTO_TUNE_EXPECTANCY_CLAMP) * config.AUTO_TUNE_WEIGHT_ADJUST_RATE)
             tuned[strategy_name] = max(config.AUTO_TUNE_WEIGHT_MIN, min(config.AUTO_TUNE_WEIGHT_MAX, nudged))
+        keys = list(tuned.keys())
+        if not keys:
+            return tuned
 
-        total = sum(tuned.values())
-        if total > 0:
-            tuned = {k: float(v) / total for k, v in tuned.items()}
-        return tuned
+        lb = float(config.AUTO_TUNE_WEIGHT_MIN)
+        ub = float(config.AUTO_TUNE_WEIGHT_MAX)
+        n = len(keys)
+
+        if (lb * n) > 1.0 or (ub * n) < 1.0:
+            total = sum(tuned.values())
+            return ({k: float(v) / total for k, v in tuned.items()} if total > 0 else tuned)
+
+        projected = {k: max(lb, min(ub, float(tuned[k]))) for k in keys}
+        fixed: Dict[str, float] = {}
+        free = set(keys)
+
+        while free:
+            remaining = 1.0 - sum(fixed.values())
+            if remaining <= 0:
+                break
+            free_sum = sum(projected[k] for k in free)
+            if free_sum <= 0:
+                equal = remaining / len(free)
+                for k in list(free):
+                    projected[k] = equal
+            else:
+                for k in list(free):
+                    projected[k] = remaining * (projected[k] / free_sum)
+
+            changed = False
+            for k in list(free):
+                if projected[k] < lb:
+                    fixed[k] = lb
+                    free.remove(k)
+                    changed = True
+                elif projected[k] > ub:
+                    fixed[k] = ub
+                    free.remove(k)
+                    changed = True
+            if not changed:
+                break
+
+        for k in free:
+            fixed[k] = projected[k]
+        total = sum(fixed.values())
+        if total <= 0:
+            return tuned
+        normalized = {k: fixed[k] / total for k in keys}
+        return {k: max(lb, min(ub, normalized[k])) for k in keys}
 
     def _load_daily_trade_state(self) -> None:
         """Load persisted daily trade counter so restarts do not bypass MAX_DAILY_TRADES."""
@@ -5924,50 +5980,54 @@ def check_closed_trades_enhanced():
         for ticket in list(trade_tracker.trades.keys()):
             if ticket not in active_tickets:
                 tickets_to_remove.append(ticket)
+
+        closed_deals = paper_engine.get_closed_deals() if config.PAPER_TRADING_ENABLED else mt5.history_deals_get(datetime.now() - timedelta(hours=1), datetime.now())
+        deals_by_ticket: Dict[int, Any] = {}
+        if closed_deals:
+            for deal in closed_deals:
+                deal_ticket = getattr(deal, "ticket", None) if not isinstance(deal, dict) else deal.get("ticket")
+                if deal_ticket is None:
+                    continue
+                deals_by_ticket[int(deal_ticket)] = deal
         
         for ticket in tickets_to_remove:
             trade_info = trade_tracker.get_trade(ticket)
             if trade_info:
                 symbol = trade_info['symbol']
-                
-                deals = paper_engine.get_closed_deals() if config.PAPER_TRADING_ENABLED else mt5.history_deals_get(datetime.now() - timedelta(hours=1), datetime.now())
-                if deals:
-                    for deal in deals:
-                        deal_ticket = getattr(deal, "ticket", None) if not isinstance(deal, dict) else deal.get("ticket")
-                        if deal_ticket == ticket:
-                            profit = getattr(deal, "profit", 0.0) if not isinstance(deal, dict) else deal.get("profit", 0.0)
-                            comment = getattr(deal, "comment", "") if not isinstance(deal, dict) else deal.get("comment", "")
-                            
-                            signal_type = "unknown"
-                            parts = comment.split("_")
-                            if len(parts) >= 3:
-                                signal_type = parts[2]
-                            
-                            outcome = "win" if profit > 0 else "loss"
-                            global_state.update_learning(symbol, signal_type, outcome)
-                            
-                            global_state.update_consecutive_losses(symbol, profit)
-                            trade_tracker.update_consecutive_losses(profit)
-                            global_state.update_strategy_expectancy(
-                                symbol,
-                                trade_info.get("strategy_hits", {}),
-                                profit
-                            )
-                            if performance_tracker:
-                                performance_tracker.record_trade(profit)
-                            global_state.recent_performance.append(profit)
-                            global_state.persist_readiness_state(get_readiness_snapshot())
-                            global_state.trade_learning.add_trade({
-                                "symbol": symbol,
-                                "profit": profit,
-                                "market_regime": global_state.market_regimes.get(symbol, "unknown"),
-                                "time_of_day": datetime.now().strftime("%H:%M"),
-                                "confluence_score": trade_info.get("confluence_score", 0)
-                            })
-                            global_state.trade_learning.analyze_trade_patterns()
-                            
-                            logger.logger.info(f"Trade {ticket} closed: ${profit:.2f} ({outcome})")
-                            break
+                deal = deals_by_ticket.get(int(ticket))
+                if deal is not None:
+                    profit = getattr(deal, "profit", 0.0) if not isinstance(deal, dict) else deal.get("profit", 0.0)
+                    comment = getattr(deal, "comment", "") if not isinstance(deal, dict) else deal.get("comment", "")
+                    
+                    signal_type = "unknown"
+                    parts = comment.split("_")
+                    if len(parts) >= 3:
+                        signal_type = parts[2]
+                    
+                    outcome = "win" if profit > 0 else "loss"
+                    global_state.update_learning(symbol, signal_type, outcome)
+                    
+                    global_state.update_consecutive_losses(symbol, profit)
+                    trade_tracker.update_consecutive_losses(profit)
+                    global_state.update_strategy_expectancy(
+                        symbol,
+                        trade_info.get("strategy_hits", {}),
+                        profit
+                    )
+                    if performance_tracker:
+                        performance_tracker.record_trade(profit)
+                    global_state.recent_performance.append(profit)
+                    global_state.persist_readiness_state(get_readiness_snapshot())
+                    global_state.trade_learning.add_trade({
+                        "symbol": symbol,
+                        "profit": profit,
+                        "market_regime": global_state.market_regimes.get(symbol, "unknown"),
+                        "time_of_day": datetime.now().strftime("%H:%M"),
+                        "confluence_score": trade_info.get("confluence_score", 0)
+                    })
+                    global_state.trade_learning.analyze_trade_patterns()
+                    
+                    logger.logger.info(f"Trade {ticket} closed: ${profit:.2f} ({outcome})")
             
             trade_tracker.remove_trade(ticket)
             logger.logger.debug(f"Removed closed trade {ticket} from tracker")
@@ -6081,26 +6141,33 @@ def print_daily_summary_enhanced():
 
 def get_readiness_snapshot() -> Dict[str, float]:
     """Compute objective performance metrics used by readiness gate."""
-    in_mem = {
-        "total_trades": float(performance_tracker.total_trades if performance_tracker else 0.0),
-        "win_rate": float(performance_tracker.win_rate() if performance_tracker else 0.0),
-        "profit_factor": float(performance_tracker.profit_factor() if performance_tracker else 0.0),
-        "sharpe_ratio": float(performance_tracker.sharpe_ratio() if performance_tracker else 0.0),
-        "max_drawdown": float(global_state.max_drawdown if global_state else 0.0),
-    }
-    persisted = getattr(global_state, "persisted_readiness", {}) if global_state else {}
-    persisted_trades = float(persisted.get("total_trades", 0.0) or 0.0)
+    run_trades = float(performance_tracker.total_trades if performance_tracker else 0.0)
+    run_wr = float(performance_tracker.win_rate() if performance_tracker else 0.0)
+    run_pf = float(performance_tracker.profit_factor() if performance_tracker else 0.0)
+    run_sharpe = float(performance_tracker.sharpe_ratio() if performance_tracker else 0.0)
+    run_dd = float(global_state.max_drawdown if global_state else 0.0)
 
-    # Prevent readiness bypass after restart: keep the richer sample source.
-    base = in_mem if in_mem["total_trades"] >= persisted_trades else {
-        "total_trades": persisted_trades,
-        "win_rate": float(persisted.get("win_rate", 0.0) or 0.0),
-        "profit_factor": float(persisted.get("profit_factor", 0.0) or 0.0),
-        "sharpe_ratio": float(persisted.get("sharpe_ratio", 0.0) or 0.0),
-        "max_drawdown": float(persisted.get("max_drawdown", 0.0) or 0.0),
+    baseline = getattr(global_state, "readiness_baseline", {}) if global_state else {}
+    base_trades = float(baseline.get("total_trades", 0.0) or 0.0)
+    base_wr = float(baseline.get("win_rate", 0.0) or 0.0)
+    base_pf = float(baseline.get("profit_factor", 0.0) or 0.0)
+    base_sharpe = float(baseline.get("sharpe_ratio", 0.0) or 0.0)
+    base_dd = float(baseline.get("max_drawdown", 0.0) or 0.0)
+
+    total = base_trades + run_trades
+    if total <= 0:
+        return {"total_trades": 0.0, "win_rate": 0.0, "profit_factor": 0.0, "sharpe_ratio": 0.0, "max_drawdown": max(base_dd, run_dd)}
+
+    wr = ((base_wr * base_trades) + (run_wr * run_trades)) / total
+    pf = ((base_pf * base_trades) + (run_pf * run_trades)) / total
+    sharpe = ((base_sharpe * base_trades) + (run_sharpe * run_trades)) / total
+    return {
+        "total_trades": total,
+        "win_rate": wr,
+        "profit_factor": pf,
+        "sharpe_ratio": sharpe,
+        "max_drawdown": max(base_dd, run_dd),
     }
-    base["max_drawdown"] = max(base["max_drawdown"], in_mem["max_drawdown"])
-    return base
 
 def evaluate_readiness_gate() -> Tuple[bool, str, Dict[str, float]]:
     """
