@@ -912,6 +912,10 @@ class BotConfig:
     SMART_TRAIL_LOCK_RATIO: float = 0.82
     SMART_TRAIL_MAX_GIVEBACK_USD: float = 2.5
     SMART_TRAIL_MIN_INCREMENT_USD: float = 1.25
+    FAST_SL_MODE: bool = True
+    FAST_SL_START_MULT: float = 0.70
+    FAST_SL_LOCK_BOOST: float = 0.08
+    FAST_SL_MIN_INCREMENT_MULT: float = 0.80
     DYNAMIC_TP_TRENDING_ATR_MULT: float = 2.0
     DYNAMIC_TP_RANGING_ATR_MULT: float = 1.0
     DYNAMIC_TP_VOLATILE_ATR_MULT: float = 1.4
@@ -921,6 +925,7 @@ class BotConfig:
 
     # ==== Daily Protection ====
     DAILY_LOSS_PCT: float = 5.0
+    DAILY_LOSS_USD_LIMIT: float = 30.0
     DAILY_LOSS_HARD_STOP: bool = False
     DAILY_PROFIT_PCT: float = 3.0
     MAX_DRAWDOWN_PCT: float = 5.0
@@ -1155,6 +1160,8 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("MIN_CONFLUENCE_SCORE must be at least 1.")
     if not (0 <= bot_config.DAILY_LOSS_PCT <= 100):
         errors.append("DAILY_LOSS_PCT must be between 0 and 100.")
+    if bot_config.DAILY_LOSS_USD_LIMIT < 0:
+        errors.append("DAILY_LOSS_USD_LIMIT cannot be negative.")
     if not (0 <= bot_config.DAILY_PROFIT_PCT <= 100):
         errors.append("DAILY_PROFIT_PCT must be between 0 and 100.")
     if not (0 <= bot_config.MAX_DRAWDOWN_PCT <= 100):
@@ -1188,6 +1195,12 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("RELAX_MIN_TREND_STRENGTH must be between 0 and 1.")
     if not (0 < bot_config.RISK_PER_TRADE_PCT <= 100):
         errors.append("RISK_PER_TRADE_PCT must be between 0 and 100.")
+    if not (0.2 <= bot_config.FAST_SL_START_MULT <= 1.0):
+        errors.append("FAST_SL_START_MULT must be between 0.2 and 1.0.")
+    if not (0.0 <= bot_config.FAST_SL_LOCK_BOOST <= 0.2):
+        errors.append("FAST_SL_LOCK_BOOST must be between 0.0 and 0.2.")
+    if not (0.4 <= bot_config.FAST_SL_MIN_INCREMENT_MULT <= 1.2):
+        errors.append("FAST_SL_MIN_INCREMENT_MULT must be between 0.4 and 1.2.")
     if bot_config.MIN_RISK_PER_TRADE_USD < 0:
         errors.append("MIN_RISK_PER_TRADE_USD cannot be negative.")
     if bot_config.MIN_SMC_CONFLUENCE < 0:
@@ -2911,6 +2924,8 @@ class TradeTracker:
             logger.logger.debug(f"Trade {ticket}: {current_profit_pips:.1f} pips profit, ${current_profit_usd:.2f} USD")
 
             start_usd = max(0.5, float(config.SMART_TRAIL_START_USD))
+            if config.FAST_SL_MODE:
+                start_usd = max(0.35, start_usd * float(config.FAST_SL_START_MULT))
             if current_profit_usd < start_usd:
                 return None
 
@@ -2918,6 +2933,9 @@ class TradeTracker:
             lock_ratio = min(0.95, max(0.50, float(config.SMART_TRAIL_LOCK_RATIO)))
             max_giveback = max(0.5, float(config.SMART_TRAIL_MAX_GIVEBACK_USD))
             min_increment = max(0.25, float(config.SMART_TRAIL_MIN_INCREMENT_USD))
+            if config.FAST_SL_MODE:
+                lock_ratio = min(0.95, lock_ratio + float(config.FAST_SL_LOCK_BOOST))
+                min_increment = max(0.15, min_increment * float(config.FAST_SL_MIN_INCREMENT_MULT))
 
             if current_profit_usd < (start_usd * 2):
                 lock_usd = be_buffer
@@ -4495,6 +4513,7 @@ class EnhancedGlobalState:
                     daily_reference = max(1e-6, self.peak_equity if self.peak_equity > 0 else STARTING_BALANCE)
                     equity_drawdown_pct = ((current_equity - daily_reference) / daily_reference) * 100.0
                     profit_pct = ((current_balance - STARTING_BALANCE) / max(1e-6, STARTING_BALANCE)) * 100.0
+                    pnl_usd = current_balance - STARTING_BALANCE
 
                     if equity_drawdown_pct <= -config.DAILY_LOSS_PCT:
                         self.daily_loss_triggered = bool(config.DAILY_LOSS_HARD_STOP)
@@ -4506,6 +4525,21 @@ class EnhancedGlobalState:
                         logger.log_error("update_daily_stats", 
                                        f"Daily loss/cooldown {equity_drawdown_pct:.2f}% triggered",
                                        "CRITICAL")
+
+                    if config.DAILY_LOSS_USD_LIMIT > 0 and pnl_usd <= -config.DAILY_LOSS_USD_LIMIT:
+                        self.daily_loss_triggered = bool(config.DAILY_LOSS_HARD_STOP)
+                        self.circuit_breaker_until = max(
+                            self.circuit_breaker_until,
+                            time.time() + config.CIRCUIT_BREAKER_COOL_OFF_MINUTES * 60,
+                        )
+                        logger.logger.warning(
+                            f"Daily USD loss/cooldown triggered: ${pnl_usd:.2f} <= -${config.DAILY_LOSS_USD_LIMIT:.2f}"
+                        )
+                        logger.log_error(
+                            "update_daily_stats",
+                            f"Daily USD loss/cooldown ${pnl_usd:.2f} triggered",
+                            "CRITICAL",
+                        )
                     
                     if self.max_drawdown >= config.MAX_DRAWDOWN_PCT:
                         self.daily_loss_triggered = True
