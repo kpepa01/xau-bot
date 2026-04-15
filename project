@@ -916,12 +916,19 @@ class BotConfig:
     FAST_SL_START_MULT: float = 0.85
     FAST_SL_LOCK_BOOST: float = 0.04
     FAST_SL_MIN_INCREMENT_MULT: float = 0.90
+    FAST_SL_PIPS_PRECISION_TRIGGER: float = 20.0
+    FAST_SL_PRECISION_LOCK_RATIO: float = 0.68
     DYNAMIC_TP_TRENDING_ATR_MULT: float = 2.0
     DYNAMIC_TP_RANGING_ATR_MULT: float = 1.0
     DYNAMIC_TP_VOLATILE_ATR_MULT: float = 1.4
     ENTRY_MAX_DISTANCE_ATR: float = 0.85
     ENTRY_RSI_BUY_MAX: float = 72.0
     ENTRY_RSI_SELL_MIN: float = 28.0
+    PRECISION_MODE_ENABLED: bool = True
+    PRECISION_MIN_QUALITY_BUFFER: float = 0.3
+    PRECISION_MIN_MOMENTUM_STRENGTH: float = 0.65
+    PRECISION_RSI_CENTER_BUFFER: float = 3.0
+    PRECISION_MAX_ENTRY_DISTANCE_ATR: float = 0.25
 
     # ==== Daily Protection ====
     DAILY_LOSS_PCT: float = 5.0
@@ -1211,6 +1218,18 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("FAST_SL_LOCK_BOOST must be between 0.0 and 0.2.")
     if not (0.4 <= bot_config.FAST_SL_MIN_INCREMENT_MULT <= 1.2):
         errors.append("FAST_SL_MIN_INCREMENT_MULT must be between 0.4 and 1.2.")
+    if bot_config.FAST_SL_PIPS_PRECISION_TRIGGER < 0:
+        errors.append("FAST_SL_PIPS_PRECISION_TRIGGER cannot be negative.")
+    if not (0.5 <= bot_config.FAST_SL_PRECISION_LOCK_RATIO <= 0.9):
+        errors.append("FAST_SL_PRECISION_LOCK_RATIO must be between 0.5 and 0.9.")
+    if bot_config.PRECISION_MIN_QUALITY_BUFFER < 0:
+        errors.append("PRECISION_MIN_QUALITY_BUFFER cannot be negative.")
+    if not (0 <= bot_config.PRECISION_MIN_MOMENTUM_STRENGTH <= 1.0):
+        errors.append("PRECISION_MIN_MOMENTUM_STRENGTH must be between 0.0 and 1.0.")
+    if not (0 <= bot_config.PRECISION_RSI_CENTER_BUFFER <= 20.0):
+        errors.append("PRECISION_RSI_CENTER_BUFFER must be between 0 and 20.")
+    if not (0 < bot_config.PRECISION_MAX_ENTRY_DISTANCE_ATR <= 1.5):
+        errors.append("PRECISION_MAX_ENTRY_DISTANCE_ATR must be between 0 and 1.5.")
     if bot_config.MIN_RISK_PER_TRADE_USD < 0:
         errors.append("MIN_RISK_PER_TRADE_USD cannot be negative.")
     if bot_config.MIN_SMC_CONFLUENCE < 0:
@@ -2957,6 +2976,10 @@ class TradeTracker:
             else:
                 lock_usd = max(current_profit_usd * lock_ratio, current_profit_usd - max_giveback)
                 reason = "smart_trail_runner_lock"
+
+            if config.FAST_SL_MODE and current_profit_pips >= float(config.FAST_SL_PIPS_PRECISION_TRIGGER):
+                lock_usd = max(lock_usd, current_profit_usd * float(config.FAST_SL_PRECISION_LOCK_RATIO))
+                reason = "smart_trail_precision_lock"
 
             lock_usd = min(lock_usd, max(0.0, current_profit_usd - min_increment))
             if lock_usd <= 0:
@@ -6548,6 +6571,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 logger.logger.info(f"{nowstr()} {symbol}: FORCE TRADE -> {chosen_dir}")
                 forced_trade = True
             
+            momentum_strength = 0.0
             if chosen_dir:
                 ok_fire, fire_reason = evaluate_fire_conditions(confluence_result, chosen_dir)
                 if not ok_fire and not forced_trade:
@@ -6577,6 +6601,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 
                 if config.MOMENTUM_CONFIRMATION_REQUIRED and not forced_trade:
                     confirmed, strength = calculate_momentum_strength(df, chosen_dir)
+                    momentum_strength = float(strength)
                     min_momentum = config.RELAX_MIN_MOMENTUM if relax_mode else config.MIN_MOMENTUM_STRENGTH
                     if not confirmed or strength < min_momentum:
                         logger.logger.info(f"{nowstr()} {symbol}: momentum filter failed strength={strength:.2f}")
@@ -6757,6 +6782,42 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                         logger.logger.info(f"{nowstr()} {symbol}: quality gate blocked entry (score={quality_score:.1f}<{dynamic_quality_min:.1f})")
                         time.sleep(0.2)
                         continue
+                    if config.PRECISION_MODE_ENABLED:
+                        precision_quality_min = dynamic_quality_min + float(config.PRECISION_MIN_QUALITY_BUFFER)
+                        if quality_score < precision_quality_min:
+                            logger.logger.info(
+                                f"{nowstr()} {symbol}: precision gate blocked (quality {quality_score:.2f} < {precision_quality_min:.2f})"
+                            )
+                            time.sleep(0.2)
+                            continue
+                        if config.MOMENTUM_CONFIRMATION_REQUIRED and momentum_strength < float(config.PRECISION_MIN_MOMENTUM_STRENGTH):
+                            logger.logger.info(
+                                f"{nowstr()} {symbol}: precision gate blocked (momentum {momentum_strength:.2f} < {config.PRECISION_MIN_MOMENTUM_STRENGTH:.2f})"
+                            )
+                            time.sleep(0.2)
+                            continue
+                        if pd.notna(rsi_val):
+                            center = 50.0
+                            buffer = float(config.PRECISION_RSI_CENTER_BUFFER)
+                            if chosen_dir == 'buy' and rsi_val < (center + buffer):
+                                logger.logger.info(
+                                    f"{nowstr()} {symbol}: precision gate blocked (RSI {rsi_val:.2f} not above {center + buffer:.2f} for buy)"
+                                )
+                                time.sleep(0.2)
+                                continue
+                            if chosen_dir == 'sell' and rsi_val > (center - buffer):
+                                logger.logger.info(
+                                    f"{nowstr()} {symbol}: precision gate blocked (RSI {rsi_val:.2f} not below {center - buffer:.2f} for sell)"
+                                )
+                                time.sleep(0.2)
+                                continue
+                        atr_entry_dist = abs(entry_price - float(bar.get('close', entry_price))) / max(float(atr), 1e-9)
+                        if atr_entry_dist > float(config.PRECISION_MAX_ENTRY_DISTANCE_ATR):
+                            logger.logger.info(
+                                f"{nowstr()} {symbol}: precision gate blocked (entry distance {atr_entry_dist:.2f} ATR > {config.PRECISION_MAX_ENTRY_DISTANCE_ATR:.2f})"
+                            )
+                            time.sleep(0.2)
+                            continue
                     if not global_state.trade_filter.filter_trade(
                         {"direction": chosen_dir},
                         market_data,
