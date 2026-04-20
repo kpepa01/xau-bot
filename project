@@ -1069,6 +1069,10 @@ class BotConfig:
     READINESS_MIN_PROFIT_FACTOR: float = 1.20
     READINESS_MIN_SHARPE: float = 0.20
     READINESS_MAX_DRAWDOWN: float = 8.0
+    LIVE_ACCOUNT_MODE: bool = env_bool("LIVE_ACCOUNT_MODE", False)
+    LIVE_BLOCK_DURING_READINESS_WARMUP: bool = True
+    LIVE_REQUIRE_READINESS_GATE: bool = True
+    LIVE_REQUIRE_DAILY_HARD_STOP: bool = True
     
     # ==== Confluence Scoring ====
     MIN_CONFLUENCE_SCORE: int = 2
@@ -1254,7 +1258,29 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         formatted = "\n".join(f"- {err}" for err in errors)
         raise SystemExit(f"Configuration validation failed:\n{formatted}")
 
+def validate_live_safety_or_exit(bot_config: BotConfig) -> None:
+    """Fail-fast guardrails for real-money execution."""
+    if not bot_config.LIVE_ACCOUNT_MODE:
+        return
+
+    errors = []
+    if bot_config.PAPER_TRADING_ENABLED or bot_config.BACKTEST_MODE:
+        errors.append("LIVE_ACCOUNT_MODE cannot be used with PAPER_TRADING_ENABLED or BACKTEST_MODE.")
+    if bot_config.LIVE_REQUIRE_READINESS_GATE and not bot_config.ENFORCE_READINESS_GATE:
+        errors.append("LIVE_ACCOUNT_MODE requires ENFORCE_READINESS_GATE=True.")
+    if bot_config.LIVE_REQUIRE_DAILY_HARD_STOP and not bot_config.DAILY_LOSS_HARD_STOP:
+        errors.append("LIVE_ACCOUNT_MODE requires DAILY_LOSS_HARD_STOP=True.")
+    if bot_config.DAILY_LOSS_USD_LIMIT <= 0:
+        errors.append("LIVE_ACCOUNT_MODE requires DAILY_LOSS_USD_LIMIT > 0.")
+    if bot_config.MAX_LOSS_PER_TRADE <= 0:
+        errors.append("LIVE_ACCOUNT_MODE requires MAX_LOSS_PER_TRADE > 0.")
+
+    if errors:
+        formatted = "\n".join(f"- {err}" for err in errors)
+        raise SystemExit(f"Live safety validation failed:\n{formatted}")
+
 validate_config_or_exit(config)
+validate_live_safety_or_exit(config)
 
 # ==================== AUTOMATED LOGGING SETUP ====================
 class AutomatedLogger:
@@ -4226,8 +4252,35 @@ class EnhancedGlobalState:
         total = sum(fixed.values())
         if total <= 0:
             return tuned
-        normalized = {k: fixed[k] / total for k in keys}
-        return {k: max(lb, min(ub, normalized[k])) for k in keys}
+        normalized = {k: max(lb, min(ub, (fixed[k] / total))) for k in keys}
+
+        residual = 1.0 - sum(normalized.values())
+        if abs(residual) > 1e-9:
+            if residual > 0:
+                adjustable = sorted(keys, key=lambda k: (ub - normalized[k]), reverse=True)
+                for k in adjustable:
+                    room = ub - normalized[k]
+                    if room <= 0:
+                        continue
+                    add = min(room, residual)
+                    normalized[k] += add
+                    residual -= add
+                    if residual <= 1e-9:
+                        break
+            else:
+                adjustable = sorted(keys, key=lambda k: (normalized[k] - lb), reverse=True)
+                need = -residual
+                for k in adjustable:
+                    room = normalized[k] - lb
+                    if room <= 0:
+                        continue
+                    sub = min(room, need)
+                    normalized[k] -= sub
+                    need -= sub
+                    if need <= 1e-9:
+                        break
+
+        return normalized
 
     def _load_daily_trade_state(self) -> None:
         """Load persisted daily trade counter so restarts do not bypass MAX_DAILY_TRADES."""
@@ -6416,7 +6469,14 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 continue
 
             if config.ENFORCE_READINESS_GATE:
-                ready, reason, _ = evaluate_readiness_gate()
+                ready, reason, snap = evaluate_readiness_gate()
+                if (
+                    config.LIVE_ACCOUNT_MODE
+                    and config.LIVE_BLOCK_DURING_READINESS_WARMUP
+                    and int(snap.get("total_trades", 0)) < int(config.READINESS_MIN_TRADES)
+                ):
+                    ready = False
+                    reason = f"live_warmup_block({int(snap.get('total_trades', 0))}/{int(config.READINESS_MIN_TRADES)})"
                 if not ready:
                     logger.logger.warning(f"{nowstr()} {symbol}: readiness gate blocked new entries ({reason})")
                     manage_hybrid_trailing_enhanced(symbol)
