@@ -811,6 +811,7 @@ class BotConfig:
 
     # ==== Symbols & Timeframes ====
     SYMBOLS: List[str] = field(default_factory=lambda: ["XAUUSD", "XAUJPY"])
+    ENABLE_BROKER_SYMBOL_MAPPING: bool = True
     ENTRY_TF: int = mt5.TIMEFRAME_M5
     HTF_TF: int = mt5.TIMEFRAME_M15
 
@@ -1077,6 +1078,8 @@ class BotConfig:
     # ==== Confluence Scoring ====
     MIN_CONFLUENCE_SCORE: int = 2
     IDEAL_CONFLUENCE_SCORE: int = 3
+    STRATEGY_COMPONENT_MIN_SCORE: float = 0.12
+    STRATEGY_MIN_COMPONENTS_REQUIRED: int = 2
 
     # ==== LIQUIDITY SMC Strategy Settings ====
     LIQUIDITY_SMC_ENABLED: bool = True
@@ -1240,6 +1243,10 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("MIN_SMC_CONFLUENCE cannot be negative.")
     if bot_config.MIN_CLASSIC_CONFLUENCE < 0:
         errors.append("MIN_CLASSIC_CONFLUENCE cannot be negative.")
+    if bot_config.STRATEGY_COMPONENT_MIN_SCORE < 0:
+        errors.append("STRATEGY_COMPONENT_MIN_SCORE cannot be negative.")
+    if bot_config.STRATEGY_MIN_COMPONENTS_REQUIRED < 1:
+        errors.append("STRATEGY_MIN_COMPONENTS_REQUIRED must be at least 1.")
     if bot_config.MAX_TRADE_DURATION_MINUTES <= 0:
         errors.append("MAX_TRADE_DURATION_MINUTES must be greater than 0.")
     if bot_config.TRAIL_PROFIT_STEP_USD <= 0:
@@ -1458,7 +1465,7 @@ class AutomatedLogger:
             writer = csv.writer(f)
             writer.writerow([
                 'timestamp', 'symbol', 'trend_signals', 'crt_signals', 'snr_signals',
-                'fvg_signals', 'liquidity_signals', 'confluence_score', 'market_regime', 'final_decision', 'action_taken', 'dynamic_weights'
+                'fvg_signals', 'liquidity_signals', 'confluence_score', 'market_regime', 'final_decision', 'action_taken', 'dynamic_weights', 'strategy_breakdown'
             ])
         
         # FVG Signals Log
@@ -1667,7 +1674,8 @@ class AutomatedLogger:
                     confluence_data.get('market_regime', ''),
                     confluence_data.get('final_decision', ''),
                     confluence_data.get('action_taken', ''),
-                    confluence_data.get('dynamic_weights', '')
+                    confluence_data.get('dynamic_weights', ''),
+                    confluence_data.get('strategy_breakdown', '')
                 ])
         except Exception as e:
             self.logger.error(f"Failed to log confluence: {e}")
@@ -2012,13 +2020,61 @@ def get_account_info_safe():
         return paper_engine.get_account_info()
     return mt5.account_info()
 
+SYMBOL_RESOLUTION_CACHE: Dict[str, str] = {}
+
+def resolve_broker_symbol(symbol: str) -> str:
+    """Resolve configured symbol to actual broker symbol (suffix/prefix tolerant)."""
+    if not symbol:
+        return symbol
+    if config.PAPER_TRADING_ENABLED or not config.ENABLE_BROKER_SYMBOL_MAPPING:
+        return symbol
+    cached = SYMBOL_RESOLUTION_CACHE.get(symbol)
+    if cached:
+        return cached
+
+    try:
+        direct = mt5.symbol_info(symbol)
+        if direct is not None:
+            SYMBOL_RESOLUTION_CACHE[symbol] = symbol
+            return symbol
+
+        # Common broker suffix/prefix variants
+        candidates = [
+            symbol, f"{symbol}.m", f"{symbol}m", f"{symbol}.pro", f"{symbol}pro",
+            f"{symbol}_i", f"{symbol}.i", f"{symbol}#", f"{symbol}."
+        ]
+        for cand in candidates:
+            info = mt5.symbol_info(cand)
+            if info is not None:
+                mt5.symbol_select(cand, True)
+                SYMBOL_RESOLUTION_CACHE[symbol] = cand
+                logger.logger.info(f"Resolved symbol mapping: {symbol} -> {cand}")
+                return cand
+
+        normalized_target = re.sub(r'[^A-Z0-9]', '', symbol.upper())
+        all_symbols = mt5.symbols_get() or []
+        for s in all_symbols:
+            name = getattr(s, "name", "")
+            normalized_name = re.sub(r'[^A-Z0-9]', '', str(name).upper())
+            if normalized_target and normalized_target in normalized_name:
+                mt5.symbol_select(name, True)
+                SYMBOL_RESOLUTION_CACHE[symbol] = name
+                logger.logger.info(f"Resolved symbol mapping via scan: {symbol} -> {name}")
+                return name
+    except Exception as e:
+        logger.logger.warning(f"Symbol resolution failed for {symbol}: {e}")
+
+    return symbol
+
 def get_positions_safe(symbol: Optional[str] = None):
     if config.PAPER_TRADING_ENABLED:
         return paper_engine.get_positions_as_mt5(symbol)
-    return mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
+    resolved_symbol = resolve_broker_symbol(symbol) if symbol else None
+    return mt5.positions_get(symbol=resolved_symbol) if resolved_symbol else mt5.positions_get()
 
 
 def get_symbol_info_safe(symbol: str):
+    symbol = resolve_broker_symbol(symbol)
     info = mt5.symbol_info(symbol)
     if info is not None:
         return info
@@ -2040,7 +2096,8 @@ def get_symbol_info_safe(symbol: str):
     return None
 
 def get_spread_points(symbol: str) -> Optional[float]:
-    tick = mt5.symbol_info_tick(symbol)
+    symbol = resolve_broker_symbol(symbol)
+    tick = mt5.symbol_info_tick(resolve_broker_symbol(symbol))
     info = mt5.symbol_info(symbol)
     if tick is None or info is None:
         return None
@@ -3554,18 +3611,20 @@ class EnhancedDataCache:
             logger.logger.debug(f"Skipping {symbol} fetch: symbol in temporary backoff window")
             return pd.DataFrame()
 
+        broker_symbol = resolve_broker_symbol(symbol)
+
         for attempt in range(self.max_retries):
             try:
                 cached_data = self.get_cached_data(symbol, timeframe, n)
                 if cached_data is not None:
                     return cached_data
 
-                selected = mt5.symbol_select(symbol, True)
+                selected = mt5.symbol_select(broker_symbol, True)
                 if not selected:
                     self.mark_symbol_temporarily_unavailable(symbol, backoff_seconds=1800)
-                    raise ValueError(f"Symbol {symbol} is not available in Market Watch")
+                    raise ValueError(f"Symbol {symbol} ({broker_symbol}) is not available in Market Watch")
                 
-                rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, n)
+                rates = mt5.copy_rates_from_pos(broker_symbol, timeframe, 0, n)
                 if rates is None or len(rates) == 0:
                     # For non-primary symbols (e.g., correlation context), avoid noisy reconnect/error storms.
                     if symbol in config.SYMBOLS and not config.PAPER_TRADING_ENABLED:
@@ -3575,7 +3634,7 @@ class EnhancedDataCache:
                         self.cache[f"{symbol}_{timeframe}"] = fallback_df.copy()
                         self.cache_timestamps[f"{symbol}_{timeframe}"] = time.time()
                         return fallback_df
-                    raise ValueError(f"No data returned for {symbol}")
+                    raise ValueError(f"No data returned for {symbol} ({broker_symbol})")
                 
                 df = pd.DataFrame(rates)
                 df['time'] = pd.to_datetime(df['time'], unit='s')
@@ -3869,22 +3928,42 @@ class ConfluenceManager:
             weights = global_state.get_auto_tuned_weights(symbol, base_weights)
         except Exception:
             weights = base_weights
-        
-        buy_confidence = (
-            sum(s.get('confidence', 0.5) for s in buy_signals['trend']) * weights['trend_following'] +
-            sum(s.get('confidence', 0) for s in buy_signals['crt']) * weights['crt'] +
-            sum(s.get('confidence', 0) for s in buy_signals['snr']) * weights['snr'] +
-            sum(s.get('confidence', 0) for s in buy_signals['fvg']) * weights['fvg'] +
-            sum(s.get('confidence', 0) for s in buy_signals['liquidity']) * config.LIQUIDITY_CONFLUENCE_WEIGHT
-        )
-        
-        sell_confidence = (
-            sum(s.get('confidence', 0.5) for s in sell_signals['trend']) * weights['trend_following'] +
-            sum(s.get('confidence', 0) for s in sell_signals['crt']) * weights['crt'] +
-            sum(s.get('confidence', 0) for s in sell_signals['snr']) * weights['snr'] +
-            sum(s.get('confidence', 0) for s in sell_signals['fvg']) * weights['fvg'] +
-            sum(s.get('confidence', 0) for s in sell_signals['liquidity']) * config.LIQUIDITY_CONFLUENCE_WEIGHT
-        )
+        liquidity_weight = weights.get('liquidity', config.LIQUIDITY_CONFLUENCE_WEIGHT)
+
+        strategy_breakdown = {
+            "buy": {},
+            "sell": {},
+            "weights": {k: round(float(v), 4) for k, v in weights.items()}
+        }
+
+        def _weighted_component(signals: List[Dict[str, Any]], weight: float, default_conf: float = 0.0) -> float:
+            total_conf = sum(float(s.get('confidence', default_conf)) for s in signals)
+            return total_conf * float(weight)
+
+        buy_components = {
+            'trend_following': _weighted_component(buy_signals['trend'], weights['trend_following'], 0.5),
+            'crt': _weighted_component(buy_signals['crt'], weights['crt']),
+            'snr': _weighted_component(buy_signals['snr'], weights['snr']),
+            'fvg': _weighted_component(buy_signals['fvg'], weights['fvg']),
+            'liquidity': _weighted_component(buy_signals['liquidity'], liquidity_weight),
+        }
+        sell_components = {
+            'trend_following': _weighted_component(sell_signals['trend'], weights['trend_following'], 0.5),
+            'crt': _weighted_component(sell_signals['crt'], weights['crt']),
+            'snr': _weighted_component(sell_signals['snr'], weights['snr']),
+            'fvg': _weighted_component(sell_signals['fvg'], weights['fvg']),
+            'liquidity': _weighted_component(sell_signals['liquidity'], liquidity_weight),
+        }
+
+        buy_confidence = sum(buy_components.values())
+
+        sell_confidence = sum(sell_components.values())
+
+        strategy_breakdown["buy"] = {k: round(float(v), 4) for k, v in buy_components.items()}
+        strategy_breakdown["sell"] = {k: round(float(v), 4) for k, v in sell_components.items()}
+
+        buy_component_count = sum(1 for v in buy_components.values() if v >= float(config.STRATEGY_COMPONENT_MIN_SCORE))
+        sell_component_count = sum(1 for v in sell_components.values() if v >= float(config.STRATEGY_COMPONENT_MIN_SCORE))
         
         buy_confluence = 0
         if len(buy_signals['trend']) > 0:
@@ -3917,10 +3996,18 @@ class ConfluenceManager:
         final_direction = None
         final_confluence = 0
         
-        if buy_confluence >= config.MIN_CONFLUENCE_SCORE and buy_confidence > sell_confidence:
+        if (
+            buy_confluence >= config.MIN_CONFLUENCE_SCORE and
+            buy_confidence > sell_confidence and
+            buy_component_count >= int(config.STRATEGY_MIN_COMPONENTS_REQUIRED)
+        ):
             final_direction = 'buy'
             final_confluence = buy_confluence
-        elif sell_confluence >= config.MIN_CONFLUENCE_SCORE and sell_confidence > buy_confidence:
+        elif (
+            sell_confluence >= config.MIN_CONFLUENCE_SCORE and
+            sell_confidence > buy_confidence and
+            sell_component_count >= int(config.STRATEGY_MIN_COMPONENTS_REQUIRED)
+        ):
             final_direction = 'sell'
             final_confluence = sell_confluence
         
@@ -3938,6 +4025,7 @@ class ConfluenceManager:
         }
         if config.AUTO_TUNE_STRATEGY_WEIGHTS:
             confluence_data['dynamic_weights'] = json.dumps({k: round(v, 4) for k, v in weights.items()})
+        confluence_data['strategy_breakdown'] = json.dumps(strategy_breakdown)
         
         logger.log_confluence(confluence_data)
         
@@ -3952,7 +4040,8 @@ class ConfluenceManager:
             'fvg_signals': fvg_signals,
             'liquidity_signals': liquidity_signals,
             'fvg_confluence': fvg_confluence,
-            'trend_direction': trend_direction
+            'trend_direction': trend_direction,
+            'strategy_breakdown': strategy_breakdown
         }
 
 # ==================== TRADE FILTERS & ADAPTIVE LOGIC ====================
@@ -5252,7 +5341,8 @@ def symbol_min_stop(symbol: str):
         if not connection_manager.check_connection():
             return None
         
-        info = mt5.symbol_info(symbol)
+        trade_symbol = resolve_broker_symbol(symbol)
+        info = mt5.symbol_info(trade_symbol)
         if info is None:
             return None
         point = info.point
@@ -5273,8 +5363,9 @@ def modify_position_sl_with_retry(symbol: str, pos: Any, new_sl: float, tp: floa
                 return True
         return False
 
-    info = mt5.symbol_info(symbol)
-    tick = mt5.symbol_info_tick(symbol)
+    trade_symbol = resolve_broker_symbol(symbol)
+    info = mt5.symbol_info(trade_symbol)
+    tick = mt5.symbol_info_tick(trade_symbol)
     if info is None or tick is None:
         logger.logger.error(f"{nowstr()} {symbol}: cannot modify SL, missing symbol info/tick")
         return None
@@ -5300,7 +5391,7 @@ def modify_position_sl_with_retry(symbol: str, pos: Any, new_sl: float, tp: floa
         req = {
             "action": mt5.TRADE_ACTION_SLTP,
             "position": int(pos.ticket),
-            "symbol": symbol,
+            "symbol": trade_symbol,
             "sl": sl_candidate,
             "tp": float(tp) if tp else 0.0
         }
@@ -5324,7 +5415,7 @@ def round_lot(symbol: str, lot: float) -> float:
         if not connection_manager.check_connection():
             return round(lot, 2)
         
-        info = mt5.symbol_info(symbol)
+        info = mt5.symbol_info(resolve_broker_symbol(symbol))
         if info is None:
             return round(lot, 2)
         
@@ -5421,7 +5512,8 @@ def market_entry_safe(symbol: str, direction: str, lot: float, comment: str = No
             logger.logger.warning(f"{nowstr()} {symbol}: No connection for market entry")
             return None
         
-        tick = mt5.symbol_info_tick(symbol)
+        trade_symbol = resolve_broker_symbol(symbol)
+        tick = mt5.symbol_info_tick(trade_symbol)
         if tick is None:
             logger.logger.warning(f"{nowstr()} {symbol}: no tick for market_entry")
             return None
@@ -5444,7 +5536,7 @@ def market_entry_safe(symbol: str, direction: str, lot: float, comment: str = No
         
         req = {
             "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
+            "symbol": trade_symbol,
             "volume": lot,
             "type": order_type,
             "price": price,
@@ -5523,10 +5615,11 @@ def attach_sl_tp_safe(symbol: str, sl_price: float, tp_price: float, attempt: in
                     return SimpleNamespace(retcode=mt5.TRADE_RETCODE_DONE, order=pos.ticket)
         
         ticket = int(pos.ticket)
+        trade_symbol = resolve_broker_symbol(symbol)
         req = {
             "action": mt5.TRADE_ACTION_SLTP,
             "position": ticket,
-            "symbol": symbol,
+            "symbol": trade_symbol,
             "sl": float(sl_price) if sl_price else 0.0,
             "tp": float(tp_price) if tp_price else 0.0
         }
@@ -5537,8 +5630,8 @@ def attach_sl_tp_safe(symbol: str, sl_price: float, tp_price: float, attempt: in
             logger.logger.error(f"{nowstr()} {symbol}: attach_sl_tp_safe returned None mt5.last_error={mt5.last_error()}")
             
             if attempt == 1:
-                info = mt5.symbol_info(symbol)
-                tick = mt5.symbol_info_tick(symbol)
+                info = mt5.symbol_info(trade_symbol)
+                tick = mt5.symbol_info_tick(trade_symbol)
                 if info is None or tick is None:
                     return None
                 
@@ -5584,7 +5677,8 @@ def close_partial_position_safe(symbol: str, pct: float = config.PARTIAL_CLOSE_P
         if pos is None:
             return None
         
-        info = mt5.symbol_info(symbol)
+        trade_symbol = resolve_broker_symbol(symbol)
+        info = mt5.symbol_info(trade_symbol)
         if info is None:
             return None
         
@@ -5605,7 +5699,7 @@ def close_partial_position_safe(symbol: str, pct: float = config.PARTIAL_CLOSE_P
         if close_vol < min_lot:
             return None
         
-        tick = mt5.symbol_info_tick(symbol)
+        tick = mt5.symbol_info_tick(trade_symbol)
         if tick is None:
             return None
 
@@ -5622,7 +5716,7 @@ def close_partial_position_safe(symbol: str, pct: float = config.PARTIAL_CLOSE_P
         
         req = {
             "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
+            "symbol": trade_symbol,
             "volume": close_vol,
             "type": close_type,
             "price": close_price,
@@ -5660,7 +5754,8 @@ def close_position_safe(symbol: str, reason: str = "timeout"):
         if pos is None:
             return None
 
-        tick = mt5.symbol_info_tick(symbol)
+        trade_symbol = resolve_broker_symbol(symbol)
+        tick = mt5.symbol_info_tick(trade_symbol)
         if tick is None:
             return None
 
@@ -5675,7 +5770,7 @@ def close_position_safe(symbol: str, reason: str = "timeout"):
         close_price = float(tick.bid) if close_type == mt5.ORDER_TYPE_SELL else float(tick.ask)
         req = {
             "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
+            "symbol": trade_symbol,
             "position": pos.ticket,
             "volume": float(pos.volume),
             "type": close_type,
@@ -5703,7 +5798,8 @@ def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp
             logger.logger.warning(f"{nowstr()} {symbol}: No connection for trade")
             return None
         
-        tick = mt5.symbol_info_tick(symbol)
+        trade_symbol = resolve_broker_symbol(symbol)
+        tick = mt5.symbol_info_tick(trade_symbol)
         if tick is None:
             logger.logger.warning(f"{nowstr()} {symbol}: no tick in send_trade_safe")
             return None
@@ -5739,7 +5835,7 @@ def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp
         
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
+            "symbol": trade_symbol,
             "volume": lot,
             "type": order_type,
             "price": price,
@@ -6385,7 +6481,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 continue
 
             if config.PAPER_TRADING_ENABLED:
-                tick = mt5.symbol_info_tick(symbol)
+                tick = mt5.symbol_info_tick(resolve_broker_symbol(symbol))
                 if tick:
                     paper_engine.update_price(symbol, float(tick.bid), float(tick.ask))
                     paper_engine.evaluate_positions()
@@ -6676,12 +6772,13 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 not trade_tracker.should_pause_trading() and
                 not global_state.should_pause_symbol(symbol)):
                 
-                info = mt5.symbol_info(symbol)
+                trade_symbol = resolve_broker_symbol(symbol)
+                info = mt5.symbol_info(trade_symbol)
                 if info is None:
                     time.sleep(0.2)
                     continue
                 
-                tick = mt5.symbol_info_tick(symbol)
+                tick = mt5.symbol_info_tick(trade_symbol)
                 if tick is None:
                     time.sleep(0.2)
                     continue
