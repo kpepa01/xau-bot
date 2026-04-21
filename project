@@ -913,6 +913,13 @@ class BotConfig:
     SMART_TRAIL_LOCK_RATIO: float = 0.82
     SMART_TRAIL_MAX_GIVEBACK_USD: float = 2.5
     SMART_TRAIL_MIN_INCREMENT_USD: float = 1.25
+    CHART_DYNAMIC_TRAIL_ENABLED: bool = True
+    CHART_DYNAMIC_TRAIL_LOOKBACK_BARS: int = 18
+    CHART_DYNAMIC_TRAIL_MIN_PROFIT_PIPS: float = 12.0
+    CHART_DYNAMIC_TRAIL_ATR_BASE_MULT: float = 1.6
+    CHART_DYNAMIC_TRAIL_ATR_MIN_MULT: float = 0.8
+    CHART_DYNAMIC_TRAIL_ATR_MAX_MULT: float = 2.4
+    CHART_DYNAMIC_TRAIL_SWING_BUFFER_PIPS: float = 8.0
     FAST_SL_MODE: bool = True
     FAST_SL_START_MULT: float = 0.85
     FAST_SL_LOCK_BOOST: float = 0.04
@@ -1225,6 +1232,18 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("FAST_SL_LOCK_BOOST must be between 0.0 and 0.2.")
     if not (0.4 <= bot_config.FAST_SL_MIN_INCREMENT_MULT <= 1.2):
         errors.append("FAST_SL_MIN_INCREMENT_MULT must be between 0.4 and 1.2.")
+    if bot_config.CHART_DYNAMIC_TRAIL_LOOKBACK_BARS < 5:
+        errors.append("CHART_DYNAMIC_TRAIL_LOOKBACK_BARS must be at least 5.")
+    if bot_config.CHART_DYNAMIC_TRAIL_MIN_PROFIT_PIPS < 0:
+        errors.append("CHART_DYNAMIC_TRAIL_MIN_PROFIT_PIPS cannot be negative.")
+    if bot_config.CHART_DYNAMIC_TRAIL_ATR_BASE_MULT <= 0:
+        errors.append("CHART_DYNAMIC_TRAIL_ATR_BASE_MULT must be greater than 0.")
+    if bot_config.CHART_DYNAMIC_TRAIL_ATR_MIN_MULT <= 0 or bot_config.CHART_DYNAMIC_TRAIL_ATR_MAX_MULT <= 0:
+        errors.append("CHART_DYNAMIC_TRAIL_ATR_MIN/MAX_MULT must be greater than 0.")
+    if bot_config.CHART_DYNAMIC_TRAIL_ATR_MIN_MULT > bot_config.CHART_DYNAMIC_TRAIL_ATR_MAX_MULT:
+        errors.append("CHART_DYNAMIC_TRAIL_ATR_MIN_MULT cannot exceed CHART_DYNAMIC_TRAIL_ATR_MAX_MULT.")
+    if bot_config.CHART_DYNAMIC_TRAIL_SWING_BUFFER_PIPS < 0:
+        errors.append("CHART_DYNAMIC_TRAIL_SWING_BUFFER_PIPS cannot be negative.")
     if bot_config.FAST_SL_PIPS_PRECISION_TRIGGER < 0:
         errors.append("FAST_SL_PIPS_PRECISION_TRIGGER cannot be negative.")
     if not (0.5 <= bot_config.FAST_SL_PRECISION_LOCK_RATIO <= 0.9):
@@ -5988,6 +6007,62 @@ def ensure_position_tracked(symbol: str, pos: Any) -> None:
         logger.log_error("ensure_position_tracked", str(e), "WARNING", symbol)
 
 
+def compute_chart_dynamic_trailing_sl(symbol: str, direction: str, current_price: float, pip_value: float, current_profit_pips: float) -> Tuple[Optional[float], Optional[str], float]:
+    """
+    Derive trailing stop from live chart movement with no manual levels:
+    - ATR-based adaptive distance
+    - recent structure (swing high/low)
+    - pip buffer derived from symbol pip value
+    """
+    if not config.CHART_DYNAMIC_TRAIL_ENABLED:
+        return None, None, 0.0
+    if current_profit_pips < float(config.CHART_DYNAMIC_TRAIL_MIN_PROFIT_PIPS):
+        return None, None, 0.0
+
+    try:
+        lookback = max(5, int(config.CHART_DYNAMIC_TRAIL_LOOKBACK_BARS))
+        bars_needed = max(60, lookback + 10)
+        df = calc_indicators_safe(get_bars_enhanced(symbol, config.ENTRY_TF, bars_needed))
+        if df.empty:
+            return None, None, 0.0
+
+        atr_val = float(df.iloc[-1].get('atr', 0.0) or 0.0)
+        if atr_val <= 0:
+            atr_val = float((df['high'].iloc[-20:] - df['low'].iloc[-20:]).mean())
+        if atr_val <= 0:
+            return None, None, 0.0
+
+        recent = df.iloc[-lookback:]
+        swing_low = float(recent['low'].min())
+        swing_high = float(recent['high'].max())
+
+        trend_strength = float(detect_market_condition_enhanced(df).get("trend_strength", 0.0) or 0.0)
+        adaptive_mult = float(config.CHART_DYNAMIC_TRAIL_ATR_BASE_MULT) - min(0.6, trend_strength * 0.25)
+        adaptive_mult = clamp(
+            adaptive_mult,
+            float(config.CHART_DYNAMIC_TRAIL_ATR_MIN_MULT),
+            float(config.CHART_DYNAMIC_TRAIL_ATR_MAX_MULT)
+        )
+
+        pip_buffer = max(float(pip_value) * float(config.CHART_DYNAMIC_TRAIL_SWING_BUFFER_PIPS), float(pip_value))
+        dynamic_distance = max(atr_val * adaptive_mult, pip_buffer)
+
+        if direction == 'buy':
+            atr_sl = current_price - dynamic_distance
+            structure_sl = swing_low - pip_buffer
+            dynamic_sl = max(atr_sl, structure_sl)
+        else:
+            atr_sl = current_price + dynamic_distance
+            structure_sl = swing_high + pip_buffer
+            dynamic_sl = min(atr_sl, structure_sl)
+
+        reason = f"chart_dynamic_trail(atr={atr_val:.4f},mult={adaptive_mult:.2f},lb={lookback})"
+        return dynamic_sl, reason, atr_val
+    except Exception as e:
+        logger.logger.debug(f"{symbol}: chart dynamic trailing calc failed: {e}")
+        return None, None, 0.0
+
+
 # ==================== ENHANCED HYBRID SL MANAGEMENT ====================
 def manage_hybrid_trailing_enhanced(symbol: str):
     """Enhanced trailing stop management with safety checks"""
@@ -5998,7 +6073,7 @@ def manage_hybrid_trailing_enhanced(symbol: str):
     if pos is None:
         return
     
-    tick = mt5.symbol_info_tick(symbol)
+    tick = mt5.symbol_info_tick(resolve_broker_symbol(symbol))
     if tick is None:
         return
     
@@ -6009,6 +6084,19 @@ def manage_hybrid_trailing_enhanced(symbol: str):
     
     ticket = pos.ticket
     ensure_position_tracked(symbol, pos)
+    trade_info = trade_tracker.get_trade(ticket)
+    profit_pips = 0.0
+    pip_value = 0.01
+    direction = 'buy' if pos.type == 0 else 'sell'
+    if trade_info:
+        direction = trade_info.get('direction', direction)
+        pip_value = float(trade_info.get('pip_value', pip_value) or pip_value)
+        entry = float(trade_info.get('entry_price', current_price) or current_price)
+        if direction == 'buy':
+            profit_pips = (current_price - entry) / max(pip_value, 1e-9)
+        else:
+            profit_pips = (entry - current_price) / max(pip_value, 1e-9)
+
     result = trade_tracker.update_trade(ticket, current_price)
     
     if result is not None:
@@ -6033,6 +6121,22 @@ def manage_hybrid_trailing_enhanced(symbol: str):
                     atr_value = float(df.iloc[-1].get('atr', 0))
             except:
                 pass
+
+            dynamic_sl, dynamic_reason, dynamic_atr = compute_chart_dynamic_trailing_sl(
+                symbol=symbol,
+                direction=direction,
+                current_price=float(current_price),
+                pip_value=float(trade_info.get('pip_value', pip_value) or pip_value),
+                current_profit_pips=float(profit_pips)
+            )
+            if dynamic_sl is not None:
+                atr_value = max(atr_value, dynamic_atr)
+                if direction == 'buy' and dynamic_sl > new_sl:
+                    new_sl = dynamic_sl
+                    move_reason = f"{move_reason}|{dynamic_reason}"
+                elif direction == 'sell' and dynamic_sl < new_sl:
+                    new_sl = dynamic_sl
+                    move_reason = f"{move_reason}|{dynamic_reason}"
 
             if config.VOLATILITY_ADJUSTED_SL and atr_value > 0:
                 atr_mult = 2.0
@@ -6093,6 +6197,33 @@ def manage_hybrid_trailing_enhanced(symbol: str):
             tracked = trade_tracker.get_trade(ticket)
             if tracked:
                 current_profit_usd = trade_tracker.calculate_current_profit_usd(ticket, current_price)
+                dynamic_sl, dynamic_reason, dynamic_atr = compute_chart_dynamic_trailing_sl(
+                    symbol=symbol,
+                    direction=tracked.get('direction', 'buy'),
+                    current_price=float(current_price),
+                    pip_value=float(tracked.get('pip_value', 0.01) or 0.01),
+                    current_profit_pips=float(profit_pips)
+                )
+                if dynamic_sl is not None:
+                    old_sl = float(getattr(pos, 'sl', 0.0) or 0.0)
+                    can_move = (
+                        (tracked.get('direction') == 'buy' and dynamic_sl > old_sl) or
+                        (tracked.get('direction') == 'sell' and dynamic_sl < old_sl)
+                    )
+                    if can_move:
+                        moved = modify_position_sl_with_retry(
+                            symbol=symbol,
+                            pos=pos,
+                            new_sl=dynamic_sl,
+                            tp=pos.tp,
+                            context=f"dynamic_chart_trailing {symbol}"
+                        )
+                        if moved:
+                            tracked['current_sl'] = float(dynamic_sl)
+                            logger.logger.info(
+                                f"{nowstr()} {symbol}: dynamic chart trailing moved SL "
+                                f"{old_sl:.5f} -> {dynamic_sl:.5f} (reason={dynamic_reason}, atr={dynamic_atr:.4f})"
+                            )
                 logger.logger.debug(
                     f"{nowstr()} {symbol}: no SL move ticket={ticket} profit=${current_profit_usd:.2f} "
                     f"start=${config.SMART_TRAIL_START_USD:.2f} current_sl={tracked.get('current_sl', 0):.5f}"
