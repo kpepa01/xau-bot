@@ -879,6 +879,11 @@ class BotConfig:
     # ==== HTF Confirmation ====
     HTF_H4_TF: int = mt5.TIMEFRAME_H4
     HTF_H1_TF: int = mt5.TIMEFRAME_H1
+    MTF_ENTRY_TF: int = mt5.TIMEFRAME_M15
+    MIN_CONFIRMATION_SCORE: float = 70.0
+    AVOID_ASIAN_SESSION: bool = True
+    ASIAN_SESSION_START_HOUR_UTC: int = 0
+    ASIAN_SESSION_END_HOUR_UTC: int = 6
 
     EMA_FAST_H1: int = 13
     EMA_SLOW_H1: int = 34
@@ -1183,6 +1188,10 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("TP_ATR_MULT must be greater than 0.")
     if bot_config.MIN_CONFLUENCE_SCORE < 1:
         errors.append("MIN_CONFLUENCE_SCORE must be at least 1.")
+    if not (0 <= bot_config.MIN_CONFIRMATION_SCORE <= 100):
+        errors.append("MIN_CONFIRMATION_SCORE must be between 0 and 100.")
+    if not (0 <= bot_config.ASIAN_SESSION_START_HOUR_UTC <= 23 and 0 <= bot_config.ASIAN_SESSION_END_HOUR_UTC <= 23):
+        errors.append("ASIAN session hours must be between 0 and 23.")
     if not (0 <= bot_config.DAILY_LOSS_PCT <= 100):
         errors.append("DAILY_LOSS_PCT must be between 0 and 100.")
     if bot_config.DAILY_LOSS_USD_LIMIT < 0:
@@ -5146,6 +5155,61 @@ def get_mtf_alignment(df_h1: pd.DataFrame, df_h4: pd.DataFrame, direction: str) 
         return h1_fast > h1_slow and h4_fast > h4_slow
     return h1_fast < h1_slow and h4_fast < h4_slow
 
+def compute_mtf_confirmation_score(df_h4: pd.DataFrame, df_h1: pd.DataFrame, df_m15: pd.DataFrame, direction: str) -> Tuple[float, Dict[str, Any]]:
+    """
+    Multi-timeframe confirmation engine (0-100):
+    - H4: macro trend bias
+    - H1: trend + structure (proxy BOS/CHOCH)
+    - M15: pullback and entry-zone quality
+    """
+    details = {"h4_bias": False, "h1_structure": False, "m15_entry_zone": False}
+    if df_h4.empty or df_h1.empty or df_m15.empty:
+        return 0.0, details
+    try:
+        h4_fast, h4_slow = float(df_h4['ema_fast'].iloc[-1]), float(df_h4['ema_slow'].iloc[-1])
+        h1_fast, h1_slow = float(df_h1['ema_fast'].iloc[-1]), float(df_h1['ema_slow'].iloc[-1])
+        h4_close = float(df_h4['close'].iloc[-1])
+        h1_close = float(df_h1['close'].iloc[-1])
+
+        # H4 macro bias
+        if direction == 'buy':
+            details["h4_bias"] = (h4_fast > h4_slow and h4_close > h4_fast)
+        else:
+            details["h4_bias"] = (h4_fast < h4_slow and h4_close < h4_fast)
+
+        # H1 structure proxy for BOS/CHOCH (new swing expansion + EMA agreement)
+        recent_h1 = df_h1.iloc[-20:]
+        prev_h1 = df_h1.iloc[-40:-20] if len(df_h1) >= 40 else df_h1.iloc[:-20]
+        if not prev_h1.empty:
+            if direction == 'buy':
+                bos = float(recent_h1['high'].max()) > float(prev_h1['high'].max())
+                details["h1_structure"] = bos and h1_fast > h1_slow and h1_close > h1_fast
+            else:
+                bos = float(recent_h1['low'].min()) < float(prev_h1['low'].min())
+                details["h1_structure"] = bos and h1_fast < h1_slow and h1_close < h1_fast
+
+        # M15 pullback + SR zone proxy using recent swings + ATR buffer
+        atr_m15 = float(df_m15['atr'].iloc[-1]) if 'atr' in df_m15.columns and not pd.isna(df_m15['atr'].iloc[-1]) else 0.0
+        m15_close = float(df_m15['close'].iloc[-1])
+        m15_fast, m15_slow = float(df_m15['ema_fast'].iloc[-1]), float(df_m15['ema_slow'].iloc[-1])
+        swing_low = float(df_m15['low'].iloc[-30:].min())
+        swing_high = float(df_m15['high'].iloc[-30:].max())
+        zone_buf = max(atr_m15 * 0.6, 0.05)
+        if direction == 'buy':
+            near_support = abs(m15_close - swing_low) <= zone_buf
+            details["m15_entry_zone"] = near_support and m15_fast >= m15_slow
+        else:
+            near_resistance = abs(swing_high - m15_close) <= zone_buf
+            details["m15_entry_zone"] = near_resistance and m15_fast <= m15_slow
+
+        score = 0.0
+        score += 40.0 if details["h4_bias"] else 0.0
+        score += 35.0 if details["h1_structure"] else 0.0
+        score += 25.0 if details["m15_entry_zone"] else 0.0
+        return score, details
+    except Exception:
+        return 0.0, details
+
 
 def evaluate_fire_conditions(confluence_result: Dict[str, Any], direction: str) -> Tuple[bool, str]:
     side = 'buy_signals' if direction == 'buy' else 'sell_signals'
@@ -6730,6 +6794,15 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 logger.logger.info(f"{nowstr()} {symbol}: news filter active, skipping trade window")
                 time.sleep(30)
                 continue
+            if config.AVOID_ASIAN_SESSION:
+                h = datetime.utcnow().hour
+                st = int(config.ASIAN_SESSION_START_HOUR_UTC)
+                en = int(config.ASIAN_SESSION_END_HOUR_UTC)
+                in_asian = (st <= h < en) if st < en else (h >= st or h < en)
+                if in_asian:
+                    logger.logger.info(f"{nowstr()} {symbol}: asian low-liquidity filter active")
+                    time.sleep(30)
+                    continue
 
             if global_state.correlation_data and not passes_correlation_filter(symbol, global_state.correlation_data):
                 logger.logger.info(f"{nowstr()} {symbol}: correlation filter blocked trade")
@@ -6795,8 +6868,9 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             df_htf = calc_indicators_safe(get_bars_enhanced(symbol, config.HTF_TF, 250))
             df_h1 = calc_indicators_safe(get_bars_enhanced(symbol, config.HTF_H1_TF, 250))
             df_h4 = calc_indicators_safe(get_bars_enhanced(symbol, config.HTF_H4_TF, 250))
+            df_m15 = calc_indicators_safe(get_bars_enhanced(symbol, config.MTF_ENTRY_TF, 250))
 
-            if df.empty or df_htf.empty or df_h1.empty or df_h4.empty:
+            if df.empty or df_htf.empty or df_h1.empty or df_h4.empty or df_m15.empty:
                 time.sleep(1)
                 continue
 
@@ -6805,6 +6879,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 (df_htf, config.HTF_TF, "htf"),
                 (df_h1, config.HTF_H1_TF, "h1"),
                 (df_h4, config.HTF_H4_TF, "h4"),
+                (df_m15, config.MTF_ENTRY_TF, "m15"),
             ]
             bad_data = False
             for data_df, tf, label in checks:
@@ -6931,6 +7006,13 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             
             momentum_strength = 0.0
             if chosen_dir:
+                mtf_score, mtf_details = compute_mtf_confirmation_score(df_h4, df_h1, df_m15, chosen_dir)
+                if mtf_score < float(config.MIN_CONFIRMATION_SCORE):
+                    logger.logger.info(
+                        f"{nowstr()} {symbol}: MTF confirmation blocked ({mtf_score:.1f}<{config.MIN_CONFIRMATION_SCORE:.1f}) details={mtf_details}"
+                    )
+                    time.sleep(0.2)
+                    continue
                 ok_fire, fire_reason = evaluate_fire_conditions(confluence_result, chosen_dir)
                 if not ok_fire and not forced_trade:
                     logger.logger.info(f"{nowstr()} {symbol}: fire conditions blocked ({fire_reason})")
