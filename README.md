@@ -1,0 +1,7544 @@
+# ============================================================
+# XAU BOT ULTIMATE AI SNIPER - PROFESSIONAL EDITION v16 + FVG
+# TRIPLE STRATEGY CONFLUENCE + FAIR VALUE GAP SYSTEM
+# COMPLETE INTEGRATION - SINGLE FILE IMPLEMENTATION
+# ============================================================
+
+import os
+import json
+import csv
+import pandas as pd
+import numpy as np
+import MetaTrader5 as mt5
+import time
+import math
+import threading
+import logging
+import hashlib
+import random
+import re
+from datetime import datetime, date, time as dt_time, timedelta
+from typing import Dict, List, Tuple, Optional, Any
+from collections import deque, defaultdict
+from dataclasses import dataclass, field
+from ta.trend import EMAIndicator, MACD
+from ta.volatility import AverageTrueRange, BollingerBands
+from ta.momentum import RSIIndicator, StochasticOscillator
+from dotenv import load_dotenv
+from itertools import product
+from types import SimpleNamespace
+
+# Load environment variables
+load_dotenv()
+
+# =========================
+# ENVIRONMENT HELPERS
+# =========================
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+# =========================
+# AUTO-CREATE FILES FUNCTION
+# =========================
+def create_file_structure():
+    """Automatically create all necessary files for the bot"""
+    base_path = os.path.dirname(os.path.abspath(__file__))
+    
+    # Create directories
+    directories = [
+        "config",
+        "data",
+        "logs",
+        "reports",
+        "fvg_data"
+    ]
+    
+    for directory in directories:
+        os.makedirs(os.path.join(base_path, directory), exist_ok=True)
+    
+    # Create FVG detector file
+    fvg_detector_code = '''"""
+Fair Value Gap Detection Module
+Integrated with existing bot architecture
+"""
+
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional, Any
+import logging
+from dataclasses import dataclass, field
+from collections import defaultdict
+
+logger = logging.getLogger("XAU_Bot_Pro_v16")
+
+@dataclass
+class FVGConfig:
+    """FVG Configuration aligned with existing bot structure"""
+    ENABLED: bool = True
+    MIN_CANDLE_BODY_RATIO: float = 0.8
+    MAX_GAP_PERCENTAGE: float = 0.02
+    GAP_FILTER_ATR_MULTIPLIER: float = 2.5
+    FRESH_THRESHOLD_BARS: int = 50
+    STRENGTH_VOLUME_MULTIPLIER: float = 1.5
+    HTF_CONFIRMATION_REQUIRED: bool = True
+    MIN_CONFLUENCE_LEVEL: int = 2
+    MAX_AGE_BARS: int = 200
+    PARTIAL_FVG_THRESHOLD: float = 0.3
+    MITIGATION_LOOKBACK_BARS: int = 20
+    GAP_STRENGTH_WEIGHTS: Dict[str, float] = field(default_factory=lambda: {
+        'volume': 0.3,
+        'gap_size': 0.25,
+        'trend_alignment': 0.25,
+        'snr_confluence': 0.2
+    })
+    
+    USE_FVG_TP1: bool = True
+    USE_FVG_TP2: bool = True
+    SL_BREAKER_CANDLE_MULTIPLIER: float = 1.2
+    MIN_STOP_DISTANCE_ATR_MULTIPLIER: float = 1.0
+
+class FVGZone:
+    """Represents a Fair Value Gap zone"""
+    def __init__(self, start_bar: int, end_bar: int, high: float, low: float,
+                 direction: str, gap_size: float, volume_score: float,
+                 created_time: datetime):
+        self.start_bar = start_bar
+        self.end_bar = end_bar
+        self.high = high
+        self.low = low
+        self.direction = direction
+        self.gap_size = gap_size
+        self.volume_score = volume_score
+        self.created_time = created_time
+        self.mitigated = False
+        self.mitigation_time = None
+        self.mitigation_price = None
+        self.strength_score = 0.0
+        self.confluence_score = 0
+        self.htf_confirmed = False
+        self.fresh = True
+        self.partial = False
+        
+    def __repr__(self):
+        return (f"FVGZone({self.direction}, high={self.high:.5f}, low={self.low:.5f}, "
+                f"size={self.gap_size:.5f}, strength={self.strength_score:.2f}, "
+                f"mitigated={self.mitigated}, fresh={self.fresh})")
+
+class FVGStrategy:
+    """Fair Value Gap Detection and Trading Strategy"""
+    
+    def __init__(self, config: FVGConfig = None):
+        self.config = config or FVGConfig()
+        self.detected_zones: Dict[str, List[FVGZone]] = defaultdict(list)
+        self.active_zones: Dict[str, List[FVGZone]] = defaultdict(list)
+        self.logger = logger
+        
+    def detect_fvg(self, df: pd.DataFrame, symbol: str) -> List[FVGZone]:
+        """Detect Fair Value Gaps in price data"""
+        if len(df) < 3:
+            return []
+        
+        zones = []
+        df = df.copy()
+        
+        # Calculate metrics
+        df['body_size'] = abs(df['close'] - df['open'])
+        df['high_low_range'] = df['high'] - df['low']
+        df['body_ratio'] = df['body_size'] / df['high_low_range'].replace(0, 0.001)
+        
+        # Use tick_volume instead of volume
+        if 'tick_volume' in df.columns:
+            df['volume_avg'] = df['tick_volume'].rolling(20, min_periods=1).mean()
+            df['volume_ratio'] = df['tick_volume'] / df['volume_avg'].replace(0, 0.001)
+        else:
+            df['volume_ratio'] = 1.0
+        
+        # Detect FVGs
+        for i in range(2, len(df)):
+            candle1 = df.iloc[i-2]
+            candle2 = df.iloc[i-1]
+            candle3 = df.iloc[i]
+
+            # Ignore abnormal session/weekend gaps that often create false FVGs.
+            recent_tr = (df['high'].iloc[max(0, i-20):i] - df['low'].iloc[max(0, i-20):i]).replace(0, np.nan)
+            atr_proxy = float(np.nanmean(recent_tr)) if len(recent_tr) else 0.0
+            open_gap = abs(float(candle3['open']) - float(candle2['close']))
+            if atr_proxy > 0 and open_gap > (atr_proxy * self.config.GAP_FILTER_ATR_MULTIPLIER):
+                continue
+            
+            if not self._validate_fvg_formation(candle1, candle2, candle3):
+                continue
+            
+            # Determine direction
+            if candle1['low'] > candle3['high']:
+                direction = 'bullish'
+                fvg_high = candle1['low']
+                fvg_low = candle3['high']
+            elif candle1['high'] < candle3['low']:
+                direction = 'bearish'
+                fvg_high = candle3['low']
+                fvg_low = candle1['high']
+            else:
+                if self._is_partial_fvg(candle1, candle3):
+                    direction = 'partial'
+                    fvg_high = max(candle1['low'], candle3['high'])
+                    fvg_low = min(candle1['low'], candle3['high'])
+                else:
+                    continue
+            
+            gap_size = fvg_high - fvg_low
+            if gap_size <= 0:
+                continue
+            
+            avg_price = (fvg_high + fvg_low) / 2
+            gap_percentage = gap_size / avg_price
+            
+            if gap_percentage > self.config.MAX_GAP_PERCENTAGE:
+                continue
+            
+            volume_score = self._calculate_volume_score(candle1, candle2, candle3, df, i)
+            
+            zone = FVGZone(
+                start_bar=i-2,
+                end_bar=i,
+                high=fvg_high,
+                low=fvg_low,
+                direction=direction,
+                gap_size=gap_size,
+                volume_score=volume_score,
+                created_time=datetime.now()
+            )
+            
+            if direction == 'partial':
+                zone.partial = True
+                overlap = self._calculate_overlap(candle1, candle3)
+                if overlap < self.config.PARTIAL_FVG_THRESHOLD:
+                    continue
+            
+            zones.append(zone)
+        
+        self.clean_fvg_zones(symbol)
+        
+        if zones:
+            self.detected_zones[symbol].extend(zones)
+            self.logger.info(f"Detected {len(zones)} FVG zones for {symbol}")
+        
+        return zones
+    
+    def _validate_fvg_formation(self, candle1: pd.Series, candle2: pd.Series, 
+                               candle3: pd.Series) -> bool:
+        """Validate FVG formation criteria"""
+        if candle2['close'] <= candle1['high'] and candle2['close'] >= candle1['low']:
+            return False
+        
+        if candle1['body_ratio'] < self.config.MIN_CANDLE_BODY_RATIO:
+            return False
+        if candle3['body_ratio'] < self.config.MIN_CANDLE_BODY_RATIO:
+            return False
+        
+        has_gap = (candle1['low'] > candle3['high']) or (candle1['high'] < candle3['low'])
+        return has_gap
+    
+    def _is_partial_fvg(self, candle1: pd.Series, candle3: pd.Series) -> bool:
+        """Check for partial FVG"""
+        overlap_high = min(candle1['low'], candle3['high'])
+        overlap_low = max(candle1['high'], candle3['low'])
+        
+        if overlap_high > overlap_low:
+            overlap_size = overlap_high - overlap_low
+            gap_size = abs(candle1['low'] - candle3['high'])
+            return gap_size > overlap_size
+        
+        return False
+    
+    def _calculate_overlap(self, candle1: pd.Series, candle3: pd.Series) -> float:
+        """Calculate overlap percentage"""
+        overlap_high = min(candle1['low'], candle3['high'])
+        overlap_low = max(candle1['high'], candle3['low'])
+        
+        if overlap_high > overlap_low:
+            overlap_size = overlap_high - overlap_low
+            candle1_range = candle1['low'] - candle1['high']
+            candle3_range = candle3['high'] - candle3['low']
+            avg_range = (abs(candle1_range) + abs(candle3_range)) / 2
+            return overlap_size / avg_range if avg_range > 0 else 0
+        
+        return 0
+    
+    def _calculate_volume_score(self, candle1: pd.Series, candle2: pd.Series,
+                               candle3: pd.Series, df: pd.DataFrame, current_idx: int) -> float:
+        """Calculate volume-based score"""
+        if 'volume_ratio' not in df.columns:
+            return 0.5
+        
+        vol1 = df.iloc[current_idx-2]['volume_ratio']
+        vol2 = df.iloc[current_idx-1]['volume_ratio']
+        vol3 = df.iloc[current_idx]['volume_ratio']
+        
+        volume_confirmation = (vol1 > 1.0 or vol3 > 1.0)
+        breaker_strength = 1.0 if vol2 > self.config.STRENGTH_VOLUME_MULTIPLIER else 0.5
+        
+        score = 0.0
+        if volume_confirmation:
+            score += 0.3
+        score += breaker_strength * 0.3
+        
+        volume_trend = 1.0 if vol3 > vol1 else 0.5
+        score += volume_trend * 0.4
+        
+        return min(1.0, score)
+    
+    def clean_fvg_zones(self, symbol: str):
+        """Remove old and mitigated FVG zones"""
+        if symbol not in self.detected_zones:
+            return
+        
+        current_time = datetime.now()
+        zones_to_keep = []
+        
+        for zone in self.detected_zones[symbol]:
+            if zone.created_time and (current_time - zone.created_time).total_seconds() > \
+               self.config.MAX_AGE_BARS * 300:
+                continue
+            
+            if zone.mitigated and zone.mitigation_time:
+                if (current_time - zone.mitigation_time).total_seconds() > 3600:
+                    continue
+            
+            zones_to_keep.append(zone)
+        
+        self.detected_zones[symbol] = zones_to_keep
+        self.logger.debug(f"Cleaned FVG zones for {symbol}, kept {len(zones_to_keep)} zones")
+    
+    def validate_fvg_with_trend(self, zone: FVGZone, trend_direction: str) -> float:
+        """Validate FVG with trend alignment"""
+        if trend_direction == 'uptrend' and zone.direction == 'bullish':
+            return 0.8
+        elif trend_direction == 'downtrend' and zone.direction == 'bearish':
+            return 0.8
+        elif trend_direction == 'sideways':
+            return 0.6
+        else:
+            return 0.4
+    
+    def validate_fvg_with_snr(self, zone: FVGZone, support_levels: List[Dict],
+                             resistance_levels: List[Dict]) -> float:
+        """Validate FVG with Support/Resistance confluence"""
+        score = 0.0
+        
+        if zone.direction == 'bullish':
+            for support in support_levels[:3]:
+                distance = abs(zone.low - support['price'])
+                if distance < zone.gap_size * 2:
+                    score += support['strength'] * 0.5
+        else:
+            for resistance in resistance_levels[:3]:
+                distance = abs(zone.high - resistance['price'])
+                if distance < zone.gap_size * 2:
+                    score += resistance['strength'] * 0.5
+        
+        return min(1.0, score)
+    
+    def calculate_fvg_strength(self, zone: FVGZone, df: pd.DataFrame, 
+                              trend_score: float, snr_score: float) -> float:
+        """Calculate overall FVG strength score"""
+        weights = self.config.GAP_STRENGTH_WEIGHTS
+        
+        gap_size_score = min(1.0, zone.gap_size / (df['close'].iloc[-1] * 0.01))
+        volume_score = zone.volume_score
+        
+        strength = (
+            gap_size_score * weights['gap_size'] +
+            volume_score * weights['volume'] +
+            trend_score * weights['trend_alignment'] +
+            snr_score * weights['snr_confluence']
+        )
+        
+        if zone.partial:
+            strength *= 0.7
+        
+        zone.strength_score = strength
+        return strength
+    
+    def check_mitigation(self, zone: FVGZone, current_price: float, 
+                        current_bar: pd.Series) -> bool:
+        """Check if FVG zone has been mitigated"""
+        if zone.mitigated:
+            return True
+        
+        if zone.direction == 'bullish':
+            mitigated = current_bar['close'] < zone.low
+            if mitigated:
+                zone.mitigated = True
+                zone.mitigation_time = datetime.now()
+                zone.mitigation_price = current_price
+        else:
+            mitigated = current_bar['close'] > zone.high
+            if mitigated:
+                zone.mitigated = True
+                zone.mitigation_time = datetime.now()
+                zone.mitigation_price = current_price
+        
+        return zone.mitigated
+    
+    def get_active_fvg_zones(self, symbol: str, current_price: float,
+                           lookback_bars: int = 100) -> List[FVGZone]:
+        """Get active (unmitigated) FVG zones near current price"""
+        if symbol not in self.detected_zones:
+            return []
+        
+        active_zones = []
+        current_time = datetime.now()
+        
+        for zone in self.detected_zones[symbol]:
+            if zone.mitigated:
+                continue
+            
+            if zone.created_time:
+                hours_old = (current_time - zone.created_time).total_seconds() / 3600
+                zone.fresh = hours_old < (self.config.FRESH_THRESHOLD_BARS * 5 / 60)
+            
+            price_distance = min(abs(current_price - zone.high), 
+                               abs(current_price - zone.low))
+            
+            if price_distance < zone.gap_size * 3:
+                active_zones.append(zone)
+        
+        active_zones.sort(key=lambda x: (x.strength_score, x.fresh), reverse=True)
+        self.active_zones[symbol] = active_zones
+        return active_zones
+    
+    def calculate_fvg_confluence(self, zone: FVGZone, confluence_data: Dict) -> int:
+        """Calculate confluence score for FVG zone"""
+        confluence_score = 0
+        confluence_score += 1
+        
+        if zone.strength_score > 0.7:
+            confluence_score += 1
+        
+        if zone.fresh:
+            confluence_score += 1
+        
+        if zone.strength_score > 0.6:
+            confluence_score += 1
+        
+        zone.confluence_score = confluence_score
+        return confluence_score
+    
+    def get_fvg_trade_signals(self, symbol: str, df: pd.DataFrame, 
+                             current_price: float, atr: float,
+                             trend_direction: str, snr_levels: Dict) -> List[Dict]:
+        """Generate trade signals from FVG zones"""
+        signals = []
+        active_zones = self.get_active_fvg_zones(symbol, current_price)
+        
+        for zone in active_zones:
+            if zone.mitigated:
+                continue
+            
+            is_approaching = self._is_price_approaching_fvg(zone, current_price, df)
+            
+            if is_approaching:
+                trend_score = self.validate_fvg_with_trend(zone, trend_direction)
+                snr_score = self.validate_fvg_with_snr(zone, 
+                                                      snr_levels.get('support', []),
+                                                      snr_levels.get('resistance', []))
+                strength = self.calculate_fvg_strength(zone, df, trend_score, snr_score)
+                
+                if strength >= 0.6:
+                    signal = self._create_fvg_signal(zone, current_price, atr, strength)
+                    signals.append(signal)
+        
+        return signals
+    
+    def _is_price_approaching_fvg(self, zone: FVGZone, current_price: float,
+                                 df: pd.DataFrame) -> bool:
+        """Check if price is approaching the FVG zone"""
+        if zone.direction == 'bullish':
+            return current_price < zone.low and (zone.low - current_price) < zone.gap_size * 2
+        else:
+            return current_price > zone.high and (current_price - zone.high) < zone.gap_size * 2
+    
+    def _create_fvg_signal(self, zone: FVGZone, current_price: float,
+                          atr: float, strength: float) -> Dict:
+        """Create trade signal from FVG zone"""
+        direction = 'buy' if zone.direction == 'bullish' else 'sell'
+        
+        if direction == 'buy':
+            entry = zone.low
+            sl = entry - atr * self.config.SL_BREAKER_CANDLE_MULTIPLIER
+            tp1 = zone.low + (zone.gap_size / 2)
+            tp2 = zone.high
+        else:
+            entry = zone.high
+            sl = entry + atr * self.config.SL_BREAKER_CANDLE_MULTIPLIER
+            tp1 = zone.high - (zone.gap_size / 2)
+            tp2 = zone.low
+        
+        return {
+            'symbol': 'XAUUSD',
+            'direction': direction,
+            'entry_price': entry,
+            'sl_price': sl,
+            'tp1_price': tp1 if self.config.USE_FVG_TP1 else None,
+            'tp2_price': tp2 if self.config.USE_FVG_TP2 else None,
+            'confidence': strength,
+            'type': 'FVG',
+            'zone_strength': zone.strength_score,
+            'zone_fresh': zone.fresh,
+            'confluence_score': zone.confluence_score,
+            'gap_size': zone.gap_size
+        }
+
+def detect_fvg(df: pd.DataFrame, lookback_bars: int = 50) -> List[Dict]:
+    """Detect Fair Value Gaps in price data (compatible function)"""
+    if len(df) < 3:
+        return []
+    
+    df_subset = df.tail(lookback_bars).copy()
+    fvgs = []
+    
+    for i in range(2, len(df_subset)):
+        candle1 = df_subset.iloc[i-2]
+        candle2 = df_subset.iloc[i-1]
+        candle3 = df_subset.iloc[i]
+        
+        if candle1['low'] > candle3['high']:
+            fvg = {
+                'type': 'bullish',
+                'high': float(candle1['low']),
+                'low': float(candle3['high']),
+                'gap_size': float(candle1['low'] - candle3['high']),
+                'start_idx': i-2,
+                'end_idx': i,
+                'volume_confirmation': True,
+                'body_ratio': 0.8
+            }
+            fvgs.append(fvg)
+        
+        elif candle1['high'] < candle3['low']:
+            fvg = {
+                'type': 'bearish',
+                'high': float(candle3['low']),
+                'low': float(candle1['high']),
+                'gap_size': float(candle3['low'] - candle1['high']),
+                'start_idx': i-2,
+                'end_idx': i,
+                'volume_confirmation': True,
+                'body_ratio': 0.8
+            }
+            fvgs.append(fvg)
+    
+    return fvgs
+
+def clean_fvg_zones(fvg_zones: List[Dict], current_price: float, 
+                   atr: float, max_age_bars: int = 100) -> List[Dict]:
+    """Clean and filter FVG zones"""
+    if not fvg_zones:
+        return []
+    
+    cleaned = []
+    
+    for zone in fvg_zones:
+        if zone.get('age_bars', 0) > max_age_bars:
+            continue
+        
+        zone_mid = (zone['high'] + zone['low']) / 2
+        distance = abs(current_price - zone_mid)
+        
+        if distance > atr * 3:
+            continue
+        
+        if zone['type'] == 'bullish' and current_price > zone['high']:
+            continue
+        if zone['type'] == 'bearish' and current_price < zone['low']:
+            continue
+        
+        cleaned.append(zone)
+    
+    return cleaned
+
+def validate_fvg_with_trend(fvg_zone: Dict, trend_direction: str, 
+                           trend_strength: float) -> float:
+    """Validate FVG with trend alignment"""
+    if trend_direction == 'neutral':
+        return 0.5
+    
+    fvg_type = fvg_zone['type']
+    
+    if fvg_type == 'bullish' and trend_direction == 'uptrend':
+        return 0.8 * trend_strength
+    elif fvg_type == 'bearish' and trend_direction == 'downtrend':
+        return 0.8 * trend_strength
+    elif fvg_type == 'bullish' and trend_direction == 'downtrend':
+        return 0.3
+    elif fvg_type == 'bearish' and trend_direction == 'uptrend':
+        return 0.3
+    else:
+        return 0.5
+
+def validate_fvg_with_snr(fvg_zone: Dict, support_levels: List[Dict],
+                         resistance_levels: List[Dict]) -> float:
+    """Validate FVG with Support/Resistance confluence"""
+    score = 0.0
+    fvg_type = fvg_zone['type']
+    
+    if fvg_type == 'bullish':
+        for support in support_levels[:3]:
+            distance = abs(fvg_zone['low'] - support['price'])
+            if distance < fvg_zone['gap_size']:
+                score += support.get('strength', 0.5) * 0.5
+    else:
+        for resistance in resistance_levels[:3]:
+            distance = abs(fvg_zone['high'] - resistance['price'])
+            if distance < fvg_zone['gap_size']:
+                score += resistance.get('strength', 0.5) * 0.5
+    
+    return min(1.0, score)
+
+def calculate_fvg_strength(fvg_zone: Dict, volume_confirmation: bool,
+                          trend_score: float, snr_score: float,
+                          gap_size_normalized: float) -> float:
+    """Calculate overall FVG strength"""
+    weights = {
+        'gap_size': 0.25,
+        'volume': 0.25,
+        'trend': 0.25,
+        'snr': 0.25
+    }
+    
+    volume_score = 1.0 if volume_confirmation else 0.5
+    
+    strength = (
+        gap_size_normalized * weights['gap_size'] +
+        volume_score * weights['volume'] +
+        trend_score * weights['trend'] +
+        snr_score * weights['snr']
+    )
+    
+    return min(1.0, strength)
+'''
+    
+    # Create FVG utils file
+    fvg_utils_code = '''"""
+FVG Utility Functions
+For integration with existing bot modules
+"""
+
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Tuple, Optional
+from datetime import datetime
+import logging
+from dataclasses import dataclass
+
+logger = logging.getLogger("XAU_Bot_Pro_v16")
+
+@dataclass
+class FVGConfluence:
+    """FVG Confluence Analysis Result"""
+    has_fvg_signal: bool = False
+    direction: Optional[str] = None
+    strength: float = 0.0
+    confluence_score: int = 0
+    zone_count: int = 0
+    fresh_zones: int = 0
+    conflicting: bool = False
+    trade_recommended: bool = False
+    reason: str = ""
+
+def confluence_fvg_signals(fvg_signals: List[Dict], trend_signals: List[Dict],
+                          crt_signals: List[Dict], snr_signals: List[Dict],
+                          market_regime: str) -> FVGConfluence:
+    """
+    Analyze confluence between FVG and other signals
+    """
+    result = FVGConfluence()
+    
+    if not fvg_signals:
+        result.reason = "No FVG signals detected"
+        return result
+    
+    result.zone_count = len(fvg_signals)
+    result.fresh_zones = sum(1 for s in fvg_signals if s.get('fresh', False))
+    
+    strongest_fvg = max(fvg_signals, key=lambda x: x.get('strength', 0), default=None)
+    
+    if not strongest_fvg:
+        result.reason = "No valid FVG signals"
+        return result
+    
+    result.has_fvg_signal = True
+    result.direction = 'buy' if strongest_fvg['type'] == 'bullish' else 'sell'
+    result.strength = strongest_fvg.get('strength', 0.5)
+    
+    trend_confluence = _check_trend_confluence(strongest_fvg, trend_signals)
+    crt_confluence = _check_crt_confluence(strongest_fvg, crt_signals)
+    snr_confluence = _check_snr_confluence(strongest_fvg, snr_signals)
+    
+    result.confluence_score = (
+        (1 if trend_confluence else 0) +
+        (1 if crt_confluence else 0) +
+        (1 if snr_confluence else 0) +
+        1
+    )
+    
+    result.conflicting = _check_conflicts(strongest_fvg, trend_signals, 
+                                         crt_signals, snr_signals)
+    
+    result.trade_recommended = (
+        result.confluence_score >= 3 and
+        result.strength >= 0.6 and
+        not result.conflicting and
+        market_regime in ['trending', 'ranging']
+    )
+    
+    if result.trade_recommended:
+        result.reason = f"Strong FVG confluence: {result.confluence_score}/4 points"
+    else:
+        result.reason = f"Insufficient confluence: {result.confluence_score}/4 points"
+    
+    return result
+
+def _check_trend_confluence(fvg_signal: Dict, trend_signals: List[Dict]) -> bool:
+    """Check if FVG aligns with trend signals"""
+    if not trend_signals:
+        return False
+    
+    fvg_direction = 'buy' if fvg_signal['type'] == 'bullish' else 'sell'
+    
+    for signal in trend_signals:
+        if signal.get('direction') == fvg_direction:
+            return True
+    
+    return False
+
+def _check_crt_confluence(fvg_signal: Dict, crt_signals: List[Dict]) -> bool:
+    """Check if FVG aligns with CRT patterns"""
+    if not crt_signals:
+        return False
+    
+    fvg_direction = 'buy' if fvg_signal['type'] == 'bullish' else 'sell'
+    
+    for signal in crt_signals:
+        if signal.get('direction') == fvg_direction:
+            return True
+    
+    return False
+
+def _check_snr_confluence(fvg_signal: Dict, snr_signals: List[Dict]) -> bool:
+    """Check if FVG aligns with SNR levels"""
+    if not snr_signals:
+        return False
+    
+    fvg_direction = 'buy' if fvg_signal['type'] == 'bullish' else 'sell'
+    
+    for signal in snr_signals:
+        if signal.get('direction') == fvg_direction:
+            return True
+    
+    return False
+
+def _check_conflicts(fvg_signal: Dict, trend_signals: List[Dict],
+                    crt_signals: List[Dict], snr_signals: List[Dict]) -> bool:
+    """Check for conflicts between FVG and other signals"""
+    fvg_direction = 'buy' if fvg_signal['type'] == 'bullish' else 'sell'
+    
+    conflict_count = 0
+    
+    for signals, weight in [(trend_signals, 1), (crt_signals, 1), (snr_signals, 1)]:
+        opposite_count = sum(1 for s in signals if s.get('direction') != fvg_direction)
+        if opposite_count > 0:
+            conflict_count += weight
+    
+    return conflict_count >= 2
+'''
+    
+    # Write files
+    with open(os.path.join(base_path, 'fvg_detector.py'), 'w', encoding='utf-8') as f:
+        f.write(fvg_detector_code)
+    
+    with open(os.path.join(base_path, 'fvg_utils.py'), 'w', encoding='utf-8') as f:
+        f.write(fvg_utils_code)
+    
+    # Create config file
+    config_data = {
+        "patterns": ["doji", "hammer", "engulfing", "morning_star", "evening_star",
+                    "abandoned_baby", "tri_star", "three_line_strike"]
+    }
+    
+    with open(os.path.join(base_path, 'config', 'patterns.json'), 'w', encoding='utf-8') as f:
+        json.dump(config_data, f, indent=4)
+    
+    # Create synthetic data
+    def generate_synthetic_data(hours=1000, start_price=1900):
+        rows = ["time,open,high,low,close,tick_volume"]
+        price = start_price
+        t = datetime(2024, 1, 1)
+        for _ in range(hours):
+            o = price
+            h = o + random.uniform(1, 20)
+            l = o - random.uniform(1, 20)
+            c = random.uniform(l, h)
+            v = random.uniform(1000, 10000)
+            rows.append(f"{t},{o:.2f},{h:.2f},{l:.2f},{c:.2f},{v:.0f}")
+            price = c
+            t += timedelta(hours=1)
+        return "\n".join(rows)
+    
+    with open(os.path.join(base_path, 'data', 'historical_xau_h1.csv'), 'w', encoding='utf-8') as f:
+        f.write(generate_synthetic_data(1000))
+    
+    with open(os.path.join(base_path, 'data', 'historical_xau_h4.csv'), 'w', encoding='utf-8') as f:
+        f.write(generate_synthetic_data(500))
+    
+    print("✅ All files created successfully!")
+
+# Run file creation
+create_file_structure()
+
+# ======================= BOT CONFIG PRO+ WITH FVG =======================
+@dataclass
+class BotConfig:
+    # ==== MT5 Connection ====
+    LOGIN: int = int(os.getenv("MT5_LOGIN", "52536980"))
+    PASSWORD: str = os.getenv("MT5_PASSWORD", "z!Kt1zsRa8Buyb")
+    SERVER: str = os.getenv("MT5_SERVER", "ICMarketsSC-Demo")
+
+    # ==== Symbols & Timeframes ====
+    SYMBOLS: List[str] = field(default_factory=lambda: ["XAUUSD", "XAUJPY"])
+    ENABLE_BROKER_SYMBOL_MAPPING: bool = True
+    ENTRY_TF: int = mt5.TIMEFRAME_M5
+    HTF_TF: int = mt5.TIMEFRAME_M15
+
+    MAGIC: int = 987654
+    MODE: str = "CONFLUENCE_AI_FVG"
+
+    # ==== Risk Management ====
+    USE_FIXED_LOT: bool = True
+    LOT_FIXED: float = 0.01
+    MAX_TRADES_PER_SYMBOL: int = 2
+    MAX_POSITIONS_TOTAL: int = 4
+    MAX_LOSS_PER_TRADE: float = 15.0
+    MIN_RISK_PER_TRADE_USD: float = 5.0
+    DYNAMIC_POSITION_SIZING: bool = False
+    RISK_PER_TRADE_PCT: float = 1.0
+    SMART_RISK_SCALING: bool = True
+    RISK_SCALE_MIN: float = 0.55
+    RISK_SCALE_MAX: float = 1.35
+    RISK_SCALE_QUALITY_WEIGHT: float = 0.45
+    RISK_SCALE_CONFLUENCE_WEIGHT: float = 0.30
+    RISK_SCALE_REGIME_WEIGHT: float = 0.15
+    RISK_SCALE_EXECUTION_WEIGHT: float = 0.10
+    VOLATILITY_ADJUSTED_SL: bool = False
+    MIN_RR_RATIO: float = 2.0
+
+    COOLDOWN: int = 1800
+    FORCE_TRADE_EVERY: int = 1400
+    FORCE_TRADE_ENABLED: bool = True
+
+    # ==== Indicator Settings ====
+    EMA_FAST: int = 12
+    EMA_SLOW: int = 26
+    EMA_SIGNAL: int = 9
+
+    ATR_PERIOD: int = 14
+    RSI_PERIOD: int = 7
+    RSI_OB: int = 70
+    RSI_OS: int = 30
+
+    MIN_ATR: float = 0.12
+    SL_ATR_MULT: float = 1.5
+    TP_ATR_MULT: float = 2.5
+    USE_SUPPORT_RESISTANCE_SL: bool = True
+    USE_ATR_MULTIPLIER_SL: bool = True
+    ATR_SL_MULTIPLIER: float = 2.0
+    MIN_SL_DISTANCE_ATR: float = 1.5
+    MAX_SL_DISTANCE_ATR: float = 3.0
+    MOMENTUM_CONFIRMATION_REQUIRED: bool = True
+    MIN_MOMENTUM_STRENGTH: float = 0.6
+    ENTRY_DELAY_BARS: int = 2
+    AUTO_RELAX_FILTERS: bool = True
+    RELAX_FILTERS_LIVE_TRADING: bool = False
+    NO_TRADE_RELAX_MINUTES: int = 30
+    RELAX_MIN_RR_RATIO: float = 1.6
+    RELAX_MIN_MOMENTUM: float = 0.45
+    RELAX_MIN_ATR_PCT: float = 0.85
+    RELAX_MAX_SPREAD_MULTIPLIER: float = 2.5
+    RELAX_MIN_TREND_STRENGTH: float = 0.45
+    MTF_CONFIRMATION_REQUIRED: bool = True
+    MIN_SMC_CONFLUENCE: int = 2
+    MIN_CLASSIC_CONFLUENCE: int = 1
+    AVOID_DUPLICATE_LEVEL_TRADES: bool = True
+    DUPLICATE_LEVEL_TOLERANCE_ATR: float = 0.2
+
+    # ==== HTF Confirmation ====
+    HTF_H4_TF: int = mt5.TIMEFRAME_H4
+    HTF_H1_TF: int = mt5.TIMEFRAME_H1
+    MTF_ENTRY_TF: int = mt5.TIMEFRAME_M15
+    MIN_CONFIRMATION_SCORE: float = 70.0
+    AVOID_ASIAN_SESSION: bool = True
+    ASIAN_SESSION_START_HOUR_UTC: int = 0
+    ASIAN_SESSION_END_HOUR_UTC: int = 6
+
+    EMA_FAST_H1: int = 13
+    EMA_SLOW_H1: int = 34
+    EMA_FAST_H4: int = 20
+    EMA_SLOW_H4: int = 50
+
+    REQUIRE_HTF_CONFLUENCE: bool = True
+
+    # ==== Advanced Market Intelligence ====
+    MARKET_REGIME_PERIOD: int = 50
+    TRENDING_THRESHOLD: float = 0.55
+    RANGING_THRESHOLD: float = 0.25
+
+    MIN_CONFIRMING_SIGNALS: int = 2
+    CONSECUTIVE_LOSS_LIMIT: int = 3
+    CONSECUTIVE_LOSS_COOLDOWN_MINUTES: int = 90
+
+    # ==== Partial Close ====
+    PARTIAL_CLOSE_ENABLED: bool = True
+    PARTIAL_CLOSE_PCT: float = 0.5
+    PARTIAL_CLOSE_MIN_VOL: float = 0.01
+
+    # ==== Trailing & Breakeven ====
+    TRAILING_ENABLED: bool = True
+    MIN_PIPS_FOR_MOVE: float = 60.0
+    MIN_PROFIT_FOR_MOVE: float = 6.0
+    BREAKEVEN_AT_PIPS: float = 60.0
+    BREAKEVEN_MIN_PROFIT: float = 6.0
+    TRAIL_PROFIT_STEP_USD: float = 7.0
+    SMART_TRAIL_START_USD: float = 4.0
+    SMART_TRAIL_BE_BUFFER_USD: float = 1.0
+    SMART_TRAIL_LOCK_RATIO: float = 0.82
+    SMART_TRAIL_MAX_GIVEBACK_USD: float = 2.5
+    SMART_TRAIL_MIN_INCREMENT_USD: float = 1.25
+    CHART_DYNAMIC_TRAIL_ENABLED: bool = True
+    CHART_DYNAMIC_TRAIL_LOOKBACK_BARS: int = 18
+    CHART_DYNAMIC_TRAIL_MIN_PROFIT_PIPS: float = 12.0
+    CHART_DYNAMIC_TRAIL_ATR_BASE_MULT: float = 1.6
+    CHART_DYNAMIC_TRAIL_ATR_MIN_MULT: float = 0.8
+    CHART_DYNAMIC_TRAIL_ATR_MAX_MULT: float = 2.4
+    CHART_DYNAMIC_TRAIL_SWING_BUFFER_PIPS: float = 8.0
+    FAST_SL_MODE: bool = True
+    FAST_SL_START_MULT: float = 0.85
+    FAST_SL_LOCK_BOOST: float = 0.04
+    FAST_SL_MIN_INCREMENT_MULT: float = 0.90
+    FAST_SL_PIPS_PRECISION_TRIGGER: float = 20.0
+    FAST_SL_PRECISION_LOCK_RATIO: float = 0.68
+    DYNAMIC_TP_TRENDING_ATR_MULT: float = 2.0
+    DYNAMIC_TP_RANGING_ATR_MULT: float = 1.0
+    DYNAMIC_TP_VOLATILE_ATR_MULT: float = 1.4
+    ENTRY_MAX_DISTANCE_ATR: float = 0.85
+    ENTRY_RSI_BUY_MAX: float = 72.0
+    ENTRY_RSI_SELL_MIN: float = 28.0
+    PRECISION_MODE_ENABLED: bool = True
+    PRECISION_MIN_QUALITY_BUFFER: float = 0.3
+    PRECISION_MIN_MOMENTUM_STRENGTH: float = 0.65
+    PRECISION_RSI_CENTER_BUFFER: float = 3.0
+    PRECISION_MAX_ENTRY_DISTANCE_ATR: float = 0.25
+
+    # ==== Daily Protection ====
+    DAILY_LOSS_PCT: float = 5.0
+    DAILY_LOSS_USD_LIMIT: float = 30.0
+    DAILY_LOSS_HARD_STOP: bool = False
+    DAILY_PROFIT_PCT: float = 3.0
+    MAX_DRAWDOWN_PCT: float = 5.0
+    MAX_DAILY_TRADES: int = 60
+
+    # ==== Time Restrictions ====
+    NO_TRADE_START: dt_time = dt_time(23, 0)
+    NO_TRADE_END: dt_time = dt_time(0, 10)
+    ENFORCE_DAILY_TRADE_WINDOW: bool = True
+    TRADE_WINDOW_START: dt_time = dt_time(0, 10)
+    TRADE_WINDOW_END: dt_time = dt_time(23, 0)
+
+    # ==== Stability & Automation ====
+    SUMMARY_INTERVAL: int = 1800
+    MONITOR_INTERVAL: int = 30
+    AUTO_RECONNECT: bool = True
+    MAX_RECONNECT_ATTEMPTS: int = 10
+    RECONNECT_BACKOFF_BASE: float = 2.0
+
+    DATA_CACHE_SECONDS: int = 60
+    VALIDATE_SYMBOLS_ON_STARTUP: bool = True
+    ENABLE_FALLBACK_DATA_SOURCE: bool = env_bool("ENABLE_FALLBACK_DATA_SOURCE", True)
+    MAX_STALE_DATA_SECONDS: int = int(os.getenv("MAX_STALE_DATA_SECONDS", "900"))
+    DATA_MAX_ZERO_ROWS_PCT: float = float(os.getenv("DATA_MAX_ZERO_ROWS_PCT", "0.05"))
+    DATA_MAX_NEGATIVE_ROWS_PCT: float = float(os.getenv("DATA_MAX_NEGATIVE_ROWS_PCT", "0.0"))
+    FVG_GAP_FILTER_ATR_MULTIPLIER: float = float(os.getenv("FVG_GAP_FILTER_ATR_MULTIPLIER", "2.5"))
+    DYNAMIC_RSI_LOOKBACK: int = int(os.getenv("DYNAMIC_RSI_LOOKBACK", "100"))
+    DYNAMIC_RSI_LOW_Q: float = float(os.getenv("DYNAMIC_RSI_LOW_Q", "0.2"))
+    DYNAMIC_RSI_HIGH_Q: float = float(os.getenv("DYNAMIC_RSI_HIGH_Q", "0.8"))
+    CIRCUIT_BREAKER_COOL_OFF_MINUTES: int = int(os.getenv("CIRCUIT_BREAKER_COOL_OFF_MINUTES", "180"))
+
+    # ==== Trade Quality Filters ====
+    MAX_SPREAD_POINTS: float = 30.0
+    MIN_RISK_REWARD: float = 1.5
+    MIN_ENTRY_QUALITY_SCORE: float = 70.0
+    QUALITY_SCORE_HARD_BLOCK: bool = True
+    EXECUTION_SPREAD_WINDOW: int = 50
+    EXECUTION_MAX_SPREAD_RATIO: float = 1.8
+    MIN_SIGNAL_WIN_RATE: float = 0.48
+    DYNAMIC_QUALITY_BY_REGIME: bool = True
+    QUALITY_REGIME_TRENDING_BONUS: float = -3.0
+    QUALITY_REGIME_RANGING_PENALTY: float = 2.0
+    QUALITY_NON_PREFERRED_SESSION_PENALTY: float = 3.0
+    NO_TRADE_VOLATILITY_SPIKE_MULT: float = 2.2
+    NO_TRADE_LOW_TREND_THRESHOLD: float = 0.18
+    NO_TRADE_LOW_VOLUME_THRESHOLD: float = 0.9
+    MAX_TRADE_DURATION_MINUTES: int = 240
+
+    # ==== Paper Trading & Backtesting ====
+    PAPER_TRADING_ENABLED: bool = env_bool("PAPER_TRADING_ENABLED", False)
+    PAPER_INITIAL_BALANCE: float = float(os.getenv("PAPER_INITIAL_BALANCE", "10000"))
+    PAPER_CONTRACT_SIZE: float = float(os.getenv("PAPER_CONTRACT_SIZE", "100"))
+    PAPER_SPREAD_PIPS: float = float(os.getenv("PAPER_SPREAD_PIPS", "0.2"))
+    PAPER_SLIPPAGE_PIPS: float = float(os.getenv("PAPER_SLIPPAGE_PIPS", "0.1"))
+    PAPER_COMMISSION_PER_LOT: float = float(os.getenv("PAPER_COMMISSION_PER_LOT", "0"))
+
+    BACKTEST_MODE: bool = env_bool("BACKTEST_MODE", False)
+    BACKTEST_INITIAL_BALANCE: float = float(os.getenv("BACKTEST_INITIAL_BALANCE", "10000"))
+    BACKTEST_DATA_FILES: Dict[str, str] = field(default_factory=lambda: {
+        "XAUUSD": os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "historical_xau_h1.csv"),
+        "XAUJPY": os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "historical_xau_h1.csv")
+    })
+
+    # ==== NEW: FVG SETTINGS ====
+    FVG_ENABLED: bool = True
+    FVG_MIN_STRENGTH: float = 0.7
+    FVG_CONFLUENCE_WEIGHT: float = 1.0
+    FVG_REQUIRE_HTF_CONFIRMATION: bool = True
+    FVG_FRESHNESS_THRESHOLD_BARS: int = 50
+    FVG_MAX_AGE_BARS: int = 200
+    FVG_USE_MIDPOINT_TP: bool = True
+    FVG_USE_OPPOSITE_SIDE_TP: bool = True
+    FVG_SL_BREAKER_MULTIPLIER: float = 1.2
+    FVG_MIN_STOP_ATR_MULTIPLIER: float = 1.0
+    FVG_MIN_CANDLE_BODY_RATIO: float = 0.6
+    FVG_MAX_GAP_PERCENTAGE: float = 0.02
+    FVG_STRENGTH_VOLUME_MULTIPLIER: float = 1.5
+
+    # ==== CRT Settings ====
+    CRT_ENABLED: bool = True
+    CRT_MIN_CONFIDENCE: float = 0.7
+    CRT_REQUIRE_TREND_CONFIRMATION: bool = True
+    CRT_PATTERNS: List[str] = field(default_factory=lambda: [
+        'bullish_engulfing', 'bearish_engulfing',
+        'hammer', 'inverted_hammer',
+        'shooting_star', 'hanging_man',
+        'morning_star', 'evening_star',
+        'piercing_line', 'dark_cloud_cover',
+        'three_white_soldiers', 'three_black_crows',
+        'doji', 'long_legged_doji', 'dragonfly_doji', 'gravestone_doji',
+        'bullish_harami', 'bearish_harami',
+        'three_inside_up', 'three_inside_down',
+        'three_line_strike',
+        'morning_doji_star', 'evening_doji_star',
+        'abandoned_baby', 'tri_star',
+        'belt_hold_bullish', 'belt_hold_bearish'
+    ])
+    
+    # ==== SNR Settings ====
+    SNR_ENABLED: bool = True
+    SNR_LOOKBACK_PERIODS: int = 50
+    SNR_MIN_STRENGTH: float = 0.6
+    SNR_ZONE_WIDTH_PCT: float = 0.012
+    SNR_REQUIRE_CONFLUENCE: bool = True
+
+    # ==== Strategy Weights with FVG ====
+    WEIGHTS_TRENDING: Dict[str, float] = field(default_factory=lambda: {
+        'trend_following': 0.35,
+        'crt': 0.25,
+        'snr': 0.25,
+        'fvg': 0.15
+    })
+    WEIGHTS_RANGING: Dict[str, float] = field(default_factory=lambda: {
+        'trend_following': 0.2,
+        'crt': 0.35,
+        'snr': 0.35,
+        'fvg': 0.1
+    })
+    WEIGHTS_VOLATILE: Dict[str, float] = field(default_factory=lambda: {
+        'trend_following': 0.25,
+        'crt': 0.3,
+        'snr': 0.25,
+        'fvg': 0.2
+    })
+    AUTO_TUNE_STRATEGY_WEIGHTS: bool = True
+    AUTO_TUNE_MIN_SAMPLES: int = 8
+    AUTO_TUNE_EXPECTANCY_CLAMP: float = 25.0
+    AUTO_TUNE_WEIGHT_ADJUST_RATE: float = 0.20
+    AUTO_TUNE_WEIGHT_MIN: float = 0.08
+    AUTO_TUNE_WEIGHT_MAX: float = 0.60
+    STRATEGY_KILL_SWITCH_ENABLED: bool = True
+    STRATEGY_KILL_MIN_SAMPLES: int = 25
+    STRATEGY_KILL_EXPECTANCY_USD: float = -0.75
+    STRATEGY_KILL_RECOVERY_EXPECTANCY_USD: float = 0.15
+    ENFORCE_READINESS_GATE: bool = False
+    READINESS_MIN_TRADES: int = 40
+    READINESS_MIN_WIN_RATE: float = 48.0
+    READINESS_MIN_PROFIT_FACTOR: float = 1.20
+    READINESS_MIN_SHARPE: float = 0.20
+    READINESS_MAX_DRAWDOWN: float = 8.0
+    LIVE_ACCOUNT_MODE: bool = env_bool("LIVE_ACCOUNT_MODE", False)
+    LIVE_BLOCK_DURING_READINESS_WARMUP: bool = True
+    LIVE_REQUIRE_READINESS_GATE: bool = True
+    LIVE_REQUIRE_DAILY_HARD_STOP: bool = True
+    
+    # ==== Confluence Scoring ====
+    MIN_CONFLUENCE_SCORE: int = 2
+    IDEAL_CONFLUENCE_SCORE: int = 3
+    STRATEGY_COMPONENT_MIN_SCORE: float = 0.12
+    STRATEGY_MIN_COMPONENTS_REQUIRED: int = 2
+
+    # ==== LIQUIDITY SMC Strategy Settings ====
+    LIQUIDITY_SMC_ENABLED: bool = True
+    LIQUIDITY_MIN_STRENGTH: float = 0.6
+    LIQUIDITY_CONFLUENCE_WEIGHT: float = 0.8
+    LIQUIDITY_LOOKBACK_PERIODS: int = 100
+    LIQUIDITY_ZONE_WIDTH_PCT: float = 0.005
+    LIQUIDITY_REQUIRE_VOLUME_CONFIRMATION: bool = True
+    LIQUIDITY_VOLUME_MULTIPLIER: float = 1.3
+
+    # ==== Session-based Trading ====
+    TRADING_SESSIONS: Dict[str, Dict[str, dt_time]] = field(default_factory=lambda: {
+        'LONDON': {'start': dt_time(8, 0), 'end': dt_time(16, 0)},
+        'NEW_YORK': {'start': dt_time(13, 0), 'end': dt_time(21, 0)},
+        'ASIA': {'start': dt_time(0, 0), 'end': dt_time(8, 0)}
+    })
+    PREFERRED_SESSION: str = 'ALL_DAY'
+
+    # ==== Correlation Filter ====
+    CORRELATION_PAIRS: Dict[str, List[str]] = field(default_factory=lambda: {
+        'XAUUSD': ['USDX', 'US10Y', 'SPX'],
+        'XAUJPY': ['USDJPY', 'JP225']
+    })
+    MAX_CORRELATION_THRESHOLD: float = 0.7
+    CORRELATED_EXPOSURE_LOT_REDUCTION: float = 0.35
+    CORRELATED_EXPOSURE_MAX_OPEN: int = 1
+
+    # ==== News Filter ====
+    ECONOMIC_NEWS_FILTER: bool = True
+    MINUTES_BEFORE_NEWS: int = 30
+    MINUTES_AFTER_NEWS: int = 60
+    HIGH_IMPACT_ONLY: bool = True
+
+    def adjust_weights(self, crt_score: float, snr_score: float, trend_strength: float, 
+                       fvg_score: float, regime: str, volatility: float) -> Dict[str, float]:
+        """
+        Auto-adjust strategy weights including FVG
+        """
+        weights = {'trend_following': 0.3, 'crt': 0.3, 'snr': 0.3, 'fvg': 0.1}
+
+        if regime == 'trending':
+            weights['trend_following'] = max(0.35, trend_strength)
+            weights['crt'] = min(0.25, crt_score / 2)
+            weights['snr'] = min(0.25, snr_score / 2)
+            weights['fvg'] = 0.15
+        elif regime == 'ranging':
+            weights['trend_following'] = 0.2
+            weights['crt'] = 0.35 if crt_score >= 0.7 else 0.3
+            weights['snr'] = 0.35 if snr_score >= 0.6 else 0.3
+            weights['fvg'] = 0.1
+        elif regime == 'volatile':
+            weights['trend_following'] = 0.25
+            weights['crt'] = 0.3 if crt_score >= 0.65 else 0.25
+            weights['snr'] = 0.25 if snr_score >= 0.6 else 0.25
+            weights['fvg'] = 0.2
+
+        if volatility > 0.02:
+            weights['fvg'] += 0.05
+            weights['snr'] -= 0.05
+
+        total = sum(weights.values())
+        for key in weights:
+            weights[key] /= total
+
+        return weights
+
+# =========================
+# Import FVG modules (created above)
+# =========================
+from fvg_detector import FVGStrategy, FVGConfig, detect_fvg, clean_fvg_zones, validate_fvg_with_trend, validate_fvg_with_snr, calculate_fvg_strength
+from fvg_utils import confluence_fvg_signals, FVGConfluence
+
+config = BotConfig()
+
+def validate_config_or_exit(bot_config: BotConfig) -> None:
+    """Validate configuration values on startup."""
+    errors = []
+
+    if not bot_config.SYMBOLS:
+        errors.append("SYMBOLS must contain at least one symbol.")
+    if bot_config.LOT_FIXED <= 0:
+        errors.append("LOT_FIXED must be greater than 0.")
+    if bot_config.MAX_TRADES_PER_SYMBOL < 1:
+        errors.append("MAX_TRADES_PER_SYMBOL must be at least 1.")
+    if bot_config.MAX_POSITIONS_TOTAL < 1:
+        errors.append("MAX_POSITIONS_TOTAL must be at least 1.")
+    if bot_config.SL_ATR_MULT <= 0:
+        errors.append("SL_ATR_MULT must be greater than 0.")
+    if bot_config.TP_ATR_MULT <= 0:
+        errors.append("TP_ATR_MULT must be greater than 0.")
+    if bot_config.MIN_CONFLUENCE_SCORE < 1:
+        errors.append("MIN_CONFLUENCE_SCORE must be at least 1.")
+    if not (0 <= bot_config.MIN_CONFIRMATION_SCORE <= 100):
+        errors.append("MIN_CONFIRMATION_SCORE must be between 0 and 100.")
+    if not (0 <= bot_config.ASIAN_SESSION_START_HOUR_UTC <= 23 and 0 <= bot_config.ASIAN_SESSION_END_HOUR_UTC <= 23):
+        errors.append("ASIAN session hours must be between 0 and 23.")
+    if not (0 <= bot_config.DAILY_LOSS_PCT <= 100):
+        errors.append("DAILY_LOSS_PCT must be between 0 and 100.")
+    if bot_config.DAILY_LOSS_USD_LIMIT < 0:
+        errors.append("DAILY_LOSS_USD_LIMIT cannot be negative.")
+    if not (0 <= bot_config.DAILY_PROFIT_PCT <= 100):
+        errors.append("DAILY_PROFIT_PCT must be between 0 and 100.")
+    if not (0 <= bot_config.MAX_DRAWDOWN_PCT <= 100):
+        errors.append("MAX_DRAWDOWN_PCT must be between 0 and 100.")
+    if bot_config.PAPER_TRADING_ENABLED:
+        if bot_config.PAPER_INITIAL_BALANCE <= 0:
+            errors.append("PAPER_INITIAL_BALANCE must be greater than 0.")
+        if bot_config.PAPER_CONTRACT_SIZE <= 0:
+            errors.append("PAPER_CONTRACT_SIZE must be greater than 0.")
+    if bot_config.MAX_SPREAD_POINTS <= 0:
+        errors.append("MAX_SPREAD_POINTS must be greater than 0.")
+    if bot_config.AUTO_TUNE_EXPECTANCY_CLAMP <= 0:
+        errors.append("AUTO_TUNE_EXPECTANCY_CLAMP must be greater than 0.")
+    if bot_config.AUTO_TUNE_WEIGHT_MIN <= 0 or bot_config.AUTO_TUNE_WEIGHT_MAX <= 0:
+        errors.append("AUTO_TUNE weight bounds must be greater than 0.")
+    if bot_config.AUTO_TUNE_WEIGHT_MIN > bot_config.AUTO_TUNE_WEIGHT_MAX:
+        errors.append("AUTO_TUNE_WEIGHT_MIN cannot exceed AUTO_TUNE_WEIGHT_MAX.")
+    if bot_config.AUTO_TUNE_MIN_SAMPLES < 1:
+        errors.append("AUTO_TUNE_MIN_SAMPLES must be at least 1.")
+    if bot_config.STRATEGY_KILL_MIN_SAMPLES < 1:
+        errors.append("STRATEGY_KILL_MIN_SAMPLES must be at least 1.")
+    if bot_config.STRATEGY_KILL_RECOVERY_EXPECTANCY_USD < bot_config.STRATEGY_KILL_EXPECTANCY_USD:
+        errors.append("STRATEGY_KILL_RECOVERY_EXPECTANCY_USD must be >= STRATEGY_KILL_EXPECTANCY_USD.")
+    if not (0 < bot_config.AUTO_TUNE_WEIGHT_ADJUST_RATE <= 1):
+        errors.append("AUTO_TUNE_WEIGHT_ADJUST_RATE must be between 0 and 1.")
+    if not (0 < bot_config.READINESS_MIN_WIN_RATE <= 100):
+        errors.append("READINESS_MIN_WIN_RATE must be between 0 and 100.")
+    if bot_config.READINESS_MIN_PROFIT_FACTOR <= 0:
+        errors.append("READINESS_MIN_PROFIT_FACTOR must be greater than 0.")
+    if bot_config.READINESS_MAX_DRAWDOWN <= 0:
+        errors.append("READINESS_MAX_DRAWDOWN must be greater than 0.")
+    if bot_config.MIN_RISK_REWARD <= 0:
+        errors.append("MIN_RISK_REWARD must be greater than 0.")
+    if bot_config.MIN_RR_RATIO <= 0:
+        errors.append("MIN_RR_RATIO must be greater than 0.")
+    if bot_config.RELAX_MIN_RR_RATIO <= 0:
+        errors.append("RELAX_MIN_RR_RATIO must be greater than 0.")
+    if not (0 < bot_config.RELAX_MIN_ATR_PCT <= 1.0):
+        errors.append("RELAX_MIN_ATR_PCT must be between 0 and 1.")
+    if not (0 <= bot_config.RELAX_MIN_TREND_STRENGTH <= 1.0):
+        errors.append("RELAX_MIN_TREND_STRENGTH must be between 0 and 1.")
+    if not (0 < bot_config.RISK_PER_TRADE_PCT <= 100):
+        errors.append("RISK_PER_TRADE_PCT must be between 0 and 100.")
+    if bot_config.RISK_SCALE_MIN <= 0 or bot_config.RISK_SCALE_MAX <= 0:
+        errors.append("RISK_SCALE_MIN/MAX must be greater than 0.")
+    if bot_config.RISK_SCALE_MIN > bot_config.RISK_SCALE_MAX:
+        errors.append("RISK_SCALE_MIN cannot exceed RISK_SCALE_MAX.")
+    if not (0.2 <= bot_config.FAST_SL_START_MULT <= 1.0):
+        errors.append("FAST_SL_START_MULT must be between 0.2 and 1.0.")
+    if not (0.0 <= bot_config.FAST_SL_LOCK_BOOST <= 0.2):
+        errors.append("FAST_SL_LOCK_BOOST must be between 0.0 and 0.2.")
+    if not (0.4 <= bot_config.FAST_SL_MIN_INCREMENT_MULT <= 1.2):
+        errors.append("FAST_SL_MIN_INCREMENT_MULT must be between 0.4 and 1.2.")
+    if bot_config.CHART_DYNAMIC_TRAIL_LOOKBACK_BARS < 5:
+        errors.append("CHART_DYNAMIC_TRAIL_LOOKBACK_BARS must be at least 5.")
+    if bot_config.CHART_DYNAMIC_TRAIL_MIN_PROFIT_PIPS < 0:
+        errors.append("CHART_DYNAMIC_TRAIL_MIN_PROFIT_PIPS cannot be negative.")
+    if bot_config.CHART_DYNAMIC_TRAIL_ATR_BASE_MULT <= 0:
+        errors.append("CHART_DYNAMIC_TRAIL_ATR_BASE_MULT must be greater than 0.")
+    if bot_config.CHART_DYNAMIC_TRAIL_ATR_MIN_MULT <= 0 or bot_config.CHART_DYNAMIC_TRAIL_ATR_MAX_MULT <= 0:
+        errors.append("CHART_DYNAMIC_TRAIL_ATR_MIN/MAX_MULT must be greater than 0.")
+    if bot_config.CHART_DYNAMIC_TRAIL_ATR_MIN_MULT > bot_config.CHART_DYNAMIC_TRAIL_ATR_MAX_MULT:
+        errors.append("CHART_DYNAMIC_TRAIL_ATR_MIN_MULT cannot exceed CHART_DYNAMIC_TRAIL_ATR_MAX_MULT.")
+    if bot_config.CHART_DYNAMIC_TRAIL_SWING_BUFFER_PIPS < 0:
+        errors.append("CHART_DYNAMIC_TRAIL_SWING_BUFFER_PIPS cannot be negative.")
+    if bot_config.FAST_SL_PIPS_PRECISION_TRIGGER < 0:
+        errors.append("FAST_SL_PIPS_PRECISION_TRIGGER cannot be negative.")
+    if not (0.5 <= bot_config.FAST_SL_PRECISION_LOCK_RATIO <= 0.9):
+        errors.append("FAST_SL_PRECISION_LOCK_RATIO must be between 0.5 and 0.9.")
+    if bot_config.PRECISION_MIN_QUALITY_BUFFER < 0:
+        errors.append("PRECISION_MIN_QUALITY_BUFFER cannot be negative.")
+    if not (0 <= bot_config.PRECISION_MIN_MOMENTUM_STRENGTH <= 1.0):
+        errors.append("PRECISION_MIN_MOMENTUM_STRENGTH must be between 0.0 and 1.0.")
+    if not (0 <= bot_config.PRECISION_RSI_CENTER_BUFFER <= 20.0):
+        errors.append("PRECISION_RSI_CENTER_BUFFER must be between 0 and 20.")
+    if not (0 < bot_config.PRECISION_MAX_ENTRY_DISTANCE_ATR <= 1.5):
+        errors.append("PRECISION_MAX_ENTRY_DISTANCE_ATR must be between 0 and 1.5.")
+    if bot_config.MIN_RISK_PER_TRADE_USD < 0:
+        errors.append("MIN_RISK_PER_TRADE_USD cannot be negative.")
+    if bot_config.MIN_SMC_CONFLUENCE < 0:
+        errors.append("MIN_SMC_CONFLUENCE cannot be negative.")
+    if bot_config.MIN_CLASSIC_CONFLUENCE < 0:
+        errors.append("MIN_CLASSIC_CONFLUENCE cannot be negative.")
+    if bot_config.STRATEGY_COMPONENT_MIN_SCORE < 0:
+        errors.append("STRATEGY_COMPONENT_MIN_SCORE cannot be negative.")
+    if bot_config.STRATEGY_MIN_COMPONENTS_REQUIRED < 1:
+        errors.append("STRATEGY_MIN_COMPONENTS_REQUIRED must be at least 1.")
+    if bot_config.MAX_TRADE_DURATION_MINUTES <= 0:
+        errors.append("MAX_TRADE_DURATION_MINUTES must be greater than 0.")
+    if bot_config.TRAIL_PROFIT_STEP_USD <= 0:
+        errors.append("TRAIL_PROFIT_STEP_USD must be greater than 0.")
+    if bot_config.BACKTEST_MODE:
+        missing_files = [
+            sym for sym, path in bot_config.BACKTEST_DATA_FILES.items()
+            if not os.path.exists(path)
+        ]
+        if missing_files:
+            errors.append(f"Missing backtest data files for symbols: {', '.join(missing_files)}.")
+    if bot_config.PAPER_TRADING_ENABLED and bot_config.BACKTEST_MODE:
+        errors.append("PAPER_TRADING_ENABLED and BACKTEST_MODE cannot both be enabled.")
+
+    if errors:
+        formatted = "\n".join(f"- {err}" for err in errors)
+        raise SystemExit(f"Configuration validation failed:\n{formatted}")
+
+def validate_live_safety_or_exit(bot_config: BotConfig) -> None:
+    """Fail-fast guardrails for real-money execution."""
+    if not bot_config.LIVE_ACCOUNT_MODE:
+        return
+
+    errors = []
+    if bot_config.PAPER_TRADING_ENABLED or bot_config.BACKTEST_MODE:
+        errors.append("LIVE_ACCOUNT_MODE cannot be used with PAPER_TRADING_ENABLED or BACKTEST_MODE.")
+    if bot_config.LIVE_REQUIRE_READINESS_GATE and not bot_config.ENFORCE_READINESS_GATE:
+        errors.append("LIVE_ACCOUNT_MODE requires ENFORCE_READINESS_GATE=True.")
+    if bot_config.LIVE_REQUIRE_DAILY_HARD_STOP and not bot_config.DAILY_LOSS_HARD_STOP:
+        errors.append("LIVE_ACCOUNT_MODE requires DAILY_LOSS_HARD_STOP=True.")
+    if bot_config.DAILY_LOSS_USD_LIMIT <= 0:
+        errors.append("LIVE_ACCOUNT_MODE requires DAILY_LOSS_USD_LIMIT > 0.")
+    if bot_config.MAX_LOSS_PER_TRADE <= 0:
+        errors.append("LIVE_ACCOUNT_MODE requires MAX_LOSS_PER_TRADE > 0.")
+
+    if errors:
+        formatted = "\n".join(f"- {err}" for err in errors)
+        raise SystemExit(f"Live safety validation failed:\n{formatted}")
+
+validate_config_or_exit(config)
+validate_live_safety_or_exit(config)
+
+# ==================== AUTOMATED LOGGING SETUP ====================
+class AutomatedLogger:
+    """AUTOMATIC LOGGING SYSTEM - Creates all logs on startup"""
+    
+    def __init__(self):
+        self.run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_dir = os.path.expanduser(fr"C:\Users\klajd\Documents\XAU_Bot_Logs\Run_{self.run_timestamp}")
+        
+        os.makedirs(self.log_dir, exist_ok=True)
+        
+        self.log_files = {
+            'main': os.path.join(self.log_dir, "trading_bot.log"),
+            'trades': os.path.join(self.log_dir, "trade_log.csv"),
+            'errors': os.path.join(self.log_dir, "error_log.csv"),
+            'performance': os.path.join(self.log_dir, "performance_log.csv"),
+            'sl_movements': os.path.join(self.log_dir, "sl_movement_log.csv"),
+            'debug': os.path.join(self.log_dir, "debug_log.csv"),
+            'signals': os.path.join(self.log_dir, "signals_log.csv"),
+            'crt_signals': os.path.join(self.log_dir, "crt_signals.csv"),
+            'snr_signals': os.path.join(self.log_dir, "snr_signals.csv"),
+            'confluence': os.path.join(self.log_dir, "confluence_log.csv"),
+            'fvg_signals': os.path.join(self.log_dir, "fvg_signals.csv"),
+            'liquidity_signals': os.path.join(self.log_dir, "liquidity_signals.csv"),
+            'startup_log': os.path.join(self.log_dir, "bot_startup.log")  # New startup log
+        }
+        
+        # ==================== AUTO-CLEAN ERROR LOGS ====================
+        self.auto_clean_error_logs()
+        
+        self._init_all_log_files()
+        self.setup_main_logger()
+        
+        self.logger.info("=" * 80)
+        self.logger.info("XAU BOT v16 + FVG + LIQUIDITY SMC SYSTEM - COMPLETE INTEGRATION")
+        self.logger.info(f"Run Timestamp: {self.run_timestamp}")
+        self.logger.info(f"Log Directory: {self.log_dir}")
+        self.logger.info("=" * 80)
+        self.logger.info("✅ ALL LOG FILES CREATED AUTOMATICALLY")
+        self.logger.info("✅ ERROR LOGS AUTO-CLEANED ON STARTUP")
+        self.logger.info("=" * 80)
+    
+    def auto_clean_error_logs(self):
+        """Automatically clean error logs on startup if system is healthy"""
+        try:
+            # Check for previous error logs
+            base_logs_dir = os.path.expanduser(fr"C:\Users\klajd\Documents\XAU_Bot_Logs")
+            
+            if not os.path.exists(base_logs_dir):
+                return
+            
+            # Find all error logs in previous runs
+            error_logs_to_clean = []
+            for run_dir in os.listdir(base_logs_dir):
+                run_path = os.path.join(base_logs_dir, run_dir)
+                if os.path.isdir(run_path):
+                    error_log_path = os.path.join(run_path, "error_log.csv")
+                    if os.path.exists(error_log_path):
+                        error_logs_to_clean.append(error_log_path)
+            
+            # Clean error logs that are older than 1 hour
+            current_time = time.time()
+            one_hour_ago = current_time - 3600
+            
+            cleaned_count = 0
+            for error_log in error_logs_to_clean:
+                try:
+                    # Get file modification time
+                    mtime = os.path.getmtime(error_log)
+                    
+                    # Clean if file is empty or only has headers
+                    if os.path.getsize(error_log) < 100:  # Less than 100 bytes (just headers)
+                        with open(error_log, 'r') as f:
+                            lines = f.readlines()
+                            if len(lines) <= 1:  # Only header or empty
+                                os.remove(error_log)
+                                cleaned_count += 1
+                                self._log_startup_event(f"Cleaned empty error log: {error_log}")
+                    # Clean old error logs (older than 1 hour) if bot is starting fresh
+                    elif mtime < one_hour_ago:
+                        # Create backup before cleaning
+                        backup_path = error_log.replace("error_log.csv", "error_log_archive.csv")
+                        if os.path.exists(backup_path):
+                            os.remove(backup_path)
+                        os.rename(error_log, backup_path)
+                        
+                        # Create new empty error log with headers
+                        with open(error_log, 'w', newline='', encoding='utf-8') as f:
+                            writer = csv.writer(f)
+                            writer.writerow([
+                                'timestamp', 'function', 'error_message', 'severity',
+                                'symbol', 'line_number', 'thread_id'
+                            ])
+                        
+                        cleaned_count += 1
+                        self._log_startup_event(f"Archived old error log: {error_log}")
+                        
+                except Exception as e:
+                    # If we can't clean it, just continue
+                    pass
+            
+            if cleaned_count > 0:
+                self._log_startup_event(f"Auto-cleaned {cleaned_count} error log files on startup")
+                
+        except Exception as e:
+            # Don't fail startup if cleanup fails
+            pass
+    
+    def _log_startup_event(self, message: str):
+        """Log startup events to a separate startup log"""
+        startup_log_path = self.log_files['startup_log']
+        try:
+            with open(startup_log_path, 'a', encoding='utf-8') as f:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                f.write(f"[{timestamp}] {message}\n")
+        except:
+            pass
+    
+    def _init_all_log_files(self):
+        """Initialize all CSV log files with headers"""
+        
+        # Trade Log
+        with open(self.log_files['trades'], 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestamp', 'symbol', 'direction', 'entry_price', 'exit_price',
+                'volume', 'profit', 'reason', 'status', 'sl_price', 'tp_price',
+                'ticket', 'magic', 'consecutive_losses', 'confluence_score', 'fvg_signal'
+            ])
+        
+        # Error Log - ALWAYS START FRESH
+        with open(self.log_files['errors'], 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestamp', 'function', 'error_message', 'severity',
+                'symbol', 'line_number', 'thread_id'
+            ])
+        
+        # Performance Log
+        with open(self.log_files['performance'], 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestamp', 'date', 'balance', 'equity', 'floating_pnl',
+                'total_trades', 'win_rate', 'profit_factor', 'sharpe_ratio', 'max_drawdown',
+                'daily_trades', 'daily_pnl', 'consecutive_losses'
+            ])
+        
+        # SL Movement Log
+        with open(self.log_files['sl_movements'], 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestamp', 'ticket', 'symbol', 'direction', 'entry_price',
+                'current_price', 'old_sl', 'new_sl', 'profit_in_pips',
+                'profit_usd', 'reason', 'move_type', 'atr_value'
+            ])
+        
+        # CRT Signals Log
+        with open(self.log_files['crt_signals'], 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestamp', 'symbol', 'pattern', 'direction', 'confidence',
+                'trend_direction', 'volume_confirmation', 'price', 'atr'
+            ])
+        
+        # SNR Signals Log
+        with open(self.log_files['snr_signals'], 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestamp', 'symbol', 'level_type', 'price', 'strength',
+                'direction', 'confidence', 'distance_to_price', 'atr'
+            ])
+        
+        # Confluence Log
+        with open(self.log_files['confluence'], 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestamp', 'symbol', 'trend_signals', 'crt_signals', 'snr_signals',
+                'fvg_signals', 'liquidity_signals', 'confluence_score', 'market_regime', 'final_decision', 'action_taken', 'dynamic_weights', 'strategy_breakdown', 'disabled_strategies'
+            ])
+        
+        # FVG Signals Log
+        with open(self.log_files['fvg_signals'], 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestamp', 'symbol', 'type', 'direction', 'high', 'low',
+                'gap_size', 'strength', 'fresh', 'mitigated', 'confluence_score',
+                'volume_confirmation', 'trend_alignment', 'snr_alignment'
+            ])
+        
+        # Liquidity Signals Log
+        with open(self.log_files['liquidity_signals'], 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestamp', 'symbol', 'zone_type', 'direction', 'price', 
+                'volume_ratio', 'strength', 'age_bars', 'confluence', 'atr'
+            ])
+        
+        # Startup Log
+        with open(self.log_files['startup_log'], 'w', encoding='utf-8') as f:
+            f.write("=" * 80 + "\n")
+            f.write(f"BOT STARTUP - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("=" * 80 + "\n")
+            f.write("Log cleaning system initialized\n")
+        
+        self.logger = None
+    
+    def setup_main_logger(self):
+        """Setup the main logger"""
+        self.logger = logging.getLogger("XAU_Bot_Pro_v16")
+        self.logger.setLevel(logging.DEBUG)
+        
+        # Remove existing handlers
+        self.logger.handlers = []
+        
+        # Create formatters
+        detailed_formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        simple_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        
+        # File handler for detailed logging
+        file_handler = logging.FileHandler(self.log_files['main'], encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(detailed_formatter)
+        
+        # Console handler for simple output
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(simple_formatter)
+        
+        # Add handlers
+        self.logger.addHandler(file_handler)
+        self.logger.addHandler(console_handler)
+
+        # Standard runtime log in local repo folder
+        runtime_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs', 'runtime_log.txt')
+        runtime_handler = logging.FileHandler(runtime_log, encoding='utf-8')
+        runtime_handler.setLevel(logging.INFO)
+        runtime_handler.setFormatter(simple_formatter)
+        self.logger.addHandler(runtime_handler)
+    
+    def log_error(self, function_name: str, error_message: str, severity: str = "ERROR", 
+                  symbol: str = "", line_number: str = "", thread_id: str = ""):
+        """Log error to CSV file"""
+        try:
+            with open(self.log_files['errors'], 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    function_name,
+                    error_message,
+                    severity,
+                    symbol,
+                    line_number,
+                    thread_id or threading.current_thread().name
+                ])
+        except Exception as e:
+            print(f"Failed to log error: {e}")
+    
+    def log_trade(self, trade_data: Dict):
+        """Log trade to CSV file"""
+        try:
+            with open(self.log_files['trades'], 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    trade_data.get('timestamp', datetime.now().isoformat()),
+                    trade_data.get('symbol', ''),
+                    trade_data.get('direction', ''),
+                    trade_data.get('entry_price', 0),
+                    trade_data.get('exit_price', 0),
+                    trade_data.get('volume', 0),
+                    trade_data.get('profit', 0),
+                    trade_data.get('reason', ''),
+                    trade_data.get('status', ''),
+                    trade_data.get('sl_price', 0),
+                    trade_data.get('tp_price', 0),
+                    trade_data.get('ticket', 0),
+                    trade_data.get('magic', 0),
+                    trade_data.get('consecutive_losses', 0),
+                    trade_data.get('confluence_score', 0),
+                    trade_data.get('fvg_signal', False)
+                ])
+        except Exception as e:
+            self.logger.error(f"Failed to log trade: {e}")
+    
+    def log_performance(self, performance_data: Dict):
+        """Log performance to CSV file"""
+        try:
+            with open(self.log_files['performance'], 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    performance_data.get('timestamp', datetime.now().isoformat()),
+                    performance_data.get('date', datetime.now().date().isoformat()),
+                    performance_data.get('balance', 0),
+                    performance_data.get('equity', 0),
+                    performance_data.get('floating_pnl', 0),
+                    performance_data.get('total_trades', 0),
+                    performance_data.get('win_rate', 0),
+                    performance_data.get('profit_factor', 0),
+                    performance_data.get('sharpe_ratio', 0),
+                    performance_data.get('max_drawdown', 0),
+                    performance_data.get('daily_trades', 0),
+                    performance_data.get('daily_pnl', 0),
+                    performance_data.get('consecutive_losses', 0)
+                ])
+        except Exception as e:
+            self.logger.error(f"Failed to log performance: {e}")
+    
+    def log_sl_movement(self, sl_data: Dict):
+        """Log SL movement to CSV file"""
+        try:
+            with open(self.log_files['sl_movements'], 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    sl_data.get('timestamp', datetime.now().isoformat()),
+                    sl_data.get('ticket', 0),
+                    sl_data.get('symbol', ''),
+                    sl_data.get('direction', ''),
+                    sl_data.get('entry_price', 0),
+                    sl_data.get('current_price', 0),
+                    sl_data.get('old_sl', 0),
+                    sl_data.get('new_sl', 0),
+                    sl_data.get('profit_in_pips', 0),
+                    sl_data.get('profit_usd', 0),
+                    sl_data.get('reason', ''),
+                    sl_data.get('move_type', ''),
+                    sl_data.get('atr_value', 0)
+                ])
+        except Exception as e:
+            self.logger.error(f"Failed to log SL movement: {e}")
+    
+    def log_crt_signal(self, crt_data: Dict):
+        """Log CRT signal to CSV file"""
+        try:
+            with open(self.log_files['crt_signals'], 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    crt_data.get('symbol', ''),
+                    crt_data.get('pattern', ''),
+                    crt_data.get('direction', ''),
+                    crt_data.get('confidence', 0),
+                    crt_data.get('trend_direction', ''),
+                    crt_data.get('volume_confirmation', False),
+                    crt_data.get('price', 0),
+                    crt_data.get('atr', 0)
+                ])
+        except Exception as e:
+            self.logger.error(f"Failed to log CRT signal: {e}")
+    
+    def log_snr_signal(self, snr_data: Dict):
+        """Log SNR signal to CSV file"""
+        try:
+            with open(self.log_files['snr_signals'], 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    snr_data.get('symbol', ''),
+                    snr_data.get('level_type', ''),
+                    snr_data.get('price', 0),
+                    snr_data.get('strength', 0),
+                    snr_data.get('direction', ''),
+                    snr_data.get('confidence', 0),
+                    snr_data.get('distance_to_price', 0),
+                    snr_data.get('atr', 0)
+                ])
+        except Exception as e:
+            self.logger.error(f"Failed to log SNR signal: {e}")
+    
+    def log_confluence(self, confluence_data: Dict):
+        """Log confluence analysis to CSV file"""
+        try:
+            with open(self.log_files['confluence'], 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    confluence_data.get('symbol', ''),
+                    confluence_data.get('trend_signals', 0),
+                    confluence_data.get('crt_signals', 0),
+                    confluence_data.get('snr_signals', 0),
+                    confluence_data.get('fvg_signals', 0),
+                    confluence_data.get('liquidity_signals', 0),
+                    confluence_data.get('confluence_score', 0),
+                    confluence_data.get('market_regime', ''),
+                    confluence_data.get('final_decision', ''),
+                    confluence_data.get('action_taken', ''),
+                    confluence_data.get('dynamic_weights', ''),
+                    confluence_data.get('strategy_breakdown', ''),
+                    confluence_data.get('disabled_strategies', '')
+                ])
+        except Exception as e:
+            self.logger.error(f"Failed to log confluence: {e}")
+    
+    def log_fvg_signal(self, fvg_data: Dict):
+        """Log FVG signal to CSV file"""
+        try:
+            with open(self.log_files['fvg_signals'], 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    fvg_data.get('symbol', ''),
+                    fvg_data.get('type', ''),
+                    fvg_data.get('direction', ''),
+                    fvg_data.get('high', 0),
+                    fvg_data.get('low', 0),
+                    fvg_data.get('gap_size', 0),
+                    fvg_data.get('strength', 0),
+                    fvg_data.get('fresh', False),
+                    fvg_data.get('mitigated', False),
+                    fvg_data.get('confluence_score', 0),
+                    fvg_data.get('volume_confirmation', False),
+                    fvg_data.get('trend_alignment', 0),
+                    fvg_data.get('snr_alignment', 0)
+                ])
+        except Exception as e:
+            self.logger.error(f"Failed to log FVG signal: {e}")
+    
+    def log_liquidity_signal(self, liquidity_data: Dict):
+        """Log liquidity signal to CSV file"""
+        try:
+            with open(self.log_files['liquidity_signals'], 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    liquidity_data.get('symbol', ''),
+                    liquidity_data.get('zone_type', ''),
+                    liquidity_data.get('direction', ''),
+                    liquidity_data.get('price', 0),
+                    liquidity_data.get('volume_ratio', 0),
+                    liquidity_data.get('strength', 0),
+                    liquidity_data.get('age_bars', 0),
+                    liquidity_data.get('confluence', 0),
+                    liquidity_data.get('atr', 0)
+                ])
+        except Exception as e:
+            self.logger.error(f"Failed to log liquidity signal: {e}")
+    
+    def check_error_log_health(self) -> Dict[str, Any]:
+        """Check if error log is healthy (mostly empty)"""
+        error_log_path = self.log_files['errors']
+        try:
+            if not os.path.exists(error_log_path):
+                return {'healthy': True, 'error_count': 0, 'message': 'Error log does not exist'}
+            
+            with open(error_log_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            if len(lines) <= 1:  # Only header or empty
+                return {'healthy': True, 'error_count': 0, 'message': 'Error log is clean'}
+            else:
+                # Count actual error rows (excluding header)
+                error_count = len(lines) - 1
+                return {
+                    'healthy': error_count < 10,  # Consider healthy if less than 10 errors
+                    'error_count': error_count,
+                    'message': f'Found {error_count} errors in log'
+                }
+        except Exception as e:
+            return {'healthy': False, 'error_count': -1, 'message': f'Error checking log health: {e}'}
+    
+    def archive_error_log_if_clean(self):
+        """Archive the current error log if it's mostly clean"""
+        health = self.check_error_log_health()
+        
+        if health['healthy'] and health['error_count'] == 0:
+            try:
+                # Archive the clean log
+                archive_path = self.log_files['errors'].replace('.csv', '_archive.csv')
+                if os.path.exists(self.log_files['errors']):
+                    # Move to archive
+                    if os.path.exists(archive_path):
+                        os.remove(archive_path)
+                    os.rename(self.log_files['errors'], archive_path)
+                    
+                    # Create fresh error log
+                    with open(self.log_files['errors'], 'w', newline='', encoding='utf-8') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([
+                            'timestamp', 'function', 'error_message', 'severity',
+                            'symbol', 'line_number', 'thread_id'
+                        ])
+                    
+                    self.logger.info(f"Archived clean error log. Health status: {health['message']}")
+            except Exception as e:
+                self.logger.error(f"Failed to archive error log: {e}")
+
+# ==================== AUTOMATIC CONNECTION MANAGER ====================
+class ConnectionManager:
+    """AUTOMATIC CONNECTION MANAGEMENT with exponential backoff"""
+    
+    def __init__(self):
+        self.connected = False
+        self.last_connection_check = 0
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = config.MAX_RECONNECT_ATTEMPTS
+        self.backoff_base = config.RECONNECT_BACKOFF_BASE
+        
+    def initialize_with_retry(self) -> float:
+        """Initialize MT5 with exponential backoff retry"""
+        attempt = 0
+        
+        while attempt < self.max_reconnect_attempts:
+            try:
+                logger.logger.info(f"MT5 Connection Attempt {attempt + 1}/{self.max_reconnect_attempts}")
+                
+                if not mt5.initialize(login=config.LOGIN, password=config.PASSWORD, server=config.SERVER):
+                    error_msg = f"MT5 initialize failed: {mt5.last_error()}"
+                    logger.logger.error(error_msg)
+                    logger.log_error("initialize_with_retry", error_msg, "ERROR")
+                    
+                    attempt += 1
+                    self.reconnect_attempts = attempt
+                    
+                    wait_time = self.backoff_base ** attempt
+                    logger.logger.warning(f"Waiting {wait_time:.1f} seconds before retry...")
+                    time.sleep(wait_time)
+                    continue
+                
+                acct = mt5.account_info()
+                if acct is None:
+                    error_msg = "Account info unavailable after connection"
+                    logger.logger.error(error_msg)
+                    logger.log_error("initialize_with_retry", error_msg, "ERROR")
+                    mt5.shutdown()
+                    
+                    attempt += 1
+                    self.reconnect_attempts = attempt
+                    wait_time = self.backoff_base ** attempt
+                    time.sleep(wait_time)
+                    continue
+                
+                if config.VALIDATE_SYMBOLS_ON_STARTUP:
+                    self.validate_all_symbols()
+                
+                self.connected = True
+                self.reconnect_attempts = 0
+                self.last_connection_check = time.time()
+                
+                logger.logger.info(f"✅ MT5 Connected Successfully")
+                logger.logger.info(f"Account: {acct.login}, Balance: ${acct.balance:.2f}")
+                
+                return float(acct.balance)
+                
+            except Exception as e:
+                error_msg = f"Connection error: {str(e)}"
+                logger.logger.error(error_msg)
+                logger.log_error("initialize_with_retry", error_msg, "CRITICAL")
+                
+                attempt += 1
+                self.reconnect_attempts = attempt
+                
+                if attempt < self.max_reconnect_attempts:
+                    wait_time = self.backoff_base ** attempt
+                    logger.logger.warning(f"Retrying in {wait_time:.1f} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    logger.logger.critical(f"Max reconnection attempts reached ({self.max_reconnect_attempts})")
+                    raise SystemExit(f"Failed to connect to MT5 after {self.max_reconnect_attempts} attempts")
+        
+        raise SystemExit("MT5 connection failed")
+    
+    def validate_all_symbols(self):
+        """Validate all trading symbols on startup"""
+        logger.logger.info("Validating trading symbols...")
+        
+        for symbol in config.SYMBOLS:
+            try:
+                info = get_symbol_info_safe(symbol)
+                if info is None:
+                    logger.logger.error(f"❌ Symbol {symbol} not found!")
+                    logger.log_error("validate_all_symbols", f"Symbol {symbol} not found", "ERROR")
+                else:
+                    logger.logger.info(f"✅ Symbol {symbol} validated")
+                    logger.logger.info(
+                        f"{symbol} point={getattr(info, 'point', 'n/a')}, "
+                        f"trade_tick_size={getattr(info, 'trade_tick_size', 'n/a')}, "
+                        f"trade_tick_value={getattr(info, 'trade_tick_value', 'n/a')}, "
+                        f"stops_level={getattr(info, 'trade_stops_level', 'n/a')}, "
+                        f"digits={getattr(info, 'digits', 'n/a')}"
+                    )
+                    logger.logger.debug(f"  Point: {info.point}, Spread: {info.spread}")
+            except Exception as e:
+                logger.logger.error(f"Error validating symbol {symbol}: {e}")
+                logger.log_error("validate_all_symbols", str(e), "WARNING", symbol)
+    
+    def check_connection(self) -> bool:
+        """Check if MT5 connection is still active"""
+        try:
+            current_time = time.time()
+            
+            if current_time - self.last_connection_check < config.MONITOR_INTERVAL:
+                return self.connected
+            
+            self.last_connection_check = current_time
+            
+            acct = mt5.account_info()
+            
+            if acct is None:
+                logger.logger.warning("MT5 connection lost - account info unavailable")
+                self.connected = False
+                return False
+            
+            self.connected = True
+            return True
+            
+        except Exception as e:
+            logger.logger.error(f"Connection check failed: {e}")
+            self.connected = False
+            return False
+    
+    def reconnect_if_needed(self) -> bool:
+        """Auto-reconnect if connection is lost"""
+        if not self.connected or not self.check_connection():
+            logger.logger.warning("Connection lost, attempting to reconnect...")
+            
+            try:
+                mt5.shutdown()
+                time.sleep(2)
+                
+                self.initialize_with_retry()
+                
+                if self.connected:
+                    logger.logger.info("✅ Successfully reconnected to MT5")
+                    return True
+                else:
+                    logger.logger.error("Failed to reconnect to MT5")
+                    return False
+                    
+            except Exception as e:
+                logger.logger.error(f"Reconnection failed: {e}")
+                logger.log_error("reconnect_if_needed", str(e), "CRITICAL")
+                return False
+        
+        return True
+
+# ==================== UTILITY FUNCTIONS ====================
+def sanitize_comment(comment: str) -> str:
+    """Sanitize comment string for MT5 compatibility"""
+    if not comment:
+        return "TRADE"
+    
+    comment = comment.encode('ascii', 'ignore').decode('ascii')
+    invalid_chars = ['<', '>', '"', "'", '&', '|', ';', '`', '$', '(', ')', '{', '}', '[', ']', '\\', '/', '?', '=', '+', '*', '^', '%', '#', '@', '!', '~']
+    for char in invalid_chars:
+        comment = comment.replace(char, '_')
+    
+    comment = re.sub(r'_+', '_', comment)
+    comment = comment.strip('_')
+    
+    if len(comment) > 25:
+        comment = comment[:25]
+    
+    if not comment.strip():
+        comment = "TRADE"
+    
+    return comment.strip()
+
+def debug_mt5_error():
+    """Debug MT5 errors with detailed information"""
+    error_code, error_desc = mt5.last_error()
+    logger.logger.error(f"MT5 Error: Code={error_code}, Description={error_desc}")
+    
+    error_fixes = {
+        -2: "Invalid argument in order request. Check comment, price, or volume format.",
+        -3: "Invalid trade parameters. Verify symbol exists and is tradeable.",
+        -10004: "Requote. Price changed during order execution.",
+        -10019: "Not enough money. Check account balance.",
+        -10021: "Market closed. Check trading hours.",
+        -10027: "Order expired. Increase deviation or use different order type.",
+    }
+    
+    if error_code in error_fixes:
+        logger.logger.error(f"Suggested fix: {error_fixes[error_code]}")
+    
+    return error_code, error_desc
+
+def is_recoverable_mt5_error(error_code: int) -> bool:
+    recoverable_codes = {
+        -10004,  # requote
+        -10006,  # no connection
+        -10009,  # invalid price
+        -10014,  # trade timeout
+        -10021,  # market closed
+        -10027,  # order expired
+    }
+    return error_code in recoverable_codes
+
+def mt5_order_send_with_recovery(request: Dict[str, Any], context: str, max_attempts: int = 3):
+    """Order send with MT5-specific recovery handling."""
+    mutable_request = dict(request)
+    for attempt in range(1, max_attempts + 1):
+        res = mt5.order_send(mutable_request)
+        if res is not None and getattr(res, "retcode", None) in {
+            mt5.TRADE_RETCODE_DONE,
+            mt5.TRADE_RETCODE_DONE_PARTIAL,
+            mt5.TRADE_RETCODE_PLACED,
+        }:
+            return res
+
+        error_code, error_desc = mt5.last_error()
+        logger.logger.warning(f"{context}: order_send attempt {attempt} failed "
+                             f"retcode={getattr(res, 'retcode', None)} "
+                             f"error={error_code} {error_desc}")
+        logger.log_error("mt5_order_send_with_recovery",
+                         f"{context} failed: {error_code} {error_desc}",
+                         "WARNING")
+
+        retcode = getattr(res, "retcode", None)
+        if retcode in {getattr(mt5, 'TRADE_RETCODE_PRICE_CHANGED', -1), getattr(mt5, 'TRADE_RETCODE_REQUOTE', -1)}:
+            tick = mt5.symbol_info_tick(mutable_request.get("symbol", ""))
+            if tick is not None and "type" in mutable_request:
+                mutable_request["price"] = float(tick.ask) if mutable_request["type"] == mt5.ORDER_TYPE_BUY else float(tick.bid)
+                mutable_request["deviation"] = min(120, int(mutable_request.get("deviation", 50)) + 10)
+                logger.logger.info(f"{context}: requote/price change -> refreshing price and retrying")
+
+        if is_recoverable_mt5_error(error_code):
+            connection_manager.reconnect_if_needed()
+            time.sleep(0.5 * attempt)
+            continue
+
+        break
+
+    debug_mt5_error()
+    return None
+
+def nowstr():
+    return datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+
+def get_account_info_safe():
+    if config.PAPER_TRADING_ENABLED:
+        return paper_engine.get_account_info()
+    return mt5.account_info()
+
+SYMBOL_RESOLUTION_CACHE: Dict[str, str] = {}
+
+def resolve_broker_symbol(symbol: str) -> str:
+    """Resolve configured symbol to actual broker symbol (suffix/prefix tolerant)."""
+    if not symbol:
+        return symbol
+    if config.PAPER_TRADING_ENABLED or not config.ENABLE_BROKER_SYMBOL_MAPPING:
+        return symbol
+    cached = SYMBOL_RESOLUTION_CACHE.get(symbol)
+    if cached:
+        return cached
+
+    try:
+        direct = mt5.symbol_info(symbol)
+        if direct is not None:
+            SYMBOL_RESOLUTION_CACHE[symbol] = symbol
+            return symbol
+
+        # Common broker suffix/prefix variants
+        candidates = [
+            symbol, f"{symbol}.m", f"{symbol}m", f"{symbol}.pro", f"{symbol}pro",
+            f"{symbol}_i", f"{symbol}.i", f"{symbol}#", f"{symbol}."
+        ]
+        for cand in candidates:
+            info = mt5.symbol_info(cand)
+            if info is not None:
+                mt5.symbol_select(cand, True)
+                SYMBOL_RESOLUTION_CACHE[symbol] = cand
+                logger.logger.info(f"Resolved symbol mapping: {symbol} -> {cand}")
+                return cand
+
+        normalized_target = re.sub(r'[^A-Z0-9]', '', symbol.upper())
+        all_symbols = mt5.symbols_get() or []
+        for s in all_symbols:
+            name = getattr(s, "name", "")
+            normalized_name = re.sub(r'[^A-Z0-9]', '', str(name).upper())
+            if normalized_target and normalized_target in normalized_name:
+                mt5.symbol_select(name, True)
+                SYMBOL_RESOLUTION_CACHE[symbol] = name
+                logger.logger.info(f"Resolved symbol mapping via scan: {symbol} -> {name}")
+                return name
+    except Exception as e:
+        logger.logger.warning(f"Symbol resolution failed for {symbol}: {e}")
+
+    return symbol
+
+def get_positions_safe(symbol: Optional[str] = None):
+    if config.PAPER_TRADING_ENABLED:
+        return paper_engine.get_positions_as_mt5(symbol)
+    resolved_symbol = resolve_broker_symbol(symbol) if symbol else None
+    return mt5.positions_get(symbol=resolved_symbol) if resolved_symbol else mt5.positions_get()
+
+
+def get_symbol_info_safe(symbol: str):
+    symbol = resolve_broker_symbol(symbol)
+    info = mt5.symbol_info(symbol)
+    if info is not None:
+        return info
+
+    if config.PAPER_TRADING_ENABLED:
+        # Minimal symbol metadata fallback for paper-mode sizing and spread calculations
+        point = 0.01
+        tick_size = 0.01
+        tick_value = 1.0
+        return SimpleNamespace(
+            point=point,
+            trade_tick_size=tick_size,
+            trade_tick_value=tick_value,
+            volume_min=0.01,
+            volume_step=0.01,
+            volume_max=100.0,
+        )
+
+    return None
+
+def get_spread_points(symbol: str) -> Optional[float]:
+    symbol = resolve_broker_symbol(symbol)
+    tick = mt5.symbol_info_tick(resolve_broker_symbol(symbol))
+    info = mt5.symbol_info(symbol)
+    if tick is None or info is None:
+        return None
+    return (tick.ask - tick.bid) / info.point if info.point else None
+
+# Initialize logger FIRST
+logger = AutomatedLogger()
+
+# Initialize connection manager
+connection_manager = ConnectionManager()
+
+# ==================== INITIALIZE MT5 WITH AUTOMATIC RECOVERY ====================
+def initialize_mt5_with_recovery() -> float:
+    """Initialize MT5 with automatic recovery"""
+    if config.BACKTEST_MODE:
+        logger.logger.info("Backtest mode enabled - skipping MT5 initialization")
+        return config.BACKTEST_INITIAL_BALANCE
+    if config.PAPER_TRADING_ENABLED:
+        logger.logger.info("Paper trading mode enabled - initializing MT5 data connection")
+        connection_manager.initialize_with_retry()
+        return config.PAPER_INITIAL_BALANCE
+    logger.logger.info("Initializing MT5 with automatic recovery...")
+    return connection_manager.initialize_with_retry()
+
+# Now initialize MT5 and get starting balance
+STARTING_BALANCE = initialize_mt5_with_recovery()
+
+# ==================== CRT STRATEGY ====================
+class CRTStrategy:
+    """Systematic Candlestick Pattern Recognition with Trend Confirmation"""
+    
+    def __init__(self):
+        self.patterns = config.CRT_PATTERNS
+        logger.logger.info(f"CRT Strategy initialized with {len(self.patterns)} patterns")
+    
+    def is_hammer(self, candle: pd.Series, prev_trend: str = 'downtrend') -> Tuple[bool, float]:
+        """Detect hammer pattern"""
+        if prev_trend not in ['downtrend', 'sideways']:
+            return False, 0.0
+        
+        body = abs(candle['close'] - candle['open'])
+        upper_shadow = candle['high'] - max(candle['close'], candle['open'])
+        lower_shadow = min(candle['close'], candle['open']) - candle['low']
+        
+        is_hammer = (lower_shadow > body * 2.0) and (upper_shadow < body * 0.5)
+        
+        if is_hammer:
+            confidence = 0.75
+            if candle.get('at_support', False):
+                confidence = 0.85
+            return True, confidence
+        
+        return False, 0.0
+    
+    def is_shooting_star(self, candle: pd.Series, prev_trend: str = 'uptrend') -> Tuple[bool, float]:
+        """Detect shooting star pattern"""
+        if prev_trend not in ['uptrend', 'sideways']:
+            return False, 0.0
+        
+        body = abs(candle['close'] - candle['open'])
+        upper_shadow = candle['high'] - max(candle['close'], candle['open'])
+        lower_shadow = min(candle['close'], candle['open']) - candle['low']
+        
+        is_shooting_star = (upper_shadow > body * 2.0) and (lower_shadow < body * 0.5)
+        
+        if is_shooting_star:
+            confidence = 0.75
+            if candle.get('at_resistance', False):
+                confidence = 0.85
+            return True, confidence
+        
+        return False, 0.0
+    
+    def is_bullish_engulfing(self, prev_candle: pd.Series, current_candle: pd.Series, 
+                           prev_trend: str = 'downtrend') -> Tuple[bool, float]:
+        """Detect bullish engulfing pattern"""
+        if prev_trend not in ['downtrend', 'sideways']:
+            return False, 0.0
+        
+        prev_bearish = prev_candle['close'] < prev_candle['open']
+        current_bullish = current_candle['close'] > current_candle['open']
+        
+        is_engulfing = (prev_bearish and current_bullish and 
+                       current_candle['open'] < prev_candle['close'] and 
+                       current_candle['close'] > prev_candle['open'])
+        
+        if is_engulfing:
+            confidence = 0.80
+            engulf_size = (current_candle['close'] - current_candle['open']) / prev_candle['body'] if prev_candle.get('body', 0) > 0 else 1
+            if engulf_size > 1.5:
+                confidence = 0.90
+            return True, confidence
+        
+        return False, 0.0
+    
+    def is_bearish_engulfing(self, prev_candle: pd.Series, current_candle: pd.Series,
+                           prev_trend: str = 'uptrend') -> Tuple[bool, float]:
+        """Detect bearish engulfing pattern"""
+        if prev_trend not in ['uptrend', 'sideways']:
+            return False, 0.0
+        
+        prev_bullish = prev_candle['close'] > prev_candle['open']
+        current_bearish = current_candle['close'] < current_candle['open']
+        
+        is_engulfing = (prev_bullish and current_bearish and 
+                       current_candle['open'] > prev_candle['close'] and 
+                       current_candle['close'] < prev_candle['open'])
+        
+        if is_engulfing:
+            confidence = 0.80
+            engulf_size = (prev_candle['open'] - current_candle['close']) / prev_candle['body'] if prev_candle.get('body', 0) > 0 else 1
+            if engulf_size > 1.5:
+                confidence = 0.90
+            return True, confidence
+        
+        return False, 0.0
+    
+    def is_morning_star(self, first: pd.Series, second: pd.Series, third: pd.Series,
+                       prev_trend: str = 'downtrend') -> Tuple[bool, float]:
+        """Detect morning star pattern (3-candle bullish reversal)"""
+        if prev_trend not in ['downtrend', 'sideways']:
+            return False, 0.0
+        
+        first_bearish = first['close'] < first['open']
+        second_small_body = abs(second['close'] - second['open']) < (abs(first['close'] - first['open']) * 0.3)
+        third_bullish = third['close'] > third['open']
+        
+        is_morning_star = (first_bearish and second_small_body and third_bullish and
+                          third['close'] > (first['open'] + first['close']) / 2)
+        
+        if is_morning_star:
+            return True, 0.85
+        
+        return False, 0.0
+    
+    def is_evening_star(self, first: pd.Series, second: pd.Series, third: pd.Series,
+                       prev_trend: str = 'uptrend') -> Tuple[bool, float]:
+        """Detect evening star pattern (3-candle bearish reversal)"""
+        if prev_trend not in ['uptrend', 'sideways']:
+            return False, 0.0
+        
+        first_bullish = first['close'] > first['open']
+        second_small_body = abs(second['close'] - second['open']) < (abs(first['close'] - first['open']) * 0.3)
+        third_bearish = third['close'] < third['open']
+        
+        is_evening_star = (first_bullish and second_small_body and third_bearish and
+                          third['close'] < (first['open'] + first['close']) / 2)
+        
+        if is_evening_star:
+            return True, 0.85
+        
+        return False, 0.0
+    
+    def detect_all_patterns(self, df: pd.DataFrame, trend_direction: str, 
+                          current_price: float, atr: float, symbol: str) -> List[Dict]:
+        """Detect all candlestick patterns with trend confirmation"""
+        if len(df) < 10:
+            return []
+        
+        patterns = []
+        current = df.iloc[-1]
+        prev = df.iloc[-2] if len(df) >= 2 else None
+        prev2 = df.iloc[-3] if len(df) >= 3 else None
+        
+        if prev is not None:
+            prev = prev.copy()
+            prev['body'] = abs(prev['close'] - prev['open'])
+        
+        # FIX: Use 'tick_volume' instead of 'volume'
+        avg_volume = df['tick_volume'].rolling(10).mean().iloc[-1] if 'tick_volume' in df else 0
+        volume_confirmation = current.get('tick_volume', 0) > avg_volume * 1.2 if avg_volume > 0 else False
+        
+        pattern_checks = [
+            ('hammer', self.is_hammer(current, trend_direction)),
+            ('shooting_star', self.is_shooting_star(current, trend_direction)),
+        ]
+        
+        if prev is not None:
+            pattern_checks.extend([
+                ('bullish_engulfing', self.is_bullish_engulfing(prev, current, trend_direction)),
+                ('bearish_engulfing', self.is_bearish_engulfing(prev, current, trend_direction)),
+            ])
+        
+        if prev is not None and prev2 is not None:
+            pattern_checks.extend([
+                ('morning_star', self.is_morning_star(prev2, prev, current, trend_direction)),
+                ('evening_star', self.is_evening_star(prev2, prev, current, trend_direction)),
+            ])
+        
+        for pattern_name, (detected, confidence) in pattern_checks:
+            if detected and confidence >= config.CRT_MIN_CONFIDENCE:
+                direction = 'buy' if pattern_name in ['hammer', 'bullish_engulfing', 'morning_star'] else 'sell'
+                
+                pattern_data = {
+                    'symbol': symbol,
+                    'pattern': pattern_name,
+                    'direction': direction,
+                    'confidence': confidence,
+                    'trend_direction': trend_direction,
+                    'volume_confirmation': volume_confirmation,
+                    'price': current_price,
+                    'atr': atr
+                }
+                
+                patterns.append(pattern_data)
+                logger.log_crt_signal(pattern_data)
+        
+        return patterns
+
+# ==================== SNR STRATEGY ====================
+class SNRStrategy:
+    """Dynamic Support & Resistance with Confluence Scoring"""
+    
+    def __init__(self):
+        self.lookback = config.SNR_LOOKBACK_PERIODS
+        self.support_levels = {}
+        self.resistance_levels = {}
+        logger.logger.info(f"SNR Strategy initialized with {self.lookback} period lookback")
+    
+    def find_swing_points(self, df: pd.DataFrame, window: int = 5) -> Tuple[List[Dict], List[Dict]]:
+        """Find swing highs and lows"""
+        highs = []
+        lows = []
+        
+        for i in range(window, len(df) - window):
+            if all(df['high'].iloc[i] >= df['high'].iloc[i-j] for j in range(1, window+1)) and \
+               all(df['high'].iloc[i] >= df['high'].iloc[i+j] for j in range(1, window+1)):
+                highs.append({
+                    'price': df['high'].iloc[i],
+                    'index': i,
+                    'strength': 1.0
+                })
+            
+            if all(df['low'].iloc[i] <= df['low'].iloc[i-j] for j in range(1, window+1)) and \
+               all(df['low'].iloc[i] <= df['low'].iloc[i+j] for j in range(1, window+1)):
+                lows.append({
+                    'price': df['low'].iloc[i],
+                    'index': i,
+                    'strength': 1.0
+                })
+        
+        return highs, lows
+    
+    def calculate_pivot_points(self, df: pd.DataFrame) -> Dict[str, float]:
+        """Calculate traditional pivot points"""
+        if len(df) < 2:
+            return {}
+        
+        high = df['high'].iloc[-1]
+        low = df['low'].iloc[-1]
+        close = df['close'].iloc[-1]
+        
+        pivot = (high + low + close) / 3
+        r1 = (2 * pivot) - low
+        s1 = (2 * pivot) - high
+        r2 = pivot + (high - low)
+        s2 = pivot - (high - low)
+        r3 = high + 2 * (pivot - low)
+        s3 = low - 2 * (high - pivot)
+        
+        return {
+            'pivot': pivot,
+            'r1': r1, 'r2': r2, 'r3': r3,
+            's1': s1, 's2': s2, 's3': s3
+        }
+    
+    def calculate_fibonacci_levels(self, df: pd.DataFrame, lookback: int = 20) -> Dict[str, float]:
+        """Calculate Fibonacci retracement levels"""
+        if len(df) < lookback:
+            return {}
+        
+        recent_high = df['high'].rolling(lookback).max().iloc[-1]
+        recent_low = df['low'].rolling(lookback).min().iloc[-1]
+        price_range = recent_high - recent_low
+        
+        if price_range == 0:
+            return {}
+        
+        return {
+            'fib_0': recent_low,
+            'fib_0.236': recent_low + price_range * 0.236,
+            'fib_0.382': recent_low + price_range * 0.382,
+            'fib_0.5': recent_low + price_range * 0.5,
+            'fib_0.618': recent_low + price_range * 0.618,
+            'fib_0.786': recent_low + price_range * 0.786,
+            'fib_1': recent_high,
+        }
+    
+    def identify_key_levels(self, df: pd.DataFrame, current_price: float, atr: float) -> Dict[str, List[Dict]]:
+        """Identify all key support and resistance levels with strength scoring"""
+        levels = {
+            'support': [],
+            'resistance': [],
+            'confluence_zones': []
+        }
+        
+        if len(df) < 20:
+            return levels
+        
+        swing_highs, swing_lows = self.find_swing_points(df.tail(100))
+        pivots = self.calculate_pivot_points(df.tail(2))
+        fib_levels = self.calculate_fibonacci_levels(df.tail(50))
+        
+        for high in swing_highs:
+            price = high['price']
+            if abs(price - current_price) <= atr * 3:
+                touches = sum(1 for i in range(len(df)-20, len(df)) 
+                            if abs(df['high'].iloc[i] - price) <= atr * 0.1)
+                strength = min(1.0, 0.5 + (touches * 0.1))
+                
+                if strength >= config.SNR_MIN_STRENGTH:
+                    levels['resistance'].append({
+                        'price': price,
+                        'strength': strength,
+                        'type': 'swing_high',
+                        'touches': touches
+                    })
+        
+        for low in swing_lows:
+            price = low['price']
+            if abs(price - current_price) <= atr * 3:
+                touches = sum(1 for i in range(len(df)-20, len(df)) 
+                            if abs(df['low'].iloc[i] - price) <= atr * 0.1)
+                strength = min(1.0, 0.5 + (touches * 0.1))
+                
+                if strength >= config.SNR_MIN_STRENGTH:
+                    levels['support'].append({
+                        'price': price,
+                        'strength': strength,
+                        'type': 'swing_low',
+                        'touches': touches
+                    })
+        
+        for name, price in pivots.items():
+            if name.startswith('r'):
+                levels['resistance'].append({
+                    'price': price,
+                    'strength': 0.7,
+                    'type': 'pivot',
+                    'touches': 0
+                })
+            elif name.startswith('s'):
+                levels['support'].append({
+                    'price': price,
+                    'strength': 0.7,
+                    'type': 'pivot',
+                    'touches': 0
+                })
+        
+        for name, price in fib_levels.items():
+            if price == 0:
+                continue
+                
+            level_type = 'support' if 'fib_0' in name or 'fib_0.236' in name or 'fib_0.382' in name else 'resistance'
+            if level_type == 'support':
+                levels['support'].append({
+                    'price': price,
+                    'strength': 0.6,
+                    'type': 'fibonacci',
+                    'touches': 0
+                })
+            else:
+                levels['resistance'].append({
+                    'price': price,
+                    'strength': 0.6,
+                    'type': 'fibonacci',
+                    'touches': 0
+                })
+        
+        for level_type in ['support', 'resistance']:
+            levels[level_type].sort(key=lambda x: abs(x['price'] - current_price))
+        
+        return levels
+    
+    def get_trade_signals(self, df: pd.DataFrame, current_price: float, 
+                         atr: float, trend_direction: str, symbol: str) -> List[Dict]:
+        """Generate trade signals based on price action at key levels"""
+        signals = []
+        
+        if len(df) < 30:
+            return signals
+        
+        levels = self.identify_key_levels(df, current_price, atr)
+        
+        for support in levels['support'][:3]:
+            distance = abs(current_price - support['price'])
+            zone_width = atr * config.SNR_ZONE_WIDTH_PCT
+            
+            if distance <= zone_width:
+                last_3 = df.tail(3)
+                bullish_reversal = (
+                    last_3['close'].iloc[-1] > last_3['open'].iloc[-1] and
+                    last_3['close'].iloc[-1] > last_3['close'].iloc[-2]
+                )
+                
+                if bullish_reversal or trend_direction == 'downtrend':
+                    confidence = support['strength'] * 0.8
+                    if confidence >= config.SNR_MIN_STRENGTH:
+                        signals.append({
+                            'symbol': symbol,
+                            'direction': 'buy',
+                            'level_type': 'support',
+                            'price': support['price'],
+                            'strength': support['strength'],
+                            'confidence': confidence,
+                            'distance_to_price': distance,
+                            'atr': atr
+                        })
+        
+        for resistance in levels['resistance'][:3]:
+            distance = abs(current_price - resistance['price'])
+            zone_width = atr * config.SNR_ZONE_WIDTH_PCT
+            
+            if distance <= zone_width:
+                last_3 = df.tail(3)
+                bearish_reversal = (
+                    last_3['close'].iloc[-1] < last_3['open'].iloc[-1] and
+                    last_3['close'].iloc[-1] < last_3['close'].iloc[-2]
+                )
+                
+                if bearish_reversal or trend_direction == 'uptrend':
+                    confidence = resistance['strength'] * 0.8
+                    if confidence >= config.SNR_MIN_STRENGTH:
+                        signals.append({
+                            'symbol': symbol,
+                            'direction': 'sell',
+                            'level_type': 'resistance',
+                            'price': resistance['price'],
+                            'strength': resistance['strength'],
+                            'confidence': confidence,
+                            'distance_to_price': distance,
+                            'atr': atr
+                        })
+        
+        for signal in signals:
+            logger.log_snr_signal(signal)
+        
+        return signals
+
+# ==================== LIQUIDITY SMC STRATEGY ====================
+class LiquiditySMCStrategy:
+    """Liquidity and Smart Money Concepts Strategy with Volume Analysis"""
+    
+    def __init__(self):
+        self.lookback = config.LIQUIDITY_LOOKBACK_PERIODS
+        self.liquidity_zones = {}
+        self.order_blocks = {}
+        self.breaker_blocks = {}
+        logger.logger.info("Liquidity SMC Strategy initialized")
+    
+    def find_liquidity_zones(self, df: pd.DataFrame, symbol: str) -> Dict[str, List[Dict]]:
+        """Find liquidity zones (high volume nodes)"""
+        zones = {
+            'liquidity_pools': [],
+            'order_blocks': [],
+            'breaker_blocks': []
+        }
+        
+        if len(df) < 20:
+            return zones
+        
+        volume_col = 'real_volume' if 'real_volume' in df.columns and df['real_volume'].sum() > 0 else (
+            'volume' if 'volume' in df.columns else ('tick_volume' if 'tick_volume' in df.columns else None)
+        )
+        if volume_col:
+            df['volume_ema'] = df[volume_col].rolling(window=20).mean()
+            high_volume_bars = df[df[volume_col] > df['volume_ema'] * config.LIQUIDITY_VOLUME_MULTIPLIER]
+            
+            for _, bar in high_volume_bars.iterrows():
+                # Liquidity pools at high volume price levels
+                zones['liquidity_pools'].append({
+                    'price': bar['close'],
+                    'volume_ratio': bar[volume_col] / max(df['volume_ema'].iloc[-1], 1.0),
+                    'timestamp': bar.name,
+                    'strength': min(1.0, bar[volume_col] / max(df[volume_col].max(), 1.0))
+                })
+        
+        # Find order blocks (institutional accumulation/distribution)
+        for i in range(2, len(df)):
+            # FIX: Use 'tick_volume' instead of 'volume'
+            if volume_col and df[volume_col].iloc[i] > df[volume_col].iloc[i-1] * 1.5:
+                # Bullish order block (accumulation)
+                if df['close'].iloc[i] > df['open'].iloc[i] and df['close'].iloc[i-1] < df['open'].iloc[i-1]:
+                    zones['order_blocks'].append({
+                        'type': 'bullish',
+                        'price_range': (df['low'].iloc[i], df['high'].iloc[i]),
+                        'volume_ratio': df[volume_col].iloc[i] / max(df[volume_col].rolling(20).mean().iloc[i], 1.0),
+                        'timestamp': df.index[i],
+                        'strength': min(1.0, df[volume_col].iloc[i] / max(df[volume_col].max(), 1.0))
+                    })
+                # Bearish order block (distribution)
+                elif df['close'].iloc[i] < df['open'].iloc[i] and df['close'].iloc[i-1] > df['open'].iloc[i-1]:
+                    zones['order_blocks'].append({
+                        'type': 'bearish',
+                        'price_range': (df['low'].iloc[i], df['high'].iloc[i]),
+                        'volume_ratio': df[volume_col].iloc[i] / max(df[volume_col].rolling(20).mean().iloc[i], 1.0),
+                        'timestamp': df.index[i],
+                        'strength': min(1.0, df[volume_col].iloc[i] / max(df[volume_col].max(), 1.0))
+                    })
+        
+        # Find breaker blocks (failed liquidity grabs)
+        for i in range(3, len(df)):
+            # Check for failed breakout
+            if (df['high'].iloc[i] > df['high'].iloc[i-1] > df['high'].iloc[i-2] and
+                df['close'].iloc[i] < df['open'].iloc[i-1]):
+                zones['breaker_blocks'].append({
+                    'type': 'bearish_breaker',
+                    'price': df['high'].iloc[i-1],
+                    'timestamp': df.index[i],
+                    'strength': 0.7
+                })
+            elif (df['low'].iloc[i] < df['low'].iloc[i-1] < df['low'].iloc[i-2] and
+                  df['close'].iloc[i] > df['open'].iloc[i-1]):
+                zones['breaker_blocks'].append({
+                    'type': 'bullish_breaker',
+                    'price': df['low'].iloc[i-1],
+                    'timestamp': df.index[i],
+                    'strength': 0.7
+                })
+        
+        self.liquidity_zones[symbol] = zones
+        return zones
+    
+    def _check_liquidity_grab(self, symbol: str, df: pd.DataFrame, current_price: float, 
+                            liquidity_zones: Dict) -> Optional[Dict]:
+        """Check for liquidity grab signals - FIXED METHOD"""
+        if not liquidity_zones:
+            return None
+        
+        signals = []
+        current_time = datetime.now()
+        
+        # Check order blocks
+        for block in liquidity_zones.get('order_blocks', []):
+            block_time = block.get('timestamp')
+            if isinstance(block_time, pd.Timestamp):
+                age_hours = (current_time - block_time.to_pydatetime()).total_seconds() / 3600
+            else:
+                age_hours = 24
+            
+            if age_hours > 48:  # Too old
+                continue
+            
+            block_low, block_high = block['price_range']
+            block_mid = (block_low + block_high) / 2
+            
+            # Check if price is approaching order block
+            distance = abs(current_price - block_mid)
+            atr = df['atr'].iloc[-1] if 'atr' in df.columns else 0.1
+            
+            if distance < atr * 2:
+                if block['type'] == 'bullish' and current_price < block_mid:
+                    signals.append({
+                        'symbol': symbol,
+                        'direction': 'buy',
+                        'type': 'order_block',
+                        'price': block_mid,
+                        'strength': block['strength'],
+                        'confidence': min(0.9, block['strength'] * 0.8),
+                        'age_hours': age_hours,
+                        'volume_ratio': block['volume_ratio']
+                    })
+                elif block['type'] == 'bearish' and current_price > block_mid:
+                    signals.append({
+                        'symbol': symbol,
+                        'direction': 'sell',
+                        'type': 'order_block',
+                        'price': block_mid,
+                        'strength': block['strength'],
+                        'confidence': min(0.9, block['strength'] * 0.8),
+                        'age_hours': age_hours,
+                        'volume_ratio': block['volume_ratio']
+                    })
+        
+        # Check breaker blocks
+        for breaker in liquidity_zones.get('breaker_blocks', []):
+            breaker_time = breaker.get('timestamp')
+            if isinstance(breaker_time, pd.Timestamp):
+                age_hours = (current_time - breaker_time.to_pydatetime()).total_seconds() / 3600
+            else:
+                age_hours = 24
+            
+            if age_hours > 24:  # Breakers are short-term
+                continue
+            
+            breaker_price = breaker['price']
+            distance = abs(current_price - breaker_price)
+            atr = df['atr'].iloc[-1] if 'atr' in df.columns else 0.1
+            
+            if distance < atr:
+                if breaker['type'] == 'bullish_breaker' and current_price > breaker_price:
+                    signals.append({
+                        'symbol': symbol,
+                        'direction': 'buy',
+                        'type': 'breaker_block',
+                        'price': breaker_price,
+                        'strength': breaker['strength'],
+                        'confidence': 0.75,
+                        'age_hours': age_hours
+                    })
+                elif breaker['type'] == 'bearish_breaker' and current_price < breaker_price:
+                    signals.append({
+                        'symbol': symbol,
+                        'direction': 'sell',
+                        'type': 'breaker_block',
+                        'price': breaker_price,
+                        'strength': breaker['strength'],
+                        'confidence': 0.75,
+                        'age_hours': age_hours
+                    })
+        
+        # Check liquidity pools
+        for pool in liquidity_zones.get('liquidity_pools', []):
+            pool_time = pool.get('timestamp')
+            if isinstance(pool_time, pd.Timestamp):
+                age_hours = (current_time - pool_time.to_pydatetime()).total_seconds() / 3600
+            else:
+                age_hours = 24
+            
+            if age_hours > 72:  # Older pools
+                continue
+            
+            pool_price = pool['price']
+            distance = abs(current_price - pool_price)
+            atr = df['atr'].iloc[-1] if 'atr' in df.columns else 0.1
+            
+            if distance < atr:
+                # Check volume confirmation
+                if pool['volume_ratio'] > config.LIQUIDITY_VOLUME_MULTIPLIER:
+                    # Determine direction based on recent price action
+                    recent_trend = 'up' if df['close'].iloc[-1] > df['close'].iloc[-5] else 'down'
+                    
+                    if recent_trend == 'up' and current_price > pool_price:
+                        signals.append({
+                            'symbol': symbol,
+                            'direction': 'buy',
+                            'type': 'liquidity_pool',
+                            'price': pool_price,
+                            'strength': pool['strength'],
+                            'confidence': min(0.8, pool['strength'] * 0.7),
+                            'age_hours': age_hours,
+                            'volume_ratio': pool['volume_ratio']
+                        })
+                    elif recent_trend == 'down' and current_price < pool_price:
+                        signals.append({
+                            'symbol': symbol,
+                            'direction': 'sell',
+                            'type': 'liquidity_pool',
+                            'price': pool_price,
+                            'strength': pool['strength'],
+                            'confidence': min(0.8, pool['strength'] * 0.7),
+                            'age_hours': age_hours,
+                            'volume_ratio': pool['volume_ratio']
+                        })
+        
+        if signals:
+            # Return the strongest signal
+            strongest_signal = max(signals, key=lambda x: x['confidence'])
+            
+            # Log the signal
+            logger.log_liquidity_signal({
+                'symbol': symbol,
+                'zone_type': strongest_signal['type'],
+                'direction': strongest_signal['direction'],
+                'price': strongest_signal['price'],
+                'volume_ratio': strongest_signal.get('volume_ratio', 1.0),
+                'strength': strongest_signal['strength'],
+                'age_bars': int(strongest_signal['age_hours'] * 12),  # Approximate bars
+                'confluence': strongest_signal['confidence'],
+                'atr': df['atr'].iloc[-1] if 'atr' in df.columns else 0.1
+            })
+            
+            return strongest_signal
+        
+        return None
+    
+    def generate_signals(self, symbol: str, df: pd.DataFrame, current_price: float) -> List[Dict]:
+        """Generate liquidity SMC signals"""
+        signals = []
+        
+        if len(df) < 50:
+            return signals
+        
+        # Find liquidity zones
+        liquidity_zones = self.find_liquidity_zones(df, symbol)
+        
+        # Check for liquidity grabs
+        liquidity_signal = self._check_liquidity_grab(symbol, df, current_price, liquidity_zones)
+        
+        if liquidity_signal:
+            signals.append(liquidity_signal)
+        
+        return signals
+
+# ==================== TRADE TRACKER FOR HYBRID SL MOVEMENT ====================
+class TradeTracker:
+    """Track individual trades for hybrid SL movement with safety limits"""
+    
+    def __init__(self):
+        self.trades = {}
+        self.consecutive_losses = 0
+        self.lock = threading.RLock()
+        self.max_loss_per_trade = config.MAX_LOSS_PER_TRADE
+        self.paused_until = 0.0
+    
+    def add_trade(self, ticket: int, symbol: str, direction: str, 
+                  entry_price: float, sl_price: float, tp_price: float,
+                  confluence_score: int = 0, fvg_signal: bool = False,
+                  lot_size: Optional[float] = None,
+                  strategy_hits: Optional[Dict[str, bool]] = None):
+        """Add a new trade to track with safety checks"""
+        with self.lock:
+            info = get_symbol_info_safe(symbol)
+            point = info.point if info else 0.01
+            pip_value = point * 10
+
+            resolved_lot = lot_size
+            if resolved_lot is None:
+                resolved_lot = self._infer_trade_volume(ticket, symbol)
+                if resolved_lot is None:
+                    logger.logger.warning(
+                        f"add_trade skipped ticket={ticket} {symbol}: unable to resolve actual lot size"
+                    )
+                    logger.log_error(
+                        "add_trade",
+                        f"Lot size inference failed for ticket {ticket} on {symbol}",
+                        "WARNING",
+                        symbol,
+                    )
+                    return
+
+            risk_per_pip = self._calculate_risk_per_pip(symbol, resolved_lot)
+            
+            if direction == 'buy':
+                stop_distance_pips = (entry_price - sl_price) / pip_value
+                potential_loss = abs(stop_distance_pips * risk_per_pip)
+            else:
+                stop_distance_pips = (sl_price - entry_price) / pip_value
+                potential_loss = abs(stop_distance_pips * risk_per_pip)
+            
+            if potential_loss > self.max_loss_per_trade:
+                logger.logger.warning(f"Potential loss ${potential_loss:.2f} exceeds maximum ${self.max_loss_per_trade}")
+                logger.log_error("add_trade", 
+                               f"Potential loss ${potential_loss:.2f} > Max ${self.max_loss_per_trade}",
+                               "WARNING", symbol)
+            
+            self.trades[ticket] = {
+                'symbol': symbol,
+                'direction': direction,
+                'entry_price': entry_price,
+                'original_sl': sl_price,
+                'tp_price': tp_price,
+                'current_sl': sl_price,
+                'open_time': datetime.now(),
+                'last_move_pips': 0.0,
+                'last_move_profit_usd': 0.0,
+                'pip_thresholds': self._calculate_pip_thresholds(entry_price, direction, pip_value),
+                'breakeven_moved': False,
+                'partial_closed': False,
+                'point_value': point,
+                'pip_value': pip_value,
+                'risk_per_pip': risk_per_pip,
+                'potential_loss': potential_loss,
+                'lot_size': resolved_lot,
+                'max_loss_exceeded': potential_loss > self.max_loss_per_trade,
+                'confluence_score': confluence_score,
+                'fvg_signal': fvg_signal,
+                'strategy_hits': strategy_hits or {}
+            }
+            
+            logger.logger.info(f"Trade {ticket} added to tracker. Potential loss: ${potential_loss:.2f}")
+    
+    def _infer_trade_volume(self, ticket: int, symbol: str) -> Optional[float]:
+        positions = get_positions_safe(symbol)
+        if positions:
+            for pos in positions:
+                pos_ticket = getattr(pos, 'ticket', None)
+                if pos_ticket != ticket:
+                    continue
+                vol = getattr(pos, 'volume', None)
+                if vol is not None:
+                    try:
+                        return float(vol)
+                    except Exception:
+                        return None
+
+            # If ticket mapping failed, infer from single live symbol position.
+            if len(positions) == 1:
+                vol = getattr(positions[0], 'volume', None)
+                if vol is not None:
+                    try:
+                        return float(vol)
+                    except Exception:
+                        return None
+
+        # Last resort for paper mode / metadata-only mode: use symbol minimum lot.
+        info = get_symbol_info_safe(symbol)
+        volume_min = getattr(info, 'volume_min', None) if info is not None else None
+        if volume_min is not None:
+            try:
+                return float(volume_min)
+            except Exception:
+                return None
+
+        return None
+
+    def _calculate_risk_per_pip(self, symbol: str, lot_size: float) -> float:
+        """Calculate risk per pip for the symbol"""
+        return lot_size * 100 * 0.10
+    
+    def _calculate_pip_thresholds(self, entry_price: float, direction: str, pip_value: float) -> List[Tuple[float, float]]:
+        """Calculate price thresholds for SL movement every 70 pips"""
+        thresholds = []
+        pip_steps = [70, 140, 210, 280, 350, 420, 490, 560, 630, 700]
+        
+        for pips in pip_steps:
+            if direction == 'buy':
+                threshold_price = entry_price + (pips * pip_value)
+            else:
+                threshold_price = entry_price - (pips * pip_value)
+            thresholds.append((pips, threshold_price))
+        
+        return thresholds
+    
+    def update_consecutive_losses(self, profit: float):
+        """Track consecutive losses with timed cooldown pause instead of permanent lock."""
+        with self.lock:
+            if profit < 0:
+                self.consecutive_losses += 1
+                logger.logger.warning(f"Consecutive losses: {self.consecutive_losses}/{config.CONSECUTIVE_LOSS_LIMIT}")
+
+                if self.consecutive_losses >= config.CONSECUTIVE_LOSS_LIMIT:
+                    cooldown = max(15, int(config.CONSECUTIVE_LOSS_COOLDOWN_MINUTES)) * 60
+                    self.paused_until = max(self.paused_until, time.time() + cooldown)
+                    logger.logger.critical(
+                        f"⚠️ Trading cooldown active for {cooldown//60}m after {self.consecutive_losses} consecutive losses"
+                    )
+                    logger.log_error(
+                        "update_consecutive_losses",
+                        f"Cooldown after {self.consecutive_losses} consecutive losses ({cooldown//60}m)",
+                        "CRITICAL",
+                    )
+            else:
+                self.consecutive_losses = 0
+                self.paused_until = 0.0
+
+    def should_pause_trading(self) -> bool:
+        """Pause only while cooldown timer is active; auto-resume afterwards."""
+        with self.lock:
+            now = time.time()
+            if now < self.paused_until:
+                return True
+            if self.paused_until > 0:
+                logger.logger.info("Consecutive-loss cooldown elapsed, trading resumed")
+                self.paused_until = 0.0
+                self.consecutive_losses = 0
+            return False
+    
+    def calculate_current_profit_pips(self, ticket: int, current_price: float) -> float:
+        """Calculate current profit in pips"""
+        with self.lock:
+            if ticket not in self.trades:
+                return 0.0
+            
+            trade = self.trades[ticket]
+            direction = trade['direction']
+            entry_price = trade['entry_price']
+            pip_value = trade['pip_value']
+            
+            if direction == 'buy':
+                pips = (current_price - entry_price) / pip_value
+            else:
+                pips = (entry_price - current_price) / pip_value
+            
+            return pips
+    
+    def calculate_current_profit_usd(self, ticket: int, current_price: float) -> float:
+        """Calculate current profit in USD"""
+        with self.lock:
+            if ticket not in self.trades:
+                return 0.0
+            
+            trade = self.trades[ticket]
+            direction = trade['direction']
+            entry_price = trade['entry_price']
+            
+            if direction == 'buy':
+                points = (current_price - entry_price) / trade['point_value']
+            else:
+                points = (entry_price - current_price) / trade['point_value']
+            
+            profit_usd = points * trade['risk_per_pip'] * 0.1
+            return profit_usd
+    
+    def _sl_for_locked_profit_usd(self, trade: Dict[str, Any], lock_usd: float) -> float:
+        """Convert a desired locked USD profit into an SL price."""
+        if lock_usd <= 0:
+            return trade['entry_price']
+
+        usd_per_point = trade['risk_per_pip'] * 0.1
+        if usd_per_point <= 0:
+            return trade['entry_price']
+
+        points_to_lock = lock_usd / usd_per_point
+        price_offset = points_to_lock * trade['point_value']
+
+        if trade['direction'] == 'buy':
+            return trade['entry_price'] + price_offset
+        return trade['entry_price'] - price_offset
+
+    def _locked_usd_from_sl(self, trade: Dict[str, Any], sl_price: float) -> float:
+        """Estimate currently locked USD at SL price for a trade."""
+        usd_per_point = trade['risk_per_pip'] * 0.1
+        if usd_per_point <= 0:
+            return 0.0
+
+        if trade['direction'] == 'buy':
+            points = (sl_price - trade['entry_price']) / trade['point_value']
+        else:
+            points = (trade['entry_price'] - sl_price) / trade['point_value']
+
+        return max(0.0, points * usd_per_point)
+
+    def update_trade(self, ticket: int, current_price: float, profit_usd_override: Optional[float] = None) -> Optional[Tuple[float, str]]:
+        """Smart fast trailing that secures profit aggressively as trade moves in favor."""
+        with self.lock:
+            if ticket not in self.trades:
+                return None
+
+            trade = self.trades[ticket]
+            direction = trade['direction']
+            entry_price = trade['entry_price']
+            current_sl = trade['current_sl']
+
+            current_profit_pips = self.calculate_current_profit_pips(ticket, current_price)
+            current_profit_usd = float(profit_usd_override) if profit_usd_override is not None else self.calculate_current_profit_usd(ticket, current_price)
+            logger.logger.debug(f"Trade {ticket}: {current_profit_pips:.1f} pips profit, ${current_profit_usd:.2f} USD")
+
+            start_usd = max(0.5, float(config.SMART_TRAIL_START_USD))
+            if config.FAST_SL_MODE:
+                start_usd = max(0.35, start_usd * float(config.FAST_SL_START_MULT))
+            if current_profit_usd < start_usd:
+                return None
+
+            be_buffer = max(0.0, float(config.SMART_TRAIL_BE_BUFFER_USD))
+            lock_ratio = min(0.95, max(0.50, float(config.SMART_TRAIL_LOCK_RATIO)))
+            max_giveback = max(0.5, float(config.SMART_TRAIL_MAX_GIVEBACK_USD))
+            min_increment = max(0.25, float(config.SMART_TRAIL_MIN_INCREMENT_USD))
+            if config.FAST_SL_MODE:
+                lock_ratio = min(0.95, lock_ratio + float(config.FAST_SL_LOCK_BOOST))
+                min_increment = max(0.15, min_increment * float(config.FAST_SL_MIN_INCREMENT_MULT))
+
+            if current_profit_usd < (start_usd * 2):
+                lock_usd = be_buffer
+                reason = "smart_trail_early_protect"
+            elif current_profit_usd < (start_usd * 3):
+                lock_usd = max(be_buffer, current_profit_usd * 0.60)
+                reason = "smart_trail_accelerate"
+            else:
+                lock_usd = max(current_profit_usd * lock_ratio, current_profit_usd - max_giveback)
+                reason = "smart_trail_runner_lock"
+
+            if config.FAST_SL_MODE and current_profit_pips >= float(config.FAST_SL_PIPS_PRECISION_TRIGGER):
+                lock_usd = max(lock_usd, current_profit_usd * float(config.FAST_SL_PRECISION_LOCK_RATIO))
+                reason = "smart_trail_precision_lock"
+
+            lock_usd = min(lock_usd, max(0.0, current_profit_usd - min_increment))
+            if lock_usd <= 0:
+                return None
+
+            current_locked_usd = self._locked_usd_from_sl(trade, current_sl)
+            if lock_usd <= (current_locked_usd + min_increment):
+                return None
+
+            proposed_sl = self._sl_for_locked_profit_usd(trade, lock_usd)
+
+            if direction == 'buy':
+                new_sl = max(proposed_sl, current_sl)
+                valid_move = new_sl > current_sl
+            else:
+                new_sl = min(proposed_sl, current_sl)
+                valid_move = new_sl < current_sl
+
+            if not valid_move:
+                return None
+
+            trade['current_sl'] = new_sl
+            trade['breakeven_moved'] = True
+            trade['last_move_pips'] = max(trade.get('last_move_pips', 0.0), current_profit_pips)
+            trade['last_move_profit_usd'] = max(trade.get('last_move_profit_usd', 0.0), lock_usd)
+
+            logger.logger.info(
+                f"Smart trailing for {ticket}: SL -> {new_sl:.5f} | "
+                f"profit=${current_profit_usd:.2f} | locked=${lock_usd:.2f} | prev_locked=${current_locked_usd:.2f}"
+            )
+            return (new_sl, reason)
+
+    def remove_trade(self, ticket: int):
+        with self.lock:
+            if ticket in self.trades:
+                del self.trades[ticket]
+    
+    def get_trade(self, ticket: int):
+        with self.lock:
+            return self.trades.get(ticket)
+
+# Initialize trade tracker
+trade_tracker = TradeTracker()
+
+# ==================== PERFORMANCE METRICS ====================
+class PerformanceTracker:
+    """Tracks performance metrics like Sharpe ratio, drawdown, and win rate."""
+
+    def __init__(self, starting_balance: float):
+        self.starting_balance = starting_balance
+        self.equity_curve = [starting_balance]
+        self.returns = []
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.total_profit = 0.0
+        self.total_loss = 0.0
+        self.max_drawdown = 0.0
+        self.lock = threading.RLock()
+
+    def record_equity(self, equity: float) -> None:
+        with self.lock:
+            if equity <= 0:
+                return
+            last_equity = self.equity_curve[-1]
+            if last_equity > 0:
+                ret = (equity - last_equity) / last_equity
+                self.returns.append(ret)
+            self.equity_curve.append(equity)
+            peak = max(self.equity_curve)
+            if peak > 0:
+                drawdown = (peak - equity) / peak * 100
+                self.max_drawdown = max(self.max_drawdown, drawdown)
+
+    def record_trade(self, profit: float) -> None:
+        with self.lock:
+            self.total_trades += 1
+            if profit > 0:
+                self.winning_trades += 1
+                self.total_profit += profit
+            elif profit < 0:
+                self.losing_trades += 1
+                self.total_loss += abs(profit)
+
+    def win_rate(self) -> float:
+        with self.lock:
+            if self.total_trades == 0:
+                return 0.0
+            return (self.winning_trades / self.total_trades) * 100
+
+    def profit_factor(self) -> float:
+        with self.lock:
+            if self.total_loss == 0:
+                return float('inf') if self.total_profit > 0 else 0.0
+            return self.total_profit / self.total_loss
+
+    def sharpe_ratio(self) -> float:
+        with self.lock:
+            if len(self.returns) < 2:
+                return 0.0
+            avg = float(np.mean(self.returns))
+            std = float(np.std(self.returns, ddof=1))
+            if std == 0:
+                return 0.0
+            return (avg / std) * math.sqrt(252)
+
+# ==================== PAPER TRADING ENGINE ====================
+@dataclass
+class PaperAccountInfo:
+    balance: float
+    equity: float
+    margin: float
+
+class PaperTradingEngine:
+    """Simulated execution engine for paper trading and backtesting."""
+
+    def __init__(self, starting_balance: float):
+        self.balance = starting_balance
+        self.equity = starting_balance
+        self.margin = 0.0
+        self.positions: Dict[int, Dict[str, Any]] = {}
+        self.closed_deals = deque()
+        self.latest_prices: Dict[str, Dict[str, float]] = {}
+        self.next_ticket = 1
+        self.lock = threading.RLock()
+
+    def update_price(self, symbol: str, bid: float, ask: float) -> None:
+        with self.lock:
+            self.latest_prices[symbol] = {"bid": bid, "ask": ask}
+            self._revalue_positions()
+
+    def _revalue_positions(self) -> None:
+        equity = self.balance
+        for position in self.positions.values():
+            symbol = position["symbol"]
+            price = self._current_price(symbol, position["direction"])
+            if price is None:
+                continue
+            pnl = self._calc_profit(position, price)
+            equity += pnl
+            position["profit"] = pnl
+        self.equity = equity
+
+    def _current_price(self, symbol: str, direction: str) -> Optional[float]:
+        price_info = self.latest_prices.get(symbol)
+        if not price_info:
+            return None
+        return price_info["bid"] if direction == "sell" else price_info["ask"]
+
+    def _calc_profit(self, position: Dict[str, Any], price: float) -> float:
+        diff = price - position["entry_price"]
+        if position["direction"] == "sell":
+            diff = -diff
+        return diff * position["volume"] * config.PAPER_CONTRACT_SIZE
+
+    def open_position(self, symbol: str, direction: str, volume: float,
+                      entry_price: float, sl_price: float, tp_price: float,
+                      comment: str) -> Dict[str, Any]:
+        with self.lock:
+            ticket = self.next_ticket
+            self.next_ticket += 1
+            self.positions[ticket] = {
+                "ticket": ticket,
+                "symbol": symbol,
+                "direction": direction,
+                "volume": volume,
+                "entry_price": entry_price,
+                "sl": sl_price,
+                "tp": tp_price,
+                "comment": comment,
+                "open_time": datetime.now()
+            }
+            self._revalue_positions()
+            return {"retcode": mt5.TRADE_RETCODE_DONE, "order": ticket}
+
+    def close_position(self, ticket: int, price: float, reason: str) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            position = self.positions.pop(ticket, None)
+            if not position:
+                return None
+            profit = self._calc_profit(position, price)
+            commission = config.PAPER_COMMISSION_PER_LOT * position["volume"]
+            profit -= commission
+            self.balance += profit
+            deal = {
+                "ticket": ticket,
+                "symbol": position["symbol"],
+                "profit": profit,
+                "comment": position["comment"],
+                "reason": reason,
+                "close_time": datetime.now()
+            }
+            self.closed_deals.append(deal)
+            self._revalue_positions()
+            return deal
+
+    def partial_close(self, ticket: int, volume: float, price: float, reason: str) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            position = self.positions.get(ticket)
+            if not position or volume <= 0 or volume > position["volume"]:
+                return None
+            temp_position = position.copy()
+            temp_position["volume"] = volume
+            profit = self._calc_profit(temp_position, price)
+            commission = config.PAPER_COMMISSION_PER_LOT * volume
+            profit -= commission
+            self.balance += profit
+            position["volume"] -= volume
+            deal = {
+                "ticket": ticket,
+                "symbol": position["symbol"],
+                "profit": profit,
+                "comment": position["comment"],
+                "reason": reason,
+                "close_time": datetime.now()
+            }
+            self.closed_deals.append(deal)
+            if position["volume"] <= 0:
+                self.positions.pop(ticket, None)
+            self._revalue_positions()
+            return deal
+
+    def evaluate_positions(self) -> List[Dict[str, Any]]:
+        closed = []
+        for ticket, position in list(self.positions.items()):
+            price = self._current_price(position["symbol"], position["direction"])
+            if price is None:
+                continue
+            sl = position.get("sl", 0.0) or 0.0
+            tp = position.get("tp", 0.0) or 0.0
+            if position["direction"] == "buy":
+                if sl and price <= sl:
+                    closed.append(self.close_position(ticket, sl, "stop_loss"))
+                elif tp and price >= tp:
+                    closed.append(self.close_position(ticket, tp, "take_profit"))
+            else:
+                if sl and price >= sl:
+                    closed.append(self.close_position(ticket, sl, "stop_loss"))
+                elif tp and price <= tp:
+                    closed.append(self.close_position(ticket, tp, "take_profit"))
+        self._revalue_positions()
+        return [c for c in closed if c]
+
+    def get_positions(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self.lock:
+            positions = list(self.positions.values())
+            if symbol:
+                return [p for p in positions if p["symbol"] == symbol]
+            return positions
+
+    def get_positions_as_mt5(self, symbol: Optional[str] = None):
+        positions = self.get_positions(symbol)
+        mt5_positions = []
+        for p in positions:
+            mt5_positions.append(SimpleNamespace(
+                ticket=p["ticket"],
+                symbol=p["symbol"],
+                type=0 if p["direction"] == "buy" else 1,
+                price_open=p["entry_price"],
+                sl=p.get("sl", 0.0),
+                tp=p.get("tp", 0.0),
+                volume=p["volume"],
+                magic=config.MAGIC,
+                profit=p.get("profit", 0.0),
+                time_update=p.get("open_time").timestamp() if p.get("open_time") else 0
+            ))
+        return mt5_positions
+
+    def get_account_info(self) -> PaperAccountInfo:
+        with self.lock:
+            return PaperAccountInfo(balance=self.balance, equity=self.equity, margin=self.margin)
+
+    def get_closed_deals(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            deals = list(self.closed_deals)
+            self.closed_deals.clear()
+            return deals
+
+# ==================== THREAD MANAGEMENT ====================
+class ThreadManager:
+    """Track thread health and clean up resources for failed threads."""
+
+    def __init__(self):
+        self.threads: Dict[str, threading.Thread] = {}
+        self.heartbeats: Dict[str, float] = {}
+        self.symbol_map: Dict[str, str] = {}
+        self.lock = threading.RLock()
+        self.stop_event = threading.Event()
+
+    def register_thread(self, name: str, thread: threading.Thread, symbol: Optional[str] = None) -> None:
+        with self.lock:
+            self.threads[name] = thread
+            self.heartbeats[name] = time.time()
+            if symbol:
+                self.symbol_map[name] = symbol
+
+    def heartbeat(self, name: str) -> None:
+        with self.lock:
+            if name in self.heartbeats:
+                self.heartbeats[name] = time.time()
+
+    def cleanup_stale_threads(self, timeout: float = 300) -> None:
+        with self.lock:
+            current = time.time()
+            for name, last_seen in list(self.heartbeats.items()):
+                thread = self.threads.get(name)
+                if thread and not thread.is_alive():
+                    self._cleanup_resources(name, reason="thread_dead")
+                elif current - last_seen > timeout:
+                    self._cleanup_resources(name, reason="heartbeat_timeout")
+
+    def _cleanup_resources(self, name: str, reason: str) -> None:
+        symbol = self.symbol_map.get(name)
+        logger.logger.warning(f"Thread {name} cleanup triggered ({reason})")
+        if symbol:
+            for ticket, trade in list(trade_tracker.trades.items()):
+                if trade.get("symbol") == symbol:
+                    trade_tracker.remove_trade(ticket)
+            if config.PAPER_TRADING_ENABLED:
+                for position in list(paper_engine.positions.values()):
+                    if position.get("symbol") == symbol:
+                        price = paper_engine._current_price(symbol, position["direction"]) or position["entry_price"]
+                        paper_engine.close_position(position["ticket"], price, "thread_cleanup")
+        self.threads.pop(name, None)
+        self.heartbeats.pop(name, None)
+        self.symbol_map.pop(name, None)
+
+    def stop_all(self) -> None:
+        self.stop_event.set()
+
+performance_tracker = PerformanceTracker(STARTING_BALANCE)
+paper_engine = PaperTradingEngine(config.PAPER_INITIAL_BALANCE)
+thread_manager = ThreadManager()
+
+# ==================== AUTOMATIC SUPERVISOR ====================
+class AutomatedSupervisor:
+    """AUTOMATIC SUPERVISOR: Monitors all bot activities"""
+    
+    def __init__(self):
+        self.running = True
+        self.threads_status = {}
+        self.last_monitor_time = 0
+        self.start_time = time.time()
+        self.performance_data = {
+            'total_trades': 0,
+            'winning_trades': 0,
+            'losing_trades': 0,
+            'total_profit': 0.0,
+            'peak_equity': 0.0,
+            'max_drawdown': 0.0
+        }
+    
+    def monitor_all_threads(self):
+        """Monitor all running threads"""
+        current_time = time.time()
+        
+        if current_time - self.last_monitor_time < 30:
+            return
+        
+        self.last_monitor_time = current_time
+        
+        if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
+            logger.logger.warning("Supervisor: Connection check failed")
+            if config.AUTO_RECONNECT:
+                connection_manager.reconnect_if_needed()
+        
+        for thread in threading.enumerate():
+            if thread.name.startswith("Thread-"):
+                if thread.name not in self.threads_status:
+                    self.threads_status[thread.name] = {
+                        'first_seen': current_time,
+                        'last_seen': current_time
+                    }
+                else:
+                    self.threads_status[thread.name]['last_seen'] = current_time
+        
+        for thread_name, status in list(self.threads_status.items()):
+            if current_time - status['last_seen'] > 300:
+                logger.logger.warning(f"Thread {thread_name} appears stalled")
+                logger.log_error("monitor_all_threads", 
+                               f"Thread {thread_name} stalled", 
+                               "WARNING")
+
+        thread_manager.cleanup_stale_threads(timeout=300)
+        
+        if current_time - self.start_time > 1800:
+            self.log_performance_summary()
+    
+    def log_performance_summary(self):
+        """Log comprehensive performance summary"""
+        try:
+            current_time = time.time()
+            acct = get_account_info_safe()
+            if acct:
+                equity = float(acct.equity)
+                balance = float(acct.balance)
+                
+                if equity > self.performance_data['peak_equity']:
+                    self.performance_data['peak_equity'] = equity
+                
+                if self.performance_data['peak_equity'] > 0:
+                    drawdown = (self.performance_data['peak_equity'] - equity) / self.performance_data['peak_equity'] * 100
+                    self.performance_data['max_drawdown'] = max(self.performance_data['max_drawdown'], drawdown)
+                
+                if not config.PAPER_TRADING_ENABLED:
+                    history = mt5.history_deals_get(datetime.now() - timedelta(hours=1), datetime.now())
+                    if history:
+                        for deal in history:
+                            if getattr(deal, "magic", None) == config.MAGIC:
+                                self.performance_data['total_trades'] += 1
+                                profit = getattr(deal, "profit", 0.0)
+                                self.performance_data['total_profit'] += profit
+                                if profit > 0:
+                                    self.performance_data['winning_trades'] += 1
+                                elif profit < 0:
+                                    self.performance_data['losing_trades'] += 1
+                
+                if config.PAPER_TRADING_ENABLED and performance_tracker:
+                    win_rate = performance_tracker.win_rate()
+                    total_trades = performance_tracker.total_trades
+                    total_profit = performance_tracker.total_profit - performance_tracker.total_loss
+                else:
+                    win_rate = (self.performance_data['winning_trades'] / self.performance_data['total_trades'] * 100) \
+                              if self.performance_data['total_trades'] > 0 else 0
+                    total_trades = self.performance_data['total_trades']
+                    total_profit = self.performance_data['total_profit']
+                sharpe = performance_tracker.sharpe_ratio() if performance_tracker else 0.0
+                
+                logger.logger.info("=" * 80)
+                logger.logger.info("SUPERVISOR PERFORMANCE REPORT")
+                logger.logger.info("=" * 80)
+                logger.logger.info(f"Uptime: {timedelta(seconds=int(current_time - self.start_time))}")
+                logger.logger.info(f"Active Threads: {threading.active_count()}")
+                logger.logger.info(f"Balance: ${balance:.2f} | Equity: ${equity:.2f}")
+                logger.logger.info(f"Total Trades: {total_trades}")
+                logger.logger.info(f"Win Rate: {win_rate:.1f}%")
+                logger.logger.info(f"Sharpe Ratio: {sharpe:.2f}")
+                logger.logger.info(f"Total Profit: ${total_profit:.2f}")
+                logger.logger.info(f"Max Drawdown: {self.performance_data['max_drawdown']:.2f}%")
+                logger.logger.info(f"Consecutive Losses: {trade_tracker.consecutive_losses}")
+                logger.logger.info(f"Tracked Trades: {len(trade_tracker.trades)}")
+                logger.logger.info("=" * 80)
+                
+        except Exception as e:
+            logger.logger.error(f"Error in performance summary: {e}")
+            logger.log_error("log_performance_summary", str(e), "WARNING")
+    
+    def run(self):
+        """Main supervisor loop"""
+        logger.logger.info("Supervisor thread started")
+        
+        while self.running:
+            try:
+                if thread_manager.stop_event.is_set():
+                    break
+                thread_manager.heartbeat(threading.current_thread().name)
+                self.monitor_all_threads()
+                time.sleep(5)
+            except Exception as e:
+                logger.logger.error(f"Supervisor error: {e}")
+                logger.log_error("supervisor_run", str(e), "ERROR")
+                time.sleep(10)
+
+# ==================== ENHANCED DATA CACHE ====================
+class EnhancedDataCache:
+    """INTELLIGENT DATA CACHING with automatic retry and symbol health tracking"""
+    
+    def __init__(self, cache_seconds: int = config.DATA_CACHE_SECONDS):
+        self.cache = {}
+        self.cache_timestamps = {}
+        self.cache_seconds = cache_seconds
+        self.max_retries = 3
+        self.symbol_backoff_until: Dict[str, float] = {}
+
+    def is_symbol_temporarily_unavailable(self, symbol: str) -> bool:
+        return time.time() < self.symbol_backoff_until.get(symbol, 0.0)
+
+    def mark_symbol_temporarily_unavailable(self, symbol: str, backoff_seconds: int = 900) -> None:
+        self.symbol_backoff_until[symbol] = time.time() + max(60, int(backoff_seconds))
+
+    def get_cached_data(self, symbol: str, timeframe: int, bars_needed: int) -> Optional[pd.DataFrame]:
+        """Get cached data if available and fresh"""
+        key = f"{symbol}_{timeframe}"
+        
+        if key in self.cache:
+            cached_time = self.cache_timestamps.get(key, 0)
+            current_time = time.time()
+            
+            if current_time - cached_time < self.cache_seconds:
+                cached_df = self.cache[key]
+                if len(cached_df) >= bars_needed:
+                    return cached_df.copy()
+        
+        return None
+
+    def _timeframe_to_yf_interval(self, timeframe: int) -> str:
+        mapping = {
+            mt5.TIMEFRAME_M1: "1m",
+            mt5.TIMEFRAME_M5: "5m",
+            mt5.TIMEFRAME_M15: "15m",
+            mt5.TIMEFRAME_M30: "30m",
+            mt5.TIMEFRAME_H1: "60m",
+            mt5.TIMEFRAME_H4: "1h",
+            mt5.TIMEFRAME_D1: "1d",
+        }
+        return mapping.get(timeframe, "5m")
+
+    def _fetch_fallback_data(self, symbol: str, timeframe: int, n: int) -> pd.DataFrame:
+        """Best-effort fallback using Yahoo Finance."""
+        if not config.ENABLE_FALLBACK_DATA_SOURCE:
+            return pd.DataFrame()
+
+        try:
+            import yfinance as yf
+        except Exception:
+            return pd.DataFrame()
+
+        try:
+            yf_symbol = symbol if "=" in symbol else f"{symbol}=X"
+            interval = self._timeframe_to_yf_interval(timeframe)
+            period = "60d" if "m" in interval or "h" in interval else "2y"
+            raw = yf.download(yf_symbol, period=period, interval=interval, progress=False, auto_adjust=False)
+            if raw is None or raw.empty:
+                return pd.DataFrame()
+
+            raw = raw.rename(columns={
+                "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"
+            }).reset_index()
+            time_col = "Datetime" if "Datetime" in raw.columns else "Date"
+            raw.rename(columns={time_col: "time"}, inplace=True)
+            df = raw[[c for c in ["time", "open", "high", "low", "close", "volume"] if c in raw.columns]].copy()
+            df["time"] = pd.to_datetime(df["time"])
+            if "volume" not in df.columns:
+                df["volume"] = 0.0
+            if len(df) > n:
+                df = df.tail(n).reset_index(drop=True)
+            logger.logger.info(f"Fallback data source used for {symbol} ({len(df)} bars)")
+            return df
+        except Exception as e:
+            logger.logger.debug(f"Fallback fetch failed for {symbol}: {e}")
+            return pd.DataFrame()
+    
+    def get_data_with_retry(self, symbol: str, timeframe: int, n: int = 400) -> pd.DataFrame:
+        """Get data with automatic retry on failure"""
+        if self.is_symbol_temporarily_unavailable(symbol):
+            logger.logger.debug(f"Skipping {symbol} fetch: symbol in temporary backoff window")
+            return pd.DataFrame()
+
+        broker_symbol = resolve_broker_symbol(symbol)
+
+        for attempt in range(self.max_retries):
+            try:
+                cached_data = self.get_cached_data(symbol, timeframe, n)
+                if cached_data is not None:
+                    return cached_data
+
+                selected = mt5.symbol_select(broker_symbol, True)
+                if not selected:
+                    self.mark_symbol_temporarily_unavailable(symbol, backoff_seconds=1800)
+                    raise ValueError(f"Symbol {symbol} ({broker_symbol}) is not available in Market Watch")
+                
+                rates = mt5.copy_rates_from_pos(broker_symbol, timeframe, 0, n)
+                if rates is None or len(rates) == 0:
+                    # For non-primary symbols (e.g., correlation context), avoid noisy reconnect/error storms.
+                    if symbol in config.SYMBOLS and not config.PAPER_TRADING_ENABLED:
+                        connection_manager.reconnect_if_needed()
+                    fallback_df = self._fetch_fallback_data(symbol, timeframe, n)
+                    if not fallback_df.empty:
+                        self.cache[f"{symbol}_{timeframe}"] = fallback_df.copy()
+                        self.cache_timestamps[f"{symbol}_{timeframe}"] = time.time()
+                        return fallback_df
+                    raise ValueError(f"No data returned for {symbol} ({broker_symbol})")
+                
+                df = pd.DataFrame(rates)
+                df['time'] = pd.to_datetime(df['time'], unit='s')
+                if 'real_volume' in df.columns and df['real_volume'].sum() > 0:
+                    df['volume'] = df['real_volume']
+                elif 'tick_volume' in df.columns:
+                    df['volume'] = df['tick_volume']
+                
+                self.cache[f"{symbol}_{timeframe}"] = df.copy()
+                self.cache_timestamps[f"{symbol}_{timeframe}"] = time.time()
+                # Symbol recovered; clear backoff flag if any.
+                self.symbol_backoff_until.pop(symbol, None)
+                
+                logger.logger.debug(f"Data fetched for {symbol} TF{timeframe}, {len(df)} bars")
+                return df
+                
+            except Exception as e:
+                is_primary_symbol = symbol in config.SYMBOLS
+                if is_primary_symbol:
+                    logger.logger.warning(f"Data fetch attempt {attempt + 1} failed for {symbol}: {e}")
+                else:
+                    logger.logger.debug(f"Context fetch attempt {attempt + 1} failed for {symbol}: {e}")
+                
+                if attempt < self.max_retries - 1:
+                    wait_time = 2 ** attempt
+                    time.sleep(wait_time)
+                else:
+                    if is_primary_symbol:
+                        logger.logger.error(f"Failed to fetch data for {symbol} after {self.max_retries} attempts")
+                        logger.log_error("get_data_with_retry", str(e), "ERROR", symbol)
+                        fallback_df = self._fetch_fallback_data(symbol, timeframe, n)
+                        if not fallback_df.empty:
+                            self.cache[f"{symbol}_{timeframe}"] = fallback_df.copy()
+                            self.cache_timestamps[f"{symbol}_{timeframe}"] = time.time()
+                            return fallback_df
+                    else:
+                        self.mark_symbol_temporarily_unavailable(symbol, backoff_seconds=1800)
+                        logger.logger.info(
+                            f"Skipping context symbol {symbol} for 30m after repeated data fetch failures"
+                        )
+                    return pd.DataFrame()
+        
+        return pd.DataFrame()
+
+# Initialize enhanced data cache
+data_cache = EnhancedDataCache()
+
+# ==================== SOUND SETUP ====================
+_have_winsound = False
+try:
+    import winsound
+    _have_winsound = True
+except Exception:
+    _have_winsound = False
+
+def find_cash_wav():
+    candidates = []
+    candidates.append(os.path.join(os.getcwd(), "cash.wav"))
+    candidates.append(os.path.join(os.path.expanduser("~"), "cash.wav"))
+    try:
+        script_dir = os.path.dirname(os.path.realpath(__file__))
+        candidates.append(os.path.join(script_dir, "cash.wav"))
+    except Exception:
+        pass
+    try:
+        tinfo = mt5.terminal_info()
+        for attr in ("data_path", "path", "common_data_path", "terminal_path"):
+            if hasattr(tinfo, attr):
+                base = getattr(tinfo, attr)
+                candidates.append(os.path.join(base, "MQL5", "Sounds", "cash.wav"))
+                candidates.append(os.path.join(base, "MQL4", "Sounds", "cash.wav"))
+    except Exception:
+        pass
+    return [p for p in candidates if p and os.path.isfile(p)]
+
+def play_wav_or_beep(kind="buy"):
+    candidates = find_cash_wav()
+    if hasattr(logger, 'log_dir'):
+        candidates.append(os.path.join(logger.log_dir, "cash.wav"))
+    for p in candidates:
+        if p and os.path.isfile(p):
+            try:
+                if _have_winsound:
+                    winsound.PlaySound(p, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                    return
+            except Exception:
+                pass
+    if _have_winsound:
+        try:
+            if kind == "buy":
+                winsound.Beep(1400, 70); winsound.Beep(1600, 60); winsound.Beep(1900, 90)
+            elif kind == "sell":
+                winsound.Beep(600, 70); winsound.Beep(520, 60); winsound.Beep(420, 90)
+            else:
+                winsound.Beep(1000, 80)
+        except Exception:
+            pass
+
+def beep_cash_buy():
+    play_wav_or_beep("buy")
+
+def beep_cash_sell():
+    play_wav_or_beep("sell")
+
+def beep_cash_partial():
+    play_wav_or_beep("partial")
+
+def trade_flash(message):
+    try:
+        print("\n" + "="*60)
+        print("💰💰💰  " + message + "  💰💰💰")
+        print("="*60 + "\n")
+    except Exception:
+        pass
+
+# ==================== CONFLUENCE MANAGER WITH FVG AND LIQUIDITY ====================
+class ConfluenceManager:
+    """Manage strategy confluence and signal weighting with FVG and Liquidity"""
+    
+    def __init__(self):
+        self.crt_strategy = CRTStrategy() if config.CRT_ENABLED else None
+        self.snr_strategy = SNRStrategy() if config.SNR_ENABLED else None
+        self.fvg_strategy = FVGStrategy(FVGConfig(
+            ENABLED=config.FVG_ENABLED,
+            MIN_CANDLE_BODY_RATIO=config.FVG_MIN_CANDLE_BODY_RATIO,
+            MAX_GAP_PERCENTAGE=config.FVG_MAX_GAP_PERCENTAGE,
+            GAP_FILTER_ATR_MULTIPLIER=config.FVG_GAP_FILTER_ATR_MULTIPLIER,
+            FRESH_THRESHOLD_BARS=config.FVG_FRESHNESS_THRESHOLD_BARS,
+            STRENGTH_VOLUME_MULTIPLIER=config.FVG_STRENGTH_VOLUME_MULTIPLIER,
+            HTF_CONFIRMATION_REQUIRED=config.FVG_REQUIRE_HTF_CONFIRMATION,
+            MIN_CONFLUENCE_LEVEL=config.MIN_CONFLUENCE_SCORE,
+            MAX_AGE_BARS=config.FVG_MAX_AGE_BARS,
+            USE_FVG_TP1=config.FVG_USE_MIDPOINT_TP,
+            USE_FVG_TP2=config.FVG_USE_OPPOSITE_SIDE_TP,
+            SL_BREAKER_CANDLE_MULTIPLIER=config.FVG_SL_BREAKER_MULTIPLIER,
+            MIN_STOP_DISTANCE_ATR_MULTIPLIER=config.FVG_MIN_STOP_ATR_MULTIPLIER
+        )) if config.FVG_ENABLED else None
+        self.liquidity_smc_strategy = LiquiditySMCStrategy() if config.LIQUIDITY_SMC_ENABLED else None
+        logger.logger.info("Confluence Manager initialized with CRT, SNR, FVG, and Liquidity SMC strategies")
+    
+    def calculate_trend_direction(self, df: pd.DataFrame) -> str:
+        """Determine current trend direction"""
+        if len(df) < 50:
+            return 'neutral'
+        
+        ema_fast = df['ema_fast'].iloc[-1] if 'ema_fast' in df else None
+        ema_slow = df['ema_slow'].iloc[-1] if 'ema_slow' in df else None
+        
+        if ema_fast is None or ema_slow is None:
+            return 'neutral'
+        
+        current_price = df['close'].iloc[-1]
+        
+        if ema_fast > ema_slow and current_price > ema_fast:
+            return 'uptrend'
+        elif ema_fast < ema_slow and current_price < ema_fast:
+            return 'downtrend'
+        else:
+            return 'sideways'
+    
+    def detect_market_regime(self, df: pd.DataFrame) -> str:
+        """Detect current market regime"""
+        if len(df) < config.MARKET_REGIME_PERIOD:
+            return "unknown"
+        
+        try:
+            enhanced = detect_market_condition_enhanced(df)
+            if enhanced.get('regime') and enhanced['regime'] != 'unknown':
+                return enhanced['regime']
+            close_prices = df['close'].values[-config.MARKET_REGIME_PERIOD:]
+            
+            x = np.arange(len(close_prices))
+            slope, _ = np.polyfit(x, close_prices, 1)
+            
+            returns = np.diff(np.log(close_prices))
+            volatility = np.std(returns) * np.sqrt(252) if len(returns) > 1 else 0
+            
+            high = df['high'].values[-config.MARKET_REGIME_PERIOD:]
+            low = df['low'].values[-config.MARKET_REGIME_PERIOD:]
+            
+            tr1 = np.abs(high - low)
+            tr2 = np.abs(high - np.roll(close_prices, 1))
+            tr3 = np.abs(low - np.roll(close_prices, 1))
+            tr = np.maximum.reduce([tr1, tr2, tr3])[1:]
+            
+            atr = np.mean(tr) if len(tr) > 0 else 0
+            
+            if atr > 0:
+                trend_strength = abs(slope) / atr
+                if trend_strength > config.TRENDING_THRESHOLD:
+                    return "trending"
+                elif volatility < config.RANGING_THRESHOLD:
+                    return "ranging"
+                else:
+                    return "volatile"
+            else:
+                return "unknown"
+                
+        except Exception as e:
+            logger.log_error("detect_market_regime", str(e), "WARNING")
+            return "unknown"
+    
+    def get_strategy_weights(self, market_regime: str) -> Dict[str, float]:
+        """Get strategy weights based on market regime"""
+        if market_regime == "trending":
+            return config.WEIGHTS_TRENDING
+        elif market_regime == "ranging":
+            return config.WEIGHTS_RANGING
+        elif market_regime == "volatile":
+            return config.WEIGHTS_VOLATILE
+        else:
+            return {'trend_following': 0.25, 'crt': 0.25, 'snr': 0.25, 'fvg': 0.15, 'liquidity': 0.1}
+    
+    def analyze_confluence(self, symbol: str, df: pd.DataFrame, 
+                          trend_signals: List[Dict], market_regime: str) -> Dict:
+        """Analyze confluence between all five strategies including FVG and Liquidity"""
+        current_price = df['close'].iloc[-1]
+        atr = df['atr'].iloc[-1] if 'atr' in df and not pd.isna(df['atr'].iloc[-1]) else 0.12
+        
+        trend_direction = self.calculate_trend_direction(df)
+        
+        crt_signals = []
+        if self.crt_strategy:
+            crt_signals = self.crt_strategy.detect_all_patterns(
+                df, trend_direction, current_price, atr, symbol
+            )
+        
+        snr_signals = []
+        if self.snr_strategy:
+            snr_signals = self.snr_strategy.get_trade_signals(
+                df, current_price, atr, trend_direction, symbol
+            )
+        
+        fvg_signals = []
+        fvg_confluence = FVGConfluence()
+        if self.fvg_strategy and config.FVG_ENABLED:
+            fvg_zones = self.fvg_strategy.detect_fvg(df, symbol)
+            
+            snr_levels = {}
+            if self.snr_strategy:
+                snr_levels = self.snr_strategy.identify_key_levels(df, current_price, atr)
+            
+            fvg_signals = self.fvg_strategy.get_fvg_trade_signals(
+                symbol, df, current_price, atr, trend_direction, snr_levels
+            )
+            
+            for fvg_signal in fvg_signals:
+                fvg_signal['symbol'] = symbol
+                logger.log_fvg_signal({
+                    'symbol': symbol,
+                    'type': 'FVG_' + fvg_signal.get('type', ''),
+                    'direction': fvg_signal['direction'],
+                    'high': fvg_signal.get('entry_price', 0) + fvg_signal.get('gap_size', 0)/2,
+                    'low': fvg_signal.get('entry_price', 0) - fvg_signal.get('gap_size', 0)/2,
+                    'gap_size': fvg_signal.get('gap_size', 0),
+                    'strength': fvg_signal.get('confidence', 0),
+                    'fresh': True,
+                    'mitigated': False,
+                    'confluence_score': fvg_signal.get('confluence_score', 0),
+                    'volume_confirmation': True,
+                    'trend_alignment': 0.8 if fvg_signal['direction'] == 'buy' and trend_direction == 'uptrend' else 0.6,
+                    'snr_alignment': 0.7
+                })
+            
+            fvg_confluence = confluence_fvg_signals(
+                fvg_signals, trend_signals, crt_signals, snr_signals, market_regime
+            )
+        
+        liquidity_signals = []
+        if self.liquidity_smc_strategy and config.LIQUIDITY_SMC_ENABLED:
+            liquidity_signals = self.liquidity_smc_strategy.generate_signals(symbol, df, current_price)
+        
+        buy_signals = {
+            'trend': [s for s in trend_signals if s['direction'] == 'buy'],
+            'crt': [s for s in crt_signals if s['direction'] == 'buy'],
+            'snr': [s for s in snr_signals if s['direction'] == 'buy'],
+            'fvg': [s for s in fvg_signals if s['direction'] == 'buy'],
+            'liquidity': [s for s in liquidity_signals if s['direction'] == 'buy']
+        }
+        
+        sell_signals = {
+            'trend': [s for s in trend_signals if s['direction'] == 'sell'],
+            'crt': [s for s in crt_signals if s['direction'] == 'sell'],
+            'snr': [s for s in snr_signals if s['direction'] == 'sell'],
+            'fvg': [s for s in fvg_signals if s['direction'] == 'sell'],
+            'liquidity': [s for s in liquidity_signals if s['direction'] == 'sell']
+        }
+        
+        base_weights = self.get_strategy_weights(market_regime)
+        try:
+            weights = global_state.get_auto_tuned_weights(symbol, base_weights)
+        except Exception:
+            weights = base_weights
+
+        strategy_enabled = {}
+        try:
+            strategy_enabled = global_state.get_strategy_enabled_map(symbol)
+        except Exception:
+            strategy_enabled = {
+                "trend_following": True, "crt": True, "snr": True, "fvg": True, "liquidity": True
+            }
+
+        if not strategy_enabled.get("trend_following", True):
+            buy_signals['trend'], sell_signals['trend'] = [], []
+            weights['trend_following'] = 0.0
+        if not strategy_enabled.get("crt", True):
+            buy_signals['crt'], sell_signals['crt'] = [], []
+            weights['crt'] = 0.0
+        if not strategy_enabled.get("snr", True):
+            buy_signals['snr'], sell_signals['snr'] = [], []
+            weights['snr'] = 0.0
+        if not strategy_enabled.get("fvg", True):
+            buy_signals['fvg'], sell_signals['fvg'] = [], []
+            weights['fvg'] = 0.0
+        if not strategy_enabled.get("liquidity", True):
+            buy_signals['liquidity'], sell_signals['liquidity'] = [], []
+            weights['liquidity'] = 0.0
+
+        disabled_strategies = [k for k, v in strategy_enabled.items() if not v]
+        liquidity_weight = weights.get('liquidity', config.LIQUIDITY_CONFLUENCE_WEIGHT)
+
+        strategy_breakdown = {
+            "buy": {},
+            "sell": {},
+            "weights": {k: round(float(v), 4) for k, v in weights.items()}
+        }
+
+        def _weighted_component(signals: List[Dict[str, Any]], weight: float, default_conf: float = 0.0) -> float:
+            total_conf = sum(float(s.get('confidence', default_conf)) for s in signals)
+            return total_conf * float(weight)
+
+        buy_components = {
+            'trend_following': _weighted_component(buy_signals['trend'], weights['trend_following'], 0.5),
+            'crt': _weighted_component(buy_signals['crt'], weights['crt']),
+            'snr': _weighted_component(buy_signals['snr'], weights['snr']),
+            'fvg': _weighted_component(buy_signals['fvg'], weights['fvg']),
+            'liquidity': _weighted_component(buy_signals['liquidity'], liquidity_weight),
+        }
+        sell_components = {
+            'trend_following': _weighted_component(sell_signals['trend'], weights['trend_following'], 0.5),
+            'crt': _weighted_component(sell_signals['crt'], weights['crt']),
+            'snr': _weighted_component(sell_signals['snr'], weights['snr']),
+            'fvg': _weighted_component(sell_signals['fvg'], weights['fvg']),
+            'liquidity': _weighted_component(sell_signals['liquidity'], liquidity_weight),
+        }
+
+        buy_confidence = sum(buy_components.values())
+
+        sell_confidence = sum(sell_components.values())
+
+        strategy_breakdown["buy"] = {k: round(float(v), 4) for k, v in buy_components.items()}
+        strategy_breakdown["sell"] = {k: round(float(v), 4) for k, v in sell_components.items()}
+
+        buy_component_count = sum(1 for v in buy_components.values() if v >= float(config.STRATEGY_COMPONENT_MIN_SCORE))
+        sell_component_count = sum(1 for v in sell_components.values() if v >= float(config.STRATEGY_COMPONENT_MIN_SCORE))
+        
+        buy_confluence = 0
+        if len(buy_signals['trend']) > 0:
+            buy_confluence += 1
+        if len(buy_signals['crt']) > 0:
+            buy_confluence += 1
+        if len(buy_signals['snr']) > 0:
+            buy_confluence += 1
+        if fvg_confluence.has_fvg_signal and fvg_confluence.direction == 'buy':
+            buy_confluence += config.FVG_CONFLUENCE_WEIGHT
+            if fvg_confluence.conflicting:
+                buy_confluence -= 0.5
+        if len(buy_signals['liquidity']) > 0:
+            buy_confluence += config.LIQUIDITY_CONFLUENCE_WEIGHT
+        
+        sell_confluence = 0
+        if len(sell_signals['trend']) > 0:
+            sell_confluence += 1
+        if len(sell_signals['crt']) > 0:
+            sell_confluence += 1
+        if len(sell_signals['snr']) > 0:
+            sell_confluence += 1
+        if fvg_confluence.has_fvg_signal and fvg_confluence.direction == 'sell':
+            sell_confluence += config.FVG_CONFLUENCE_WEIGHT
+            if fvg_confluence.conflicting:
+                sell_confluence -= 0.5
+        if len(sell_signals['liquidity']) > 0:
+            sell_confluence += config.LIQUIDITY_CONFLUENCE_WEIGHT
+        
+        final_direction = None
+        final_confluence = 0
+        
+        if (
+            buy_confluence >= config.MIN_CONFLUENCE_SCORE and
+            buy_confidence > sell_confidence and
+            buy_component_count >= int(config.STRATEGY_MIN_COMPONENTS_REQUIRED)
+        ):
+            final_direction = 'buy'
+            final_confluence = buy_confluence
+        elif (
+            sell_confluence >= config.MIN_CONFLUENCE_SCORE and
+            sell_confidence > buy_confidence and
+            sell_component_count >= int(config.STRATEGY_MIN_COMPONENTS_REQUIRED)
+        ):
+            final_direction = 'sell'
+            final_confluence = sell_confluence
+        
+        confluence_data = {
+            'symbol': symbol,
+            'trend_signals': len(trend_signals),
+            'crt_signals': len(crt_signals),
+            'snr_signals': len(snr_signals),
+            'fvg_signals': len(fvg_signals),
+            'liquidity_signals': len(liquidity_signals),
+            'confluence_score': final_confluence,
+            'market_regime': market_regime,
+            'final_decision': final_direction if final_direction else 'none',
+            'action_taken': 'monitoring'
+        }
+        if config.AUTO_TUNE_STRATEGY_WEIGHTS:
+            confluence_data['dynamic_weights'] = json.dumps({k: round(v, 4) for k, v in weights.items()})
+        confluence_data['strategy_breakdown'] = json.dumps(strategy_breakdown)
+        confluence_data['disabled_strategies'] = json.dumps(disabled_strategies)
+        
+        logger.log_confluence(confluence_data)
+        
+        return {
+            'direction': final_direction,
+            'confidence': buy_confidence if final_direction == 'buy' else sell_confidence,
+            'confluence_score': final_confluence,
+            'buy_signals': buy_signals,
+            'sell_signals': sell_signals,
+            'crt_signals': crt_signals,
+            'snr_signals': snr_signals,
+            'fvg_signals': fvg_signals,
+            'liquidity_signals': liquidity_signals,
+            'fvg_confluence': fvg_confluence,
+            'trend_direction': trend_direction,
+            'strategy_breakdown': strategy_breakdown,
+            'disabled_strategies': disabled_strategies
+        }
+
+# ==================== TRADE FILTERS & ADAPTIVE LOGIC ====================
+class TradeFilter:
+    """Filter out low-quality trades"""
+    
+    def __init__(self):
+        self.min_volume_ratio = 1.2
+        self.min_trend_strength = 0.6
+        self.max_spread_multiplier = 2.0
+        self.time_since_last_signal = 300
+    
+    def filter_trade(self, signal: Dict[str, Any], market_data: Dict[str, Any],
+                     min_trend_strength: Optional[float] = None,
+                     max_spread_multiplier: Optional[float] = None,
+                     min_rr_ratio: Optional[float] = None) -> bool:
+        filters = [
+            self._check_volume(signal, market_data),
+            self._check_trend_alignment(signal, market_data, min_trend_strength),
+            self._check_spread(signal, market_data, max_spread_multiplier),
+            self._check_time_filter(signal, market_data),
+            self._check_risk_reward(signal, market_data, min_rr_ratio)
+        ]
+        return all(filters)
+    
+    def _check_volume(self, signal: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
+        volume_ratio = market_data.get("volume_ratio", 1.0)
+        return volume_ratio >= self.min_volume_ratio
+    
+    def _check_trend_alignment(self, signal: Dict[str, Any], market_data: Dict[str, Any],
+                               min_trend_strength: Optional[float]) -> bool:
+        trend_strength = market_data.get("trend_strength", 0.0)
+        threshold = self.min_trend_strength if min_trend_strength is None else min_trend_strength
+        return trend_strength >= threshold
+    
+    def _check_spread(self, signal: Dict[str, Any], market_data: Dict[str, Any],
+                      max_spread_multiplier: Optional[float]) -> bool:
+        spread_points = market_data.get("spread_points", 0.0)
+        avg_spread = market_data.get("avg_spread_points", spread_points)
+        if avg_spread == 0:
+            return True
+        multiplier = self.max_spread_multiplier if max_spread_multiplier is None else max_spread_multiplier
+        return spread_points <= avg_spread * multiplier
+    
+    def _check_time_filter(self, signal: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
+        last_signal_time = market_data.get("last_signal_time")
+        if last_signal_time is None:
+            return True
+        return (time.time() - last_signal_time) >= self.time_since_last_signal
+    
+    def _check_risk_reward(self, signal: Dict[str, Any], market_data: Dict[str, Any],
+                           min_rr_ratio: Optional[float]) -> bool:
+        rr_ratio = market_data.get("rr_ratio", 0.0)
+        threshold = config.MIN_RR_RATIO if min_rr_ratio is None else min_rr_ratio
+        return rr_ratio >= threshold
+
+    def compute_quality_score(self, market_data: Dict[str, Any],
+                              confluence_score: float,
+                              min_rr_ratio: float,
+                              relax_mode: bool) -> float:
+        """Compute a 0-100 entry quality score combining confluence, risk, trend, volume and execution."""
+        rr_ratio = float(market_data.get("rr_ratio", 0.0))
+        trend_strength = float(market_data.get("trend_strength", 0.0))
+        volume_ratio = float(market_data.get("volume_ratio", 1.0))
+        spread_ratio = float(market_data.get("spread_ratio", 1.0))
+
+        confluence_norm = min(1.0, max(0.0, float(confluence_score) / 5.0))
+        rr_norm = min(1.0, rr_ratio / max(1e-6, min_rr_ratio + 0.5))
+        trend_target = max(0.35, (config.RELAX_MIN_TREND_STRENGTH if relax_mode else self.min_trend_strength))
+        trend_norm = min(1.0, trend_strength / max(1e-6, trend_target + 0.25))
+        volume_norm = min(1.0, volume_ratio / max(1e-6, self.min_volume_ratio + 0.4))
+        spread_norm = max(0.0, min(1.0, 2.0 - spread_ratio))
+
+        weighted = (
+            confluence_norm * 0.30
+            + rr_norm * 0.25
+            + trend_norm * 0.20
+            + volume_norm * 0.15
+            + spread_norm * 0.10
+        )
+        return max(0.0, min(100.0, weighted * 100.0))
+
+    def classify_no_trade_environment(self, market_data: Dict[str, Any], atr: float) -> Tuple[bool, str]:
+        """Detect hostile market states where entries should be skipped."""
+        spread_ratio = float(market_data.get("spread_ratio", 1.0))
+        trend_strength = float(market_data.get("trend_strength", 0.0))
+        volume_ratio = float(market_data.get("volume_ratio", 1.0))
+        atr_baseline = float(market_data.get("atr_baseline", atr if atr > 0 else 0.0))
+
+        if spread_ratio > max(config.EXECUTION_MAX_SPREAD_RATIO, config.NO_TRADE_VOLATILITY_SPIKE_MULT):
+            return True, f"spread_spike:{spread_ratio:.2f}"
+
+        if atr_baseline > 0 and atr > (atr_baseline * config.NO_TRADE_VOLATILITY_SPIKE_MULT):
+            return True, f"atr_spike:{atr:.4f}>{atr_baseline:.4f}"
+
+        if trend_strength < config.NO_TRADE_LOW_TREND_THRESHOLD and volume_ratio < config.NO_TRADE_LOW_VOLUME_THRESHOLD:
+            return True, f"dead_market:trend={trend_strength:.2f},vol={volume_ratio:.2f}"
+
+        return False, "ok"
+
+class AdaptiveTrading:
+    """Adjust trading based on recent performance"""
+    
+    def __init__(self):
+        self.win_streak_adjustment = 0.1
+        self.loss_streak_adjustment = -0.15
+        self.consecutive_wins_to_increase = 3
+        self.consecutive_losses_to_decrease = 2
+    
+    def adjust_position_size(self, current_size: float, recent_performance: List[float]) -> float:
+        if len(recent_performance) < 5:
+            return current_size
+        
+        recent_wins = sum(1 for p in recent_performance[-5:] if p > 0)
+        recent_losses = sum(1 for p in recent_performance[-5:] if p < 0)
+        
+        if recent_losses >= self.consecutive_losses_to_decrease:
+            return current_size * (1 + self.loss_streak_adjustment)
+        if recent_wins >= self.consecutive_wins_to_increase:
+            return current_size * (1 + self.win_streak_adjustment)
+        
+        return current_size
+
+class TradeLearningSystem:
+    """Learn from past trades to improve future decisions"""
+    
+    def __init__(self):
+        self.trade_history: List[Dict[str, Any]] = []
+        self.pattern_recognition: Dict[str, int] = {}
+    
+    def add_trade(self, trade: Dict[str, Any]) -> None:
+        self.trade_history.append(trade)
+        if len(self.trade_history) > 200:
+            self.trade_history = self.trade_history[-200:]
+    
+    def analyze_trade_patterns(self) -> None:
+        if len(self.trade_history) < 10:
+            return
+        
+        winning_patterns = defaultdict(int)
+        losing_patterns = defaultdict(int)
+        
+        for trade in self.trade_history[-100:]:
+            pattern_key = self._create_pattern_key(trade)
+            if trade.get('profit', 0) > 0:
+                winning_patterns[pattern_key] += 1
+            else:
+                losing_patterns[pattern_key] += 1
+        
+        self._adjust_strategy_weights(winning_patterns, losing_patterns)
+    
+    def _create_pattern_key(self, trade: Dict[str, Any]) -> str:
+        return f"{trade.get('market_regime', '')}_{trade.get('time_of_day', '')}_{trade.get('confluence_score', 0)}"
+    
+    def _adjust_strategy_weights(self, winning_patterns: Dict[str, int], losing_patterns: Dict[str, int]) -> None:
+        self.pattern_recognition = {
+            "wins": winning_patterns,
+            "losses": losing_patterns
+        }
+
+# ==================== ENHANCED GLOBAL STATE MANAGEMENT ====================
+class EnhancedGlobalState:
+    """Enhanced global state with safety features"""
+    
+    def __init__(self, starting_balance: float):
+        self.daily_start_date = date.today()
+        self.daily_trades_count = 0
+        self.daily_loss_triggered = False
+        self.last_summary_time = time.time()
+        self.start_time = time.time()
+        self.peak_equity = starting_balance
+        self.max_drawdown = 0.0
+        self.circuit_breaker_until = 0.0
+        self.last_trade_time = {s: 0 for s in config.SYMBOLS}
+        self.last_forced_time = {s: 0 for s in config.SYMBOLS}
+        self.last_trade_attempt = {s: 0 for s in config.SYMBOLS}
+        self.last_signal_time = {s: None for s in config.SYMBOLS}
+        self.last_signal_dir = {s: None for s in config.SYMBOLS}
+        self.signal_stats = self._load_learning_stats()
+        self.market_regimes = {s: "unknown" for s in config.SYMBOLS}
+        self.consecutive_losses_by_symbol = {s: 0 for s in config.SYMBOLS}
+        self.symbol_paused_until = {s: 0.0 for s in config.SYMBOLS}
+        self.signal_strength = {s: 0 for s in config.SYMBOLS}
+        self.confluence_manager = ConfluenceManager()
+        self.trade_filter = TradeFilter()
+        self.adaptive_trading = AdaptiveTrading()
+        self.trade_learning = TradeLearningSystem()
+        self.recent_performance = deque(maxlen=20)
+        self.correlation_data: Dict[str, Dict[str, float]] = {}
+        self.news_events: List[Dict[str, Any]] = []
+        self.last_news_refresh = 0.0
+        self.last_correlation_refresh = 0.0
+        self.trade_memory_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'recent_trades.json')
+        self.daily_trade_state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'daily_trade_state.json')
+        self.readiness_state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'readiness_state.json')
+        self.recent_trade_levels: List[Dict[str, Any]] = self._load_recent_trade_levels()
+        self.spread_history = {s: deque(maxlen=max(20, config.EXECUTION_SPREAD_WINDOW)) for s in config.SYMBOLS}
+        self.strategy_expectancy: Dict[str, Dict[str, Dict[str, float]]] = {
+            s: {
+                "trend_following": {"profit_sum": 0.0, "count": 0.0},
+                "crt": {"profit_sum": 0.0, "count": 0.0},
+                "snr": {"profit_sum": 0.0, "count": 0.0},
+                "fvg": {"profit_sum": 0.0, "count": 0.0},
+                "liquidity": {"profit_sum": 0.0, "count": 0.0},
+            } for s in config.SYMBOLS
+        }
+        self.lock = threading.RLock()
+        self._load_daily_trade_state()
+        self.persisted_readiness = self._load_readiness_state()
+        self.readiness_baseline = dict(self.persisted_readiness) if isinstance(self.persisted_readiness, dict) else {}
+
+    def update_strategy_expectancy(self, symbol: str, strategy_hits: Dict[str, bool], profit: float) -> None:
+        """Update per-strategy expectancy using closed-trade outcomes."""
+        if not config.AUTO_TUNE_STRATEGY_WEIGHTS:
+            return
+        with self.lock:
+            if symbol not in self.strategy_expectancy:
+                self.strategy_expectancy[symbol] = {}
+            for name, active in (strategy_hits or {}).items():
+                if not active:
+                    continue
+                if name not in self.strategy_expectancy[symbol]:
+                    self.strategy_expectancy[symbol][name] = {"profit_sum": 0.0, "count": 0.0}
+                self.strategy_expectancy[symbol][name]["profit_sum"] += float(profit)
+                self.strategy_expectancy[symbol][name]["count"] += 1.0
+
+    def get_strategy_enabled_map(self, symbol: str) -> Dict[str, bool]:
+        """
+        Hard strategy guard:
+        - disables strategy contributions when expectancy is persistently negative
+        - re-enables only after expectancy recovers above recovery threshold
+        """
+        default_enabled = {
+            "trend_following": True,
+            "crt": True,
+            "snr": True,
+            "fvg": True,
+            "liquidity": True,
+        }
+        if not config.STRATEGY_KILL_SWITCH_ENABLED:
+            return default_enabled
+
+        stats = self.strategy_expectancy.get(symbol, {})
+        out = dict(default_enabled)
+        min_samples = int(config.STRATEGY_KILL_MIN_SAMPLES)
+        disable_thr = float(config.STRATEGY_KILL_EXPECTANCY_USD)
+        recover_thr = float(config.STRATEGY_KILL_RECOVERY_EXPECTANCY_USD)
+
+        for k in out.keys():
+            st = stats.get(k, {})
+            count = float(st.get("count", 0.0) or 0.0)
+            if count < min_samples:
+                continue
+            expectancy = float(st.get("profit_sum", 0.0) or 0.0) / max(1.0, count)
+            if expectancy <= disable_thr:
+                out[k] = False
+            elif expectancy >= recover_thr:
+                out[k] = True
+        return out
+
+    def get_auto_tuned_weights(self, symbol: str, base_weights: Dict[str, float]) -> Dict[str, float]:
+        """
+        Auto-tune weights from expectancy:
+        - Positive expectancy nudges weight up
+        - Negative expectancy nudges weight down
+        """
+        tuned = dict(base_weights or {})
+        if (not config.AUTO_TUNE_STRATEGY_WEIGHTS) or symbol not in self.strategy_expectancy:
+            return tuned
+
+        stats = self.strategy_expectancy.get(symbol, {})
+        sample_ready = any(v.get("count", 0) >= config.AUTO_TUNE_MIN_SAMPLES for v in stats.values())
+        if not sample_ready:
+            return tuned
+
+        for strategy_name in ("crt", "snr", "trend_following", "fvg", "liquidity"):
+            if strategy_name not in tuned:
+                continue
+            st = stats.get(strategy_name, {})
+            count = float(st.get("count", 0.0) or 0.0)
+            if count < config.AUTO_TUNE_MIN_SAMPLES:
+                continue
+            expectancy = float(st.get("profit_sum", 0.0) or 0.0) / max(1.0, count)
+            capped = max(-config.AUTO_TUNE_EXPECTANCY_CLAMP, min(config.AUTO_TUNE_EXPECTANCY_CLAMP, expectancy))
+            nudged = tuned[strategy_name] * (1.0 + (capped / config.AUTO_TUNE_EXPECTANCY_CLAMP) * config.AUTO_TUNE_WEIGHT_ADJUST_RATE)
+            tuned[strategy_name] = max(config.AUTO_TUNE_WEIGHT_MIN, min(config.AUTO_TUNE_WEIGHT_MAX, nudged))
+        keys = list(tuned.keys())
+        if not keys:
+            return tuned
+
+        lb = float(config.AUTO_TUNE_WEIGHT_MIN)
+        ub = float(config.AUTO_TUNE_WEIGHT_MAX)
+        n = len(keys)
+
+        if (lb * n) > 1.0 or (ub * n) < 1.0:
+            total = sum(tuned.values())
+            return ({k: float(v) / total for k, v in tuned.items()} if total > 0 else tuned)
+
+        projected = {k: max(lb, min(ub, float(tuned[k]))) for k in keys}
+        fixed: Dict[str, float] = {}
+        free = set(keys)
+
+        while free:
+            remaining = 1.0 - sum(fixed.values())
+            if remaining <= 0:
+                break
+            free_sum = sum(projected[k] for k in free)
+            if free_sum <= 0:
+                equal = remaining / len(free)
+                for k in list(free):
+                    projected[k] = equal
+            else:
+                for k in list(free):
+                    projected[k] = remaining * (projected[k] / free_sum)
+
+            changed = False
+            for k in list(free):
+                if projected[k] < lb:
+                    fixed[k] = lb
+                    free.remove(k)
+                    changed = True
+                elif projected[k] > ub:
+                    fixed[k] = ub
+                    free.remove(k)
+                    changed = True
+            if not changed:
+                break
+
+        for k in free:
+            fixed[k] = projected[k]
+        total = sum(fixed.values())
+        if total <= 0:
+            return tuned
+        normalized = {k: max(lb, min(ub, (fixed[k] / total))) for k in keys}
+
+        residual = 1.0 - sum(normalized.values())
+        if abs(residual) > 1e-9:
+            if residual > 0:
+                adjustable = sorted(keys, key=lambda k: (ub - normalized[k]), reverse=True)
+                for k in adjustable:
+                    room = ub - normalized[k]
+                    if room <= 0:
+                        continue
+                    add = min(room, residual)
+                    normalized[k] += add
+                    residual -= add
+                    if residual <= 1e-9:
+                        break
+            else:
+                adjustable = sorted(keys, key=lambda k: (normalized[k] - lb), reverse=True)
+                need = -residual
+                for k in adjustable:
+                    room = normalized[k] - lb
+                    if room <= 0:
+                        continue
+                    sub = min(room, need)
+                    normalized[k] -= sub
+                    need -= sub
+                    if need <= 1e-9:
+                        break
+
+        return normalized
+
+    def _load_daily_trade_state(self) -> None:
+        """Load persisted daily trade counter so restarts do not bypass MAX_DAILY_TRADES."""
+        try:
+            if not os.path.exists(self.daily_trade_state_file):
+                return
+            with open(self.daily_trade_state_file, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+            stored_date = state.get('date')
+            stored_count = int(state.get('count', 0))
+            if stored_date == date.today().isoformat() and stored_count >= 0:
+                self.daily_start_date = date.today()
+                self.daily_trades_count = stored_count
+                logger.logger.info(f"Restored daily trade count: {self.daily_trades_count}/{config.MAX_DAILY_TRADES}")
+        except Exception as e:
+            logger.log_error('_load_daily_trade_state', str(e), 'WARNING')
+
+    def _persist_daily_trade_state(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.daily_trade_state_file), exist_ok=True)
+            with open(self.daily_trade_state_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'date': self.daily_start_date.isoformat(),
+                    'count': int(self.daily_trades_count)
+                }, f, indent=2)
+        except Exception as e:
+            logger.log_error('_persist_daily_trade_state', str(e), 'WARNING')
+
+    def _load_readiness_state(self) -> Dict[str, float]:
+        try:
+            if not os.path.exists(self.readiness_state_file):
+                return {}
+            with open(self.readiness_state_file, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+            if not isinstance(state, dict):
+                return {}
+            return {
+                "total_trades": float(state.get("total_trades", 0.0)),
+                "win_rate": float(state.get("win_rate", 0.0)),
+                "profit_factor": float(state.get("profit_factor", 0.0)),
+                "sharpe_ratio": float(state.get("sharpe_ratio", 0.0)),
+                "max_drawdown": float(state.get("max_drawdown", 0.0)),
+            }
+        except Exception as e:
+            logger.log_error('_load_readiness_state', str(e), 'WARNING')
+            return {}
+
+    def persist_readiness_state(self, snapshot: Dict[str, float]) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.readiness_state_file), exist_ok=True)
+            clean = {
+                "updated_at": datetime.now().isoformat(),
+                "total_trades": float(snapshot.get("total_trades", 0.0)),
+                "win_rate": float(snapshot.get("win_rate", 0.0)),
+                "profit_factor": float(snapshot.get("profit_factor", 0.0)),
+                "sharpe_ratio": float(snapshot.get("sharpe_ratio", 0.0)),
+                "max_drawdown": float(snapshot.get("max_drawdown", 0.0)),
+            }
+            with open(self.readiness_state_file, 'w', encoding='utf-8') as f:
+                json.dump(clean, f, indent=2)
+            self.persisted_readiness = clean
+        except Exception as e:
+            logger.log_error('persist_readiness_state', str(e), 'WARNING')
+
+    def try_reserve_daily_trade_slot(self, symbol: str) -> bool:
+        """Atomically reserve one daily trade slot to enforce MAX_DAILY_TRADES across threads."""
+        with self.lock:
+            if date.today() != self.daily_start_date:
+                self.reset_daily_stats()
+            if self.daily_trades_count >= config.MAX_DAILY_TRADES:
+                logger.logger.warning(f"{nowstr()} {symbol}: daily trade cap reached ({self.daily_trades_count}/{config.MAX_DAILY_TRADES})")
+                return False
+            self.daily_trades_count += 1
+            self._persist_daily_trade_state()
+            return True
+
+    def release_daily_trade_slot(self) -> None:
+        """Rollback reserved slot if order placement fails."""
+        with self.lock:
+            self.daily_trades_count = max(0, self.daily_trades_count - 1)
+            self._persist_daily_trade_state()
+
+    def record_spread(self, symbol: str, spread_points: float) -> None:
+        with self.lock:
+            if symbol not in self.spread_history:
+                self.spread_history[symbol] = deque(maxlen=max(20, config.EXECUTION_SPREAD_WINDOW))
+            self.spread_history[symbol].append(float(spread_points))
+
+    def spread_ratio(self, symbol: str, spread_points: float) -> float:
+        with self.lock:
+            hist = self.spread_history.get(symbol)
+            if not hist:
+                return 1.0
+            baseline = float(np.nanmedian(list(hist))) if len(hist) else 0.0
+            if baseline <= 0:
+                return 1.0
+            return float(spread_points) / baseline
+
+    def dynamic_quality_threshold(self, symbol: str, market_regime: str, session_preferred: bool) -> float:
+        """Adaptive entry score threshold from regime/session and recent signal learning."""
+        threshold = float(config.MIN_ENTRY_QUALITY_SCORE)
+        if config.DYNAMIC_QUALITY_BY_REGIME:
+            if market_regime == 'trending':
+                threshold += float(config.QUALITY_REGIME_TRENDING_BONUS)
+            elif market_regime == 'ranging':
+                threshold += float(config.QUALITY_REGIME_RANGING_PENALTY)
+
+        if not session_preferred:
+            threshold += float(config.QUALITY_NON_PREFERRED_SESSION_PENALTY)
+
+        sample_key = "buy"
+        wr = self.get_signal_win_rate(symbol, sample_key)
+        if wr < config.MIN_SIGNAL_WIN_RATE:
+            threshold += (config.MIN_SIGNAL_WIN_RATE - wr) * 40.0
+
+        return max(50.0, min(95.0, threshold))
+    
+    def _load_recent_trade_levels(self) -> List[Dict[str, Any]]:
+        try:
+            if os.path.exists(self.trade_memory_file):
+                with open(self.trade_memory_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        return data[-200:]
+        except Exception as e:
+            logger.log_error('_load_recent_trade_levels', str(e), 'WARNING')
+        return []
+
+    def _persist_recent_trade_levels(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.trade_memory_file), exist_ok=True)
+            with open(self.trade_memory_file, 'w', encoding='utf-8') as f:
+                json.dump(self.recent_trade_levels[-200:], f, indent=2)
+        except Exception as e:
+            logger.log_error('_persist_recent_trade_levels', str(e), 'WARNING')
+
+    def record_trade_level(self, symbol: str, direction: str, price: float) -> None:
+        with self.lock:
+            self.recent_trade_levels.append({
+                'time': datetime.now().isoformat(),
+                'symbol': symbol,
+                'direction': direction,
+                'price': price
+            })
+            self.recent_trade_levels = self.recent_trade_levels[-200:]
+            self._persist_recent_trade_levels()
+
+    def update_news_events(self) -> None:
+        """Best-effort refresh of news events cache used by is_news_window."""
+        try:
+            now = datetime.now()
+            events: List[Dict[str, Any]] = []
+            start = now - timedelta(hours=2)
+            end = now + timedelta(hours=24)
+
+            if hasattr(mt5, "calendar_events_get"):
+                raw = mt5.calendar_events_get(start, end)
+                if raw:
+                    for ev in raw:
+                        event_time = getattr(ev, "time", None)
+                        if isinstance(event_time, (int, float)):
+                            event_time = datetime.fromtimestamp(event_time)
+                        if not isinstance(event_time, datetime):
+                            continue
+                        events.append({
+                            "time": event_time,
+                            "impact": getattr(ev, "importance", ""),
+                            "title": getattr(ev, "name", ""),
+                            "currency": getattr(ev, "currency", ""),
+                        })
+
+            self.news_events = events
+        except Exception as e:
+            logger.log_error('update_news_events', str(e), 'WARNING')
+
+    def update_correlation_data(self) -> None:
+        """Populate rolling correlation data for configured symbol pairs."""
+        try:
+            snapshot: Dict[str, Dict[str, float]] = {}
+            for symbol, pairs in config.CORRELATION_PAIRS.items():
+                base_df = get_bars_enhanced(symbol, config.ENTRY_TF, 200)
+                if base_df.empty or 'close' not in base_df.columns:
+                    continue
+                base_ret = np.log(base_df['close']).diff().dropna()
+                if len(base_ret) < 20:
+                    continue
+                pair_map: Dict[str, float] = {}
+                for pair in pairs:
+                    if data_cache.is_symbol_temporarily_unavailable(pair):
+                        continue
+                    pair_df = get_bars_enhanced(pair, config.ENTRY_TF, 200)
+                    if pair_df.empty or 'close' not in pair_df.columns:
+                        continue
+                    pair_ret = np.log(pair_df['close']).diff().dropna()
+                    aligned = pd.concat([base_ret, pair_ret], axis=1).dropna()
+                    if len(aligned) < 20:
+                        continue
+                    pair_map[pair] = float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1]))
+                if pair_map:
+                    snapshot[symbol] = pair_map
+            self.correlation_data = snapshot
+        except Exception as e:
+            logger.log_error('update_correlation_data', str(e), 'WARNING')
+
+    def is_duplicate_level(self, symbol: str, direction: str, price: float, tolerance: float) -> bool:
+        with self.lock:
+            now = datetime.now()
+            for item in reversed(self.recent_trade_levels[-100:]):
+                if item.get('symbol') != symbol or item.get('direction') != direction:
+                    continue
+                try:
+                    item_price = float(item.get('price', 0.0))
+                except Exception:
+                    continue
+                t = item.get('time')
+                if t:
+                    try:
+                        ts = datetime.fromisoformat(t)
+                        if (now - ts).total_seconds() > 6 * 3600:
+                            continue
+                    except Exception:
+                        pass
+                if abs(price - item_price) <= tolerance:
+                    return True
+            return False
+
+    def _load_learning_stats(self):
+        stats = {}
+        learning_file = os.path.join(os.path.expanduser("~"), "Documents", "trade_learning_log.csv")
+        
+        try:
+            if os.path.exists(learning_file):
+                with open(learning_file, 'r', newline='') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        sym = row.get("symbol", "")
+                        sig = row.get("direction", "")
+                        res = (row.get("result") or "").lower()
+                        if not sym or not sig:
+                            continue
+                        
+                        if sym not in stats:
+                            stats[sym] = {}
+                        if sig not in stats[sym]:
+                            stats[sym][sig] = {"wins": 0, "losses": 0, "total": 0}
+                        
+                        if res.startswith("win"):
+                            stats[sym][sig]["wins"] += 1
+                        elif res.startswith("loss"):
+                            stats[sym][sig]["losses"] += 1
+                        
+                        stats[sym][sig]["total"] += 1
+                        
+                logger.logger.info(f"Loaded learning stats for {len(stats)} symbols")
+        except Exception as e:
+            logger.logger.error(f"Error loading learning stats: {e}")
+            logger.log_error("_load_learning_stats", str(e), "WARNING")
+        
+        return stats
+    
+    def update_consecutive_losses(self, symbol: str, profit: float):
+        """Update per-symbol consecutive losses with timed cooldown."""
+        with self.lock:
+            if profit < 0:
+                self.consecutive_losses_by_symbol[symbol] += 1
+                logger.logger.warning(f"{symbol}: Consecutive losses: {self.consecutive_losses_by_symbol[symbol]}")
+                if self.consecutive_losses_by_symbol[symbol] >= config.CONSECUTIVE_LOSS_LIMIT:
+                    cooldown = max(15, int(config.CONSECUTIVE_LOSS_COOLDOWN_MINUTES)) * 60
+                    self.symbol_paused_until[symbol] = max(self.symbol_paused_until.get(symbol, 0.0), time.time() + cooldown)
+            else:
+                self.consecutive_losses_by_symbol[symbol] = 0
+                self.symbol_paused_until[symbol] = 0.0
+
+    def should_pause_symbol(self, symbol: str) -> bool:
+        """Check whether symbol cooldown is active and auto-resume when elapsed."""
+        with self.lock:
+            now = time.time()
+            until = self.symbol_paused_until.get(symbol, 0.0)
+            if now < until:
+                return True
+            if until > 0:
+                self.symbol_paused_until[symbol] = 0.0
+                self.consecutive_losses_by_symbol[symbol] = 0
+                logger.logger.info(f"{symbol}: symbol cooldown elapsed, trading resumed")
+            return False
+    
+    def update_learning(self, symbol: str, signal: str, outcome: str):
+        with self.lock:
+            try:
+                if symbol not in self.signal_stats:
+                    self.signal_stats[symbol] = {}
+                if signal not in self.signal_stats[symbol]:
+                    self.signal_stats[symbol][signal] = {"wins": 0, "losses": 0, "total": 0}
+                
+                if outcome == "win":
+                    self.signal_stats[symbol][signal]["wins"] += 1
+                elif outcome == "loss":
+                    self.signal_stats[symbol][signal]["losses"] += 1
+                
+                self.signal_stats[symbol][signal]["total"] += 1
+                
+                learning_file = os.path.join(os.path.expanduser("~"), "Documents", "trade_learning_log.csv")
+                with open(learning_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        datetime.now(),
+                        symbol,
+                        signal,
+                        "", "", "", "", "",
+                        outcome
+                    ])
+                
+            except Exception as e:
+                logger.logger.error(f"Error updating learning: {e}")
+                logger.log_error("update_learning", str(e), "WARNING")
+    
+    def get_signal_win_rate(self, symbol: str, signal: str) -> float:
+        with self.lock:
+            try:
+                if (symbol in self.signal_stats and 
+                    signal in self.signal_stats[symbol] and 
+                    self.signal_stats[symbol][signal]["total"] > 0):
+                    
+                    stats = self.signal_stats[symbol][signal]
+                    return stats["wins"] / stats["total"]
+            except Exception:
+                pass
+            return 0.6
+    
+    def update_signal_strength(self, symbol: str, strength: int):
+        """Update signal strength for a symbol"""
+        with self.lock:
+            self.signal_strength[symbol] = strength
+    
+    def get_signal_strength(self, symbol: str) -> int:
+        """Get current signal strength for a symbol"""
+        with self.lock:
+            return self.signal_strength.get(symbol, 0)
+    
+    def update_daily_stats(self):
+        with self.lock:
+            try:
+                if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
+                    return
+                
+                acct = get_account_info_safe()
+                if acct:
+                    current_equity = float(acct.equity)
+                    if performance_tracker:
+                        performance_tracker.record_equity(current_equity)
+                    
+                    if current_equity > self.peak_equity:
+                        self.peak_equity = current_equity
+                    
+                    if self.peak_equity > 0:
+                        drawdown = (self.peak_equity - current_equity) / self.peak_equity * 100
+                        self.max_drawdown = max(self.max_drawdown, drawdown)
+                        if performance_tracker:
+                            self.max_drawdown = max(self.max_drawdown, performance_tracker.max_drawdown)
+                    
+                    current_balance = float(acct.balance)
+                    daily_reference = max(1e-6, self.peak_equity if self.peak_equity > 0 else STARTING_BALANCE)
+                    equity_drawdown_pct = ((current_equity - daily_reference) / daily_reference) * 100.0
+                    profit_pct = ((current_balance - STARTING_BALANCE) / max(1e-6, STARTING_BALANCE)) * 100.0
+                    pnl_usd = current_balance - STARTING_BALANCE
+
+                    if equity_drawdown_pct <= -config.DAILY_LOSS_PCT:
+                        self.daily_loss_triggered = bool(config.DAILY_LOSS_HARD_STOP)
+                        self.circuit_breaker_until = max(
+                            self.circuit_breaker_until,
+                            time.time() + config.CIRCUIT_BREAKER_COOL_OFF_MINUTES * 60,
+                        )
+                        logger.logger.warning(f"Daily loss/cooldown triggered: {equity_drawdown_pct:.2f}%")
+                        logger.log_error("update_daily_stats", 
+                                       f"Daily loss/cooldown {equity_drawdown_pct:.2f}% triggered",
+                                       "CRITICAL")
+
+                    if config.DAILY_LOSS_USD_LIMIT > 0 and pnl_usd <= -config.DAILY_LOSS_USD_LIMIT:
+                        self.daily_loss_triggered = bool(config.DAILY_LOSS_HARD_STOP)
+                        self.circuit_breaker_until = max(
+                            self.circuit_breaker_until,
+                            time.time() + config.CIRCUIT_BREAKER_COOL_OFF_MINUTES * 60,
+                        )
+                        logger.logger.warning(
+                            f"Daily USD loss/cooldown triggered: ${pnl_usd:.2f} <= -${config.DAILY_LOSS_USD_LIMIT:.2f}"
+                        )
+                        logger.log_error(
+                            "update_daily_stats",
+                            f"Daily USD loss/cooldown ${pnl_usd:.2f} triggered",
+                            "CRITICAL",
+                        )
+                    
+                    if self.max_drawdown >= config.MAX_DRAWDOWN_PCT:
+                        self.daily_loss_triggered = True
+                        self.circuit_breaker_until = max(
+                            self.circuit_breaker_until,
+                            time.time() + config.CIRCUIT_BREAKER_COOL_OFF_MINUTES * 60,
+                        )
+                        logger.logger.warning(f"Max drawdown limit triggered: {self.max_drawdown:.2f}%")
+                        logger.log_error("update_daily_stats",
+                                       f"Max drawdown {self.max_drawdown:.2f}% triggered",
+                                       "CRITICAL")
+                    
+            except Exception as e:
+                logger.logger.error(f"Error updating daily stats: {e}")
+                logger.log_error("update_daily_stats", str(e), "WARNING")
+    
+    def reset_daily_stats(self):
+        with self.lock:
+            self.daily_start_date = date.today()
+            self.daily_trades_count = 0
+            self.daily_loss_triggered = False
+            self.circuit_breaker_until = 0.0
+            try:
+                acct = get_account_info_safe()
+                if acct:
+                    self.peak_equity = float(acct.balance)
+            except:
+                self.peak_equity = STARTING_BALANCE
+            self.max_drawdown = 0.0
+            self._persist_daily_trade_state()
+            logger.logger.info("Daily stats reset for new trading day")
+
+global_state = EnhancedGlobalState(STARTING_BALANCE)
+
+# ==================== ENHANCED UTILITY FUNCTIONS ====================
+def get_bars_enhanced(symbol: str, timeframe: int, n: int = 400) -> pd.DataFrame:
+    """Enhanced data fetching with caching and retry"""
+    return data_cache.get_data_with_retry(symbol, timeframe, n)
+
+def is_in_no_trade_zone() -> bool:
+    t = datetime.now().time()
+    if config.NO_TRADE_START <= config.NO_TRADE_END:
+        return config.NO_TRADE_START <= t <= config.NO_TRADE_END
+    else:
+        return t >= config.NO_TRADE_START or t <= config.NO_TRADE_END
+
+def is_in_trading_session(session_name: str) -> bool:
+    if not session_name or session_name.upper() in {"ALL", "ALL_DAY", "ANY"}:
+        return True
+    session = config.TRADING_SESSIONS.get(session_name)
+    if not session:
+        return True
+    now_time = datetime.now().time()
+    start = session['start']
+    end = session['end']
+    if start <= end:
+        return start <= now_time <= end
+    return now_time >= start or now_time <= end
+
+def is_within_daily_trade_window() -> bool:
+    """Return True when new entries are allowed for configured trade window."""
+    if not config.ENFORCE_DAILY_TRADE_WINDOW:
+        return True
+    now_time = datetime.now().time()
+    start = config.TRADE_WINDOW_START
+    end = config.TRADE_WINDOW_END
+    if start <= end:
+        return start <= now_time <= end
+    return now_time >= start or now_time <= end
+
+def timeframe_seconds(timeframe: int) -> int:
+    mapping = {
+        mt5.TIMEFRAME_M1: 60,
+        mt5.TIMEFRAME_M2: 120,
+        mt5.TIMEFRAME_M3: 180,
+        mt5.TIMEFRAME_M4: 240,
+        mt5.TIMEFRAME_M5: 300,
+        mt5.TIMEFRAME_M6: 360,
+        mt5.TIMEFRAME_M10: 600,
+        mt5.TIMEFRAME_M12: 720,
+        mt5.TIMEFRAME_M15: 900,
+        mt5.TIMEFRAME_M20: 1200,
+        mt5.TIMEFRAME_M30: 1800,
+        mt5.TIMEFRAME_H1: 3600,
+        mt5.TIMEFRAME_H2: 7200,
+        mt5.TIMEFRAME_H3: 10800,
+        mt5.TIMEFRAME_H4: 14400,
+        mt5.TIMEFRAME_H6: 21600,
+        mt5.TIMEFRAME_H8: 28800,
+        mt5.TIMEFRAME_H12: 43200,
+        mt5.TIMEFRAME_D1: 86400,
+        mt5.TIMEFRAME_W1: 604800,
+        mt5.TIMEFRAME_MN1: 2592000,
+    }
+    return mapping.get(timeframe, 300)
+
+def coerce_timestamp(value: Any) -> float:
+    if isinstance(value, (datetime, pd.Timestamp)):
+        return value.timestamp()
+    if isinstance(value, (int, float)):
+        return float(value)
+    return time.time()
+
+def validate_market_data(df: pd.DataFrame, symbol: str, timeframe: int) -> Tuple[bool, str]:
+    """Sanity checks for corrupt/stale market data."""
+    if df is None or df.empty:
+        return False, "empty_data"
+    required = {'time', 'open', 'high', 'low', 'close'}
+    if not required.issubset(set(df.columns)):
+        return False, "missing_ohlc_columns"
+
+    numeric = df[['open', 'high', 'low', 'close']]
+    non_positive_mask = (numeric <= 0).any(axis=1)
+    negative_mask = (numeric < 0).any(axis=1)
+    if float(non_positive_mask.mean()) > config.DATA_MAX_ZERO_ROWS_PCT:
+        return False, "too_many_non_positive_prices"
+    if float(negative_mask.mean()) > config.DATA_MAX_NEGATIVE_ROWS_PCT:
+        return False, "negative_prices_detected"
+
+    latest_ts = pd.to_datetime(df['time'].iloc[-1]).timestamp()
+    stale_limit = max(config.MAX_STALE_DATA_SECONDS, timeframe_seconds(timeframe) * 3)
+    if (time.time() - latest_ts) > stale_limit:
+        return False, "stale_data"
+
+    return True, "ok"
+
+def compute_dynamic_rsi_bands(df: pd.DataFrame) -> Tuple[float, float]:
+    if 'rsi' not in df.columns or len(df) < max(30, config.DYNAMIC_RSI_LOOKBACK // 2):
+        return float(config.RSI_OS), float(config.RSI_OB)
+    window = df['rsi'].tail(config.DYNAMIC_RSI_LOOKBACK).dropna()
+    if len(window) < 20:
+        return float(config.RSI_OS), float(config.RSI_OB)
+    low = float(np.clip(np.nanquantile(window, config.DYNAMIC_RSI_LOW_Q), 10.0, 45.0))
+    high = float(np.clip(np.nanquantile(window, config.DYNAMIC_RSI_HIGH_Q), 55.0, 90.0))
+    if low >= high:
+        return float(config.RSI_OS), float(config.RSI_OB)
+    return low, high
+
+def detect_order_flow_imbalance(df: pd.DataFrame, lookback: int = 20) -> Dict[str, float]:
+    """Proxy imbalance using signed candle volume when L2 bid/ask is unavailable."""
+    if df is None or df.empty or len(df) < 5:
+        return {'buy_pressure': 0.0, 'sell_pressure': 0.0, 'imbalance': 0.0}
+    vol_col = 'volume' if 'volume' in df.columns else ('tick_volume' if 'tick_volume' in df.columns else None)
+    if vol_col is None:
+        return {'buy_pressure': 0.0, 'sell_pressure': 0.0, 'imbalance': 0.0}
+    tail = df.tail(lookback)
+    up = tail[tail['close'] >= tail['open']][vol_col].sum()
+    down = tail[tail['close'] < tail['open']][vol_col].sum()
+    total = float(up + down)
+    imb = ((up - down) / total) if total > 0 else 0.0
+    return {'buy_pressure': float(up), 'sell_pressure': float(down), 'imbalance': float(imb)}
+
+def detect_market_condition_enhanced(df: pd.DataFrame) -> Dict[str, Any]:
+    """Enhanced market condition detection"""
+    condition = {
+        'regime': 'unknown',
+        'volatility': 0.0,
+        'trend_strength': 0.0,
+        'noise_level': 0.0,
+        'adx_value': 0.0
+    }
+    
+    if len(df) >= 14:
+        high = df['high'].values[-14:]
+        low = df['low'].values[-14:]
+        close = df['close'].values[-14:]
+        
+        tr = np.maximum.reduce([
+            high - low,
+            np.abs(high - np.roll(close, 1)),
+            np.abs(low - np.roll(close, 1))
+        ])[1:]
+        
+        atr = np.mean(tr) if len(tr) > 0 else 0
+        
+        returns = np.diff(np.log(close))
+        volatility = np.std(returns) * np.sqrt(252) if len(returns) > 1 else 0.0
+        
+        atr_pct = atr / df['close'].iloc[-1] if df['close'].iloc[-1] > 0 else 0.0
+
+        trend_ratio = abs(np.mean(returns)) / atr_pct if atr_pct > 0 else 0.0
+        trend_threshold = 0.5
+
+        if volatility > 0.03:
+            condition['regime'] = 'volatile'
+        elif trend_ratio > trend_threshold:
+            condition['regime'] = 'trending'
+        else:
+            condition['regime'] = 'ranging'
+        
+        condition['volatility'] = volatility
+        condition['trend_strength'] = trend_ratio
+        condition['adx_value'] = atr / df['close'].iloc[-1] * 100 if df['close'].iloc[-1] > 0 else 0
+    
+    return condition
+
+def calculate_dynamic_tp(entry_price: float, direction: str, atr: float, market_regime: str,
+                         confluence_score: float = 0.0, trend_strength: float = 0.0) -> float:
+    """Adaptive TP using market regime + confluence/trend quality boost."""
+    if market_regime == 'trending':
+        multiplier = config.DYNAMIC_TP_TRENDING_ATR_MULT
+    elif market_regime == 'volatile':
+        multiplier = config.DYNAMIC_TP_VOLATILE_ATR_MULT
+    else:
+        multiplier = config.DYNAMIC_TP_RANGING_ATR_MULT
+
+    if confluence_score >= 4:
+        multiplier += 0.20
+    if trend_strength >= 0.75:
+        multiplier += 0.15
+
+    multiplier = min(3.5, max(0.8, multiplier))
+    if direction == 'buy':
+        return entry_price + (atr * multiplier)
+    return entry_price - (atr * multiplier)
+
+
+def should_skip_chase_entry(df: pd.DataFrame, direction: str, atr: float, market_regime: str,
+                            has_smc_signal: bool = False) -> Tuple[bool, str]:
+    """Avoid late/chase entries where reward quality degrades."""
+    if df.empty or atr <= 0:
+        return False, "ok"
+
+    bar = df.iloc[-1]
+    ema_fast = float(bar.get('ema_fast', bar.get('close', 0.0)))
+    close = float(bar.get('close', ema_fast))
+    rsi_val = float(bar.get('rsi', 50.0))
+
+    extension_atr = abs(close - ema_fast) / max(atr, 1e-8)
+    max_ext = config.ENTRY_MAX_DISTANCE_ATR
+    if market_regime == 'ranging':
+        max_ext *= 0.85
+
+    if extension_atr > max_ext and not has_smc_signal:
+        return True, f"overextended extension_atr={extension_atr:.2f}>{max_ext:.2f}"
+
+    if direction == 'buy' and rsi_val > config.ENTRY_RSI_BUY_MAX and not has_smc_signal:
+        return True, f"buy_rsi_too_high={rsi_val:.1f}"
+    if direction == 'sell' and rsi_val < config.ENTRY_RSI_SELL_MIN and not has_smc_signal:
+        return True, f"sell_rsi_too_low={rsi_val:.1f}"
+
+    return False, "ok"
+
+
+def adjust_sl_for_regime_and_quality(entry_price: float, direction: str, atr: float, sl_price: float,
+                                     market_regime: str, confluence_score: float) -> float:
+    """Tighten/relax SL distance based on regime and setup quality."""
+    regime_mult = 1.0
+    if market_regime == 'trending':
+        regime_mult = 1.12
+    elif market_regime == 'ranging':
+        regime_mult = 0.88
+
+    quality_mult = 0.92 if confluence_score >= 4 else 1.0
+    target_dist = atr * config.SL_ATR_MULT * regime_mult * quality_mult
+
+    if direction == 'buy':
+        adaptive_sl = entry_price - target_dist
+        return max(sl_price, adaptive_sl)
+    adaptive_sl = entry_price + target_dist
+    return min(sl_price, adaptive_sl)
+
+
+def calculate_momentum_strength(df: pd.DataFrame, direction: str) -> Tuple[bool, float]:
+    rsi_val = float(df['rsi'].iloc[-1]) if 'rsi' in df.columns else 50.0
+    strength = min(1.0, abs(rsi_val - 50.0) / 50.0)
+    if direction == 'buy':
+        confirmed = rsi_val >= 50.0
+    else:
+        confirmed = rsi_val <= 50.0
+    return confirmed, strength
+
+def is_macro_high_risk_time(now: datetime) -> bool:
+    """Simple built-in NFP/CPI risk-time detector for XAUUSD."""
+    # NFP (typically first Friday around 13:30 UTC)
+    if now.weekday() == 4 and now.day <= 7 and now.hour == 13 and 0 <= now.minute <= 59:
+        return True
+    # CPI (approx monthly mid-cycle around 13:30 UTC)
+    if 10 <= now.day <= 16 and now.hour == 13 and 0 <= now.minute <= 59:
+        return True
+    return False
+
+
+def get_mtf_alignment(df_h1: pd.DataFrame, df_h4: pd.DataFrame, direction: str) -> bool:
+    if df_h1.empty or df_h4.empty:
+        return False
+    for frame in (df_h1, df_h4):
+        if 'ema_fast' not in frame.columns or 'ema_slow' not in frame.columns:
+            return False
+    h1_fast, h1_slow = float(df_h1['ema_fast'].iloc[-1]), float(df_h1['ema_slow'].iloc[-1])
+    h4_fast, h4_slow = float(df_h4['ema_fast'].iloc[-1]), float(df_h4['ema_slow'].iloc[-1])
+    if direction == 'buy':
+        return h1_fast > h1_slow and h4_fast > h4_slow
+    return h1_fast < h1_slow and h4_fast < h4_slow
+
+def compute_mtf_confirmation_score(df_h4: pd.DataFrame, df_h1: pd.DataFrame, df_m15: pd.DataFrame, direction: str) -> Tuple[float, Dict[str, Any]]:
+    """
+    Multi-timeframe confirmation engine (0-100):
+    - H4: macro trend bias
+    - H1: trend + structure (proxy BOS/CHOCH)
+    - M15: pullback and entry-zone quality
+    """
+    details = {"h4_bias": False, "h1_structure": False, "m15_entry_zone": False}
+    if df_h4.empty or df_h1.empty or df_m15.empty:
+        return 0.0, details
+    try:
+        h4_fast, h4_slow = float(df_h4['ema_fast'].iloc[-1]), float(df_h4['ema_slow'].iloc[-1])
+        h1_fast, h1_slow = float(df_h1['ema_fast'].iloc[-1]), float(df_h1['ema_slow'].iloc[-1])
+        h4_close = float(df_h4['close'].iloc[-1])
+        h1_close = float(df_h1['close'].iloc[-1])
+
+        # H4 macro bias
+        if direction == 'buy':
+            details["h4_bias"] = (h4_fast > h4_slow and h4_close > h4_fast)
+        else:
+            details["h4_bias"] = (h4_fast < h4_slow and h4_close < h4_fast)
+
+        # H1 structure proxy for BOS/CHOCH (new swing expansion + EMA agreement)
+        recent_h1 = df_h1.iloc[-20:]
+        prev_h1 = df_h1.iloc[-40:-20] if len(df_h1) >= 40 else df_h1.iloc[:-20]
+        if not prev_h1.empty:
+            if direction == 'buy':
+                bos = float(recent_h1['high'].max()) > float(prev_h1['high'].max())
+                details["h1_structure"] = bos and h1_fast > h1_slow and h1_close > h1_fast
+            else:
+                bos = float(recent_h1['low'].min()) < float(prev_h1['low'].min())
+                details["h1_structure"] = bos and h1_fast < h1_slow and h1_close < h1_fast
+
+        # M15 pullback + SR zone proxy using recent swings + ATR buffer
+        atr_m15 = float(df_m15['atr'].iloc[-1]) if 'atr' in df_m15.columns and not pd.isna(df_m15['atr'].iloc[-1]) else 0.0
+        m15_close = float(df_m15['close'].iloc[-1])
+        m15_fast, m15_slow = float(df_m15['ema_fast'].iloc[-1]), float(df_m15['ema_slow'].iloc[-1])
+        swing_low = float(df_m15['low'].iloc[-30:].min())
+        swing_high = float(df_m15['high'].iloc[-30:].max())
+        zone_buf = max(atr_m15 * 0.6, 0.05)
+        if direction == 'buy':
+            near_support = abs(m15_close - swing_low) <= zone_buf
+            details["m15_entry_zone"] = near_support and m15_fast >= m15_slow
+        else:
+            near_resistance = abs(swing_high - m15_close) <= zone_buf
+            details["m15_entry_zone"] = near_resistance and m15_fast <= m15_slow
+
+        score = 0.0
+        score += 40.0 if details["h4_bias"] else 0.0
+        score += 35.0 if details["h1_structure"] else 0.0
+        score += 25.0 if details["m15_entry_zone"] else 0.0
+        return score, details
+    except Exception:
+        return 0.0, details
+
+
+def evaluate_fire_conditions(confluence_result: Dict[str, Any], direction: str) -> Tuple[bool, str]:
+    side = 'buy_signals' if direction == 'buy' else 'sell_signals'
+    side_signals = confluence_result.get(side, {})
+    smc_count = 0
+    if side_signals.get('fvg'):
+        smc_count += 1
+    if side_signals.get('liquidity'):
+        smc_count += 1
+    if side_signals.get('snr'):
+        smc_count += 1
+    classic_count = 0
+    if side_signals.get('trend'):
+        classic_count += 1
+    if side_signals.get('crt'):
+        classic_count += 1
+    if smc_count < config.MIN_SMC_CONFLUENCE:
+        return False, f'smc_confluence={smc_count}<{config.MIN_SMC_CONFLUENCE}'
+    if classic_count < config.MIN_CLASSIC_CONFLUENCE:
+        return False, f'classic_confluence={classic_count}<{config.MIN_CLASSIC_CONFLUENCE}'
+    return True, 'ok'
+
+
+def is_duplicate_trade_level(symbol: str, direction: str, entry_price: float, atr: float) -> bool:
+    if not config.AVOID_DUPLICATE_LEVEL_TRADES:
+        return False
+    tolerance = max(atr * config.DUPLICATE_LEVEL_TOLERANCE_ATR, 0.01)
+    return global_state.is_duplicate_level(symbol, direction, entry_price, tolerance)
+
+def is_news_window(events: List[Dict[str, Any]], now: datetime) -> bool:
+    if is_macro_high_risk_time(now):
+        return True
+    if not events:
+        return False
+    for event in events:
+        impact = (event.get("impact") or "").lower()
+        if config.HIGH_IMPACT_ONLY and impact not in {"high", "high-impact", "high impact"}:
+            continue
+        event_time = event.get("time")
+        if not isinstance(event_time, datetime):
+            continue
+        minutes_diff = (event_time - now).total_seconds() / 60
+        if -config.MINUTES_AFTER_NEWS <= minutes_diff <= config.MINUTES_BEFORE_NEWS:
+            return True
+    return False
+
+def passes_correlation_filter(symbol: str, correlation_data: Dict[str, Dict[str, float]]) -> bool:
+    if symbol not in config.CORRELATION_PAIRS:
+        return True
+    pair_data = correlation_data.get(symbol, {})
+    for pair in config.CORRELATION_PAIRS[symbol]:
+        corr_val = pair_data.get(pair)
+        if corr_val is not None and abs(corr_val) >= config.MAX_CORRELATION_THRESHOLD:
+            return False
+    return True
+
+def calculate_support_resistance_sl(df: pd.DataFrame, direction: str, entry_price: float, atr: float) -> float:
+    lookback = min(50, len(df))
+    recent_lows = df['low'].iloc[-lookback:]
+    recent_highs = df['high'].iloc[-lookback:]
+    if direction == 'buy':
+        support = float(recent_lows.min())
+        atr_sl = entry_price - atr * config.SL_ATR_MULT
+        sl = max(atr_sl, support)
+    else:
+        resistance = float(recent_highs.max())
+        atr_sl = entry_price + atr * config.SL_ATR_MULT
+        sl = min(atr_sl, resistance)
+    return sl
+
+def adjust_sl_for_volatility(entry_price: float, direction: str, atr: float, sl_price: float) -> float:
+    min_dist = atr * config.MIN_SL_DISTANCE_ATR
+    max_dist = atr * config.MAX_SL_DISTANCE_ATR
+    dist = abs(entry_price - sl_price)
+    clamped_dist = min(max(dist, min_dist), max_dist)
+    return entry_price - clamped_dist if direction == 'buy' else entry_price + clamped_dist
+
+def estimate_loss_usd(symbol: str, entry_price: float, sl_price: float, lot: float) -> float:
+    """Estimate SL loss in USD using symbol tick metadata."""
+    if lot <= 0:
+        return 0.0
+    info = get_symbol_info_safe(symbol)
+    if info is None:
+        return 0.0
+
+    tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
+    tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
+    move = abs(float(entry_price) - float(sl_price))
+
+    if tick_value > 0 and tick_size > 0 and move > 0:
+        ticks = move / tick_size
+        return max(0.0, ticks * tick_value * float(lot))
+
+    point = float(getattr(info, "point", 0.0) or 0.0)
+    if point <= 0 or move <= 0:
+        return 0.0
+
+    value_per_point = tick_value / tick_size if tick_value > 0 and tick_size > 0 else 0.0
+    if value_per_point <= 0:
+        return 0.0
+    points = move / point
+    return max(0.0, points * value_per_point * point * float(lot))
+
+
+def correlated_exposure_lot_adjustment(symbol: str, direction: str, proposed_lot: float) -> float:
+    """Reduce lot when correlated symbols already have open same-direction exposure."""
+    try:
+        if proposed_lot <= 0:
+            return proposed_lot
+
+        positions = get_positions_safe() or []
+        correlated = set(config.CORRELATION_PAIRS.get(symbol, []))
+        if not correlated:
+            return proposed_lot
+
+        same_dir_open = 0
+        for pos in positions:
+            psym = getattr(pos, 'symbol', '')
+            if psym not in correlated:
+                continue
+            if getattr(pos, 'magic', None) != config.MAGIC:
+                continue
+            pdir = 'buy' if getattr(pos, 'type', None) == 0 else 'sell'
+            if pdir == direction:
+                same_dir_open += 1
+
+        if same_dir_open >= int(config.CORRELATED_EXPOSURE_MAX_OPEN):
+            reduction = min(0.8, max(0.0, float(config.CORRELATED_EXPOSURE_LOT_REDUCTION)))
+            adjusted = proposed_lot * (1.0 - reduction)
+            logger.logger.info(
+                f"{nowstr()} {symbol}: correlated exposure active ({same_dir_open}), "
+                f"reducing lot {proposed_lot:.3f} -> {adjusted:.3f}"
+            )
+            return adjusted
+
+    except Exception as e:
+        logger.log_error("correlated_exposure_lot_adjustment", str(e), "WARNING", symbol)
+
+    return proposed_lot
+
+def calculate_position_size(symbol: str, entry_price: float, sl_price: float) -> float:
+    info = get_symbol_info_safe(symbol)
+    if info is None:
+        return config.LOT_FIXED
+    account = get_account_info_safe()
+    if account is None:
+        return config.LOT_FIXED
+    balance = float(getattr(account, "balance", 0.0))
+    if balance <= 0:
+        return config.LOT_FIXED
+    risk_amount = max(balance * (config.RISK_PER_TRADE_PCT / 100.0), config.MIN_RISK_PER_TRADE_USD)
+    stop_points = abs(entry_price - sl_price)
+    tick_value = getattr(info, "trade_tick_value", None)
+    tick_size = getattr(info, "trade_tick_size", None)
+    if not tick_value or not tick_size:
+        return config.LOT_FIXED
+    value_per_point = tick_value / tick_size
+    if stop_points <= 0 or value_per_point <= 0:
+        return config.LOT_FIXED
+    lots = risk_amount / (stop_points * value_per_point)
+    return round_lot(symbol, lots)
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+def compute_smart_risk_multiplier(
+    quality_score: float,
+    confluence_score: int,
+    market_regime: str,
+    spread_ratio: float,
+    recent_performance: List[float],
+) -> float:
+    """
+    Compute a bounded risk multiplier based on setup quality/execution context.
+    Keeps fast-trade logic unchanged while adapting lot sizing confidence.
+    """
+    if not config.SMART_RISK_SCALING:
+        return 1.0
+
+    q_norm = clamp((quality_score - 50.0) / 35.0, 0.0, 1.0)
+    c_norm = clamp(confluence_score / 5.0, 0.0, 1.0)
+
+    if market_regime == "trending":
+        regime_boost = 1.0
+    elif market_regime == "ranging":
+        regime_boost = 0.55
+    elif market_regime == "volatile":
+        regime_boost = 0.75
+    else:
+        regime_boost = 0.65
+
+    exec_score = clamp((2.0 - max(0.0, spread_ratio)) / 2.0, 0.0, 1.0)
+
+    perf_score = 0.5
+    if recent_performance:
+        window = recent_performance[-20:]
+        wins = sum(1 for p in window if p > 0)
+        perf_score = wins / max(1, len(window))
+    perf_blend = 0.75 + (perf_score - 0.5) * 0.5
+    perf_blend = clamp(perf_blend, 0.55, 1.20)
+
+    weighted = (
+        q_norm * config.RISK_SCALE_QUALITY_WEIGHT +
+        c_norm * config.RISK_SCALE_CONFLUENCE_WEIGHT +
+        regime_boost * config.RISK_SCALE_REGIME_WEIGHT +
+        exec_score * config.RISK_SCALE_EXECUTION_WEIGHT
+    )
+    base_mult = 0.6 + weighted
+    scaled = base_mult * perf_blend
+    return clamp(scaled, config.RISK_SCALE_MIN, config.RISK_SCALE_MAX)
+def calc_indicators_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """Safe indicator calculation with error handling"""
+    if df is None or df.empty or len(df) < max(config.EMA_SLOW, config.ATR_PERIOD, config.RSI_PERIOD) + 5:
+        return df
+    
+    df = df.copy()
+    
+    indicators_to_calc = [
+        ('ema_fast', lambda: EMAIndicator(df['close'], config.EMA_FAST).ema_indicator()),
+        ('ema_slow', lambda: EMAIndicator(df['close'], config.EMA_SLOW).ema_indicator()),
+        ('atr', lambda: AverageTrueRange(df['high'], df['low'], df['close'], 
+                                        config.ATR_PERIOD).average_true_range()),
+        ('rsi', lambda: RSIIndicator(df['close'], config.RSI_PERIOD).rsi()),
+    ]
+    
+    for name, calc_func in indicators_to_calc:
+        try:
+            df[name] = calc_func()
+        except Exception as e:
+            logger.logger.warning(f"Failed to calculate {name}: {e}")
+            logger.log_error("calc_indicators_safe", f"Failed to calculate {name}: {str(e)}", "WARNING")
+    
+    try:
+        macd = MACD(df['close'])
+        df['macd'] = macd.macd()
+        df['macd_signal'] = macd.macd_signal()
+        df['macd_diff'] = df['macd'] - df['macd_signal']
+    except Exception as e:
+        logger.logger.warning(f"Failed to calculate MACD: {e}")
+    
+    try:
+        st = StochasticOscillator(df['high'], df['low'], df['close'])
+        df['stoch_k'] = st.stoch()
+        df['stoch_d'] = st.stoch_signal()
+    except Exception as e:
+        logger.logger.warning(f"Failed to calculate Stochastic: {e}")
+    
+    return df
+
+def active_positions(symbol: str):
+    try:
+        if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
+            return []
+        
+        ps = get_positions_safe(symbol)
+        if not ps:
+            return []
+        return [p for p in ps if getattr(p, "magic", None) == config.MAGIC]
+    except Exception as e:
+        logger.log_error("active_positions", str(e), "WARNING", symbol)
+        return []
+
+def latest_our_position(symbol: str):
+    try:
+        if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
+            return None
+        
+        ps = get_positions_safe(symbol)
+        if not ps:
+            return None
+        our = [p for p in ps if getattr(p, "magic", None) == config.MAGIC]
+        if not our:
+            return None
+        return sorted(our, key=lambda x: getattr(x, "time_update", 0), reverse=True)[0]
+    except Exception as e:
+        logger.log_error("latest_our_position", str(e), "WARNING", symbol)
+        return None
+
+def symbol_min_stop(symbol: str):
+    try:
+        if config.PAPER_TRADING_ENABLED:
+            return config.MIN_ATR
+        if not connection_manager.check_connection():
+            return None
+        
+        trade_symbol = resolve_broker_symbol(symbol)
+        info = mt5.symbol_info(trade_symbol)
+        if info is None:
+            return None
+        point = info.point
+        level = getattr(info, "trade_stops_level", None)
+        if level is None:
+            return point * 10
+        return max(point * level, point)
+    except Exception as e:
+        logger.log_error("symbol_min_stop", str(e), "WARNING", symbol)
+        return None
+
+def modify_position_sl_with_retry(symbol: str, pos: Any, new_sl: float, tp: float, context: str = ""):
+    """Modify position SL with stop-level aware retries."""
+    if config.PAPER_TRADING_ENABLED:
+        for position in paper_engine.positions.values():
+            if position["ticket"] == int(getattr(pos, 'ticket', 0)):
+                position["sl"] = float(new_sl)
+                return True
+        return False
+
+    trade_symbol = resolve_broker_symbol(symbol)
+    info = mt5.symbol_info(trade_symbol)
+    tick = mt5.symbol_info_tick(trade_symbol)
+    if info is None or tick is None:
+        logger.logger.error(f"{nowstr()} {symbol}: cannot modify SL, missing symbol info/tick")
+        return None
+
+    point = float(getattr(info, 'point', 0.0) or 0.0)
+    digits = int(getattr(info, 'digits', 3) or 3)
+    base_min_stop = symbol_min_stop(symbol) or (point * 10 if point > 0 else 0.1)
+
+    for attempt in range(1, 4):
+        sl_candidate = float(new_sl)
+        buffer_mult = 1.0 + (attempt - 1) * 0.5
+        min_stop = base_min_stop * buffer_mult
+
+        if getattr(pos, 'type', None) == 0:
+            max_allowed_sl = tick.bid - min_stop
+            sl_candidate = min(sl_candidate, max_allowed_sl)
+        else:
+            min_allowed_sl = tick.ask + min_stop
+            sl_candidate = max(sl_candidate, min_allowed_sl)
+
+        sl_candidate = round(sl_candidate, digits)
+
+        req = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": int(pos.ticket),
+            "symbol": trade_symbol,
+            "sl": sl_candidate,
+            "tp": float(tp) if tp else 0.0
+        }
+        res = mt5_order_send_with_recovery(req, f"{context} attempt={attempt}")
+        if res:
+            return res
+
+        err = mt5.last_error()
+        logger.logger.warning(
+            f"{nowstr()} {symbol}: SL modify failed ticket={getattr(pos, 'ticket', 0)} "
+            f"attempt={attempt}/3 sl={sl_candidate} min_stop={min_stop:.5f} last_error={err}"
+        )
+        time.sleep(0.2 * attempt)
+
+    return None
+
+def round_lot(symbol: str, lot: float) -> float:
+    try:
+        if config.PAPER_TRADING_ENABLED:
+            return round(lot, 2)
+        if not connection_manager.check_connection():
+            return round(lot, 2)
+        
+        info = mt5.symbol_info(resolve_broker_symbol(symbol))
+        if info is None:
+            return round(lot, 2)
+        
+        min_lot = getattr(info, "volume_min", None) or getattr(info, "min_lot", None) or 0.01
+        step = getattr(info, "volume_step", None) or getattr(info, "lot_step", None) or 0.01
+        max_lot = getattr(info, "volume_max", None) or getattr(info, "max_lot", None)
+        
+        if lot < min_lot:
+            lot = min_lot
+        
+        if step > 0:
+            steps = int(round((lot - min_lot) / step))
+            lot_q = min_lot + steps * step
+        else:
+            lot_q = lot
+        
+        if max_lot and lot_q > max_lot:
+            lot_q = max_lot
+        
+        prec = 3 if step < 0.01 else 2
+        return round(lot_q, prec)
+        
+    except Exception as e:
+        logger.log_error("round_lot", str(e), "WARNING", symbol)
+        return round(lot, 2)
+
+# ==================== TREND SIGNAL GENERATION ====================
+def get_trend_signals(df: pd.DataFrame, df_htf: pd.DataFrame, market_regime: str) -> List[Dict]:
+    """Generate trend following signals"""
+    signals = []
+    
+    if df.empty or df_htf.empty:
+        return signals
+    
+    bar = df.iloc[-1]
+    bar_htf = df_htf.iloc[-1]
+    
+    try:
+        ema_fast = bar.get('ema_fast')
+        ema_slow = bar.get('ema_slow')
+        ema_fast_htf = bar_htf.get('ema_fast')
+        ema_slow_htf = bar_htf.get('ema_slow')
+        
+        if pd.notna(ema_fast) and pd.notna(ema_slow) and pd.notna(ema_fast_htf) and pd.notna(ema_slow_htf):
+            if ema_fast > ema_slow and ema_fast_htf > ema_slow_htf:
+                if bar['close'] > bar['open']:
+                    signals.append({
+                        'direction': 'buy',
+                        'type': 'EMA_Trend_HTF',
+                        'confidence': 0.8,
+                        'price': bar['close']
+                    })
+            
+            if ema_fast < ema_slow and ema_fast_htf < ema_slow_htf:
+                if bar['close'] < bar['open']:
+                    signals.append({
+                        'direction': 'sell',
+                        'type': 'EMA_Trend_HTF',
+                        'confidence': 0.8,
+                        'price': bar['close']
+                    })
+    except Exception as e:
+        logger.logger.warning(f"Trend signal error: {e}")
+    
+    try:
+        dyn_rsi_os, dyn_rsi_ob = compute_dynamic_rsi_bands(df)
+        rsi_val = bar.get('rsi')
+        if pd.notna(rsi_val):
+            if rsi_val <= dyn_rsi_os and bar['close'] > bar['open']:
+                signals.append({
+                    'direction': 'buy',
+                    'type': 'RSI_OS_DYNAMIC',
+                    'confidence': 0.75,
+                    'price': bar['close']
+                })
+            
+            if rsi_val >= dyn_rsi_ob and bar['close'] < bar['open']:
+                signals.append({
+                    'direction': 'sell',
+                    'type': 'RSI_OB_DYNAMIC',
+                    'confidence': 0.75,
+                    'price': bar['close']
+                })
+    except Exception:
+        pass
+    
+    return signals
+
+# ==================== FIXED ORDER MANAGEMENT ====================
+def market_entry_safe(symbol: str, direction: str, lot: float, comment: str = None):
+    """Safe market entry with connection check"""
+    try:
+        if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
+            logger.logger.warning(f"{nowstr()} {symbol}: No connection for market entry")
+            return None
+        
+        trade_symbol = resolve_broker_symbol(symbol)
+        tick = mt5.symbol_info_tick(trade_symbol)
+        if tick is None:
+            logger.logger.warning(f"{nowstr()} {symbol}: no tick for market_entry")
+            return None
+
+        if config.PAPER_TRADING_ENABLED:
+            entry_price = float(tick.ask) if direction == 'buy' else float(tick.bid)
+            slippage = config.PAPER_SLIPPAGE_PIPS * (1 if direction == 'buy' else -1)
+            entry_price += slippage
+            paper_engine.update_price(symbol, float(tick.bid), float(tick.ask))
+            safe_comment = sanitize_comment(comment or f"{config.MODE}_{direction}")
+            res = paper_engine.open_position(symbol, direction, lot, entry_price, 0.0, 0.0, safe_comment)
+            logger.logger.info(f"{nowstr()} {symbol}: Paper market entry executed, ticket {res.get('order')}")
+            return SimpleNamespace(**res)
+        
+        order_type = mt5.ORDER_TYPE_BUY if direction == 'buy' else mt5.ORDER_TYPE_SELL
+        price = float(tick.ask) if direction == 'buy' else float(tick.bid)
+        
+        safe_comment = sanitize_comment(comment or f"{config.MODE}_{direction}")
+        logger.logger.debug(f"Sanitized comment: '{comment or f'{config.MODE}_{direction}'}' -> '{safe_comment}'")
+        
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": trade_symbol,
+            "volume": lot,
+            "type": order_type,
+            "price": price,
+            "sl": 0.0,
+            "tp": 0.0,
+            "deviation": 50,
+            "magic": config.MAGIC,
+            "comment": safe_comment,
+            "type_filling": mt5.ORDER_FILLING_IOC
+        }
+        
+        logger.logger.debug(f"Market entry request for {symbol}: {req}")
+        
+        res = mt5_order_send_with_recovery(req, f"market_entry_safe {symbol}")
+        
+        if res is None:
+            logger.logger.error(f"{nowstr()} {symbol}: market_entry returned None mt5.last_error={mt5.last_error()}, comment='{safe_comment}'")
+            logger.log_error("market_entry_safe", f"Order send returned None for {symbol}, comment='{safe_comment}'", "ERROR", symbol)
+            debug_mt5_error()
+            return None
+        
+        if hasattr(res, 'retcode') and res.retcode != mt5.TRADE_RETCODE_DONE:
+            logger.logger.error(f"{nowstr()} {symbol}: Order failed with retcode {res.retcode}, comment='{safe_comment}'")
+            logger.log_error("market_entry_safe", f"Order failed with retcode {res.retcode}, comment='{safe_comment}'", "ERROR", symbol)
+            debug_mt5_error()
+            return None
+        
+        logger.logger.info(f"{nowstr()} {symbol}: Market entry successful, ticket: {getattr(res, 'order', 'unknown')}")
+        
+        logger.log_trade({
+            'symbol': symbol,
+            'direction': direction,
+            'entry_price': price,
+            'volume': lot,
+            'status': 'executed',
+            'reason': comment or direction,
+            'ticket': getattr(res, 'order', 0),
+            'magic': config.MAGIC,
+            'consecutive_losses': trade_tracker.consecutive_losses
+        })
+        
+        try:
+            if direction == 'buy':
+                beep_cash_buy()
+            else:
+                beep_cash_sell()
+            trade_flash(f"{symbol} {direction.upper()} executed via market_entry")
+        except Exception:
+            pass
+        
+        return res
+        
+    except Exception as e:
+        logger.logger.error(f"{nowstr()} {symbol}: market_entry_safe exception: {e}")
+        logger.log_error("market_entry_safe", str(e), "ERROR", symbol)
+        debug_mt5_error()
+        return None
+
+def attach_sl_tp_safe(symbol: str, sl_price: float, tp_price: float, attempt: int = 1):
+    """Safe SL/TP attachment with retry"""
+    try:
+        if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
+            return None
+        
+        pos = latest_our_position(symbol)
+        if pos is None:
+            logger.logger.warning(f"{nowstr()} {symbol}: attach_sl_tp_safe - no our position found")
+            return None
+
+        if config.PAPER_TRADING_ENABLED:
+            for position in paper_engine.positions.values():
+                if position["symbol"] == symbol and position["ticket"] == pos.ticket:
+                    position["sl"] = float(sl_price) if sl_price else 0.0
+                    position["tp"] = float(tp_price) if tp_price else 0.0
+                    logger.logger.info(f"{nowstr()} {symbol}: Paper SL/TP attached ticket={pos.ticket}")
+                    return SimpleNamespace(retcode=mt5.TRADE_RETCODE_DONE, order=pos.ticket)
+        
+        ticket = int(pos.ticket)
+        trade_symbol = resolve_broker_symbol(symbol)
+        req = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": ticket,
+            "symbol": trade_symbol,
+            "sl": float(sl_price) if sl_price else 0.0,
+            "tp": float(tp_price) if tp_price else 0.0
+        }
+        
+        res = mt5_order_send_with_recovery(req, f"attach_sl_tp_safe {symbol}")
+        
+        if res is None:
+            logger.logger.error(f"{nowstr()} {symbol}: attach_sl_tp_safe returned None mt5.last_error={mt5.last_error()}")
+            
+            if attempt == 1:
+                info = mt5.symbol_info(trade_symbol)
+                tick = mt5.symbol_info_tick(trade_symbol)
+                if info is None or tick is None:
+                    return None
+                
+                min_stop = symbol_min_stop(symbol) or info.point * 10
+                
+                if pos.type == 0:
+                    sl_new = tick.bid - max(min_stop * 2, abs(tick.bid - (sl_price or tick.bid)))
+                    tp_new = tick.bid + max(min_stop * 2, abs((tp_price or tick.bid) - tick.bid))
+                else:
+                    sl_new = tick.ask + max(min_stop * 2, abs((sl_price or tick.ask) - tick.ask))
+                    tp_new = tick.ask - max(min_stop * 2, abs(tick.ask - (tp_price or tick.ask)))
+                
+                logger.logger.info(f"{nowstr()} {symbol}: retry attach_sl_tp_safe with expanded stops")
+                return attach_sl_tp_safe(symbol, sl_new, tp_new, attempt=2)
+            return None
+        
+        logger.logger.info(f"{nowstr()} {symbol}: SL/TP attached ticket={ticket} sl={req['sl']} tp={req['tp']}")
+        
+        try:
+            direction = 'buy' if pos.type == 0 else 'sell'
+            fvg_signal = False
+            trade_tracker.add_trade(ticket, symbol, direction, 
+                                  pos.price_open, sl_price, tp_price, 0, fvg_signal)
+            logger.logger.info(f"{nowstr()} {symbol}: Trade {ticket} added to tracker")
+        except Exception as e:
+            logger.logger.error(f"Error adding trade to tracker: {e}")
+            logger.log_error("attach_sl_tp_safe", str(e), "WARNING", symbol)
+        
+        return res
+        
+    except Exception as e:
+        logger.logger.error(f"{nowstr()} {symbol}: attach_sl_tp_safe exception: {e}")
+        logger.log_error("attach_sl_tp_safe", str(e), "ERROR", symbol)
+        return None
+
+def close_partial_position_safe(symbol: str, pct: float = config.PARTIAL_CLOSE_PCT):
+    """Safe partial position close"""
+    try:
+        if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
+            return None
+        
+        pos = latest_our_position(symbol)
+        if pos is None:
+            return None
+        
+        trade_symbol = resolve_broker_symbol(symbol)
+        info = mt5.symbol_info(trade_symbol)
+        if info is None:
+            return None
+        
+        step = getattr(info, "volume_step", None) or getattr(info, "lot_step", None) or 0.01
+        min_lot = getattr(info, "volume_min", None) or getattr(info, "min_lot", None) or 0.01
+        current_vol = float(pos.volume)
+        
+        if current_vol <= min_lot:
+            return None
+        
+        if step > 0:
+            target = max(min_lot, round(current_vol * pct / step) * step)
+        else:
+            target = max(min_lot, round(current_vol * pct, 2))
+        
+        close_vol = min(target, current_vol - min_lot)
+        
+        if close_vol < min_lot:
+            return None
+        
+        tick = mt5.symbol_info_tick(trade_symbol)
+        if tick is None:
+            return None
+
+        if config.PAPER_TRADING_ENABLED:
+            close_price = float(tick.bid) if pos.type == 0 else float(tick.ask)
+            deal = paper_engine.partial_close(pos.ticket, close_vol, close_price, "partial_close")
+            if deal:
+                logger.logger.info(f"{nowstr()} {symbol}: paper partial close executed vol={close_vol:.3f}")
+                return SimpleNamespace(retcode=mt5.TRADE_RETCODE_DONE, order=pos.ticket)
+            return None
+        
+        close_type = mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY
+        close_price = float(tick.bid) if close_type == mt5.ORDER_TYPE_SELL else float(tick.ask)
+        
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": trade_symbol,
+            "volume": close_vol,
+            "type": close_type,
+            "price": close_price,
+            "deviation": 50,
+            "magic": config.MAGIC,
+            "comment": sanitize_comment(f"PartialClose_{symbol}"),
+            "type_filling": mt5.ORDER_FILLING_IOC
+        }
+        
+        res = mt5_order_send_with_recovery(req, f"close_partial_position_safe {symbol}")
+        
+        if res is None:
+            logger.logger.error(f"{nowstr()} {symbol}: close_partial_position_safe returned None mt5.last_error={mt5.last_error()}")
+            return None
+        
+        logger.logger.info(f"{nowstr()} {symbol}: partial close executed vol={close_vol:.3f}")
+        
+        try:
+            beep_cash_partial()
+            trade_flash(f"{symbol} PARTIAL CLOSE executed vol={close_vol}")
+        except Exception:
+            pass
+        
+        return res
+        
+    except Exception as e:
+        logger.logger.error(f"{nowstr()} {symbol}: close_partial_position_safe exception: {e}")
+        logger.log_error("close_partial_position_safe", str(e), "ERROR", symbol)
+        return None
+
+def close_position_safe(symbol: str, reason: str = "timeout"):
+    """Safe full position close for latest position."""
+    try:
+        pos = latest_our_position(symbol)
+        if pos is None:
+            return None
+
+        trade_symbol = resolve_broker_symbol(symbol)
+        tick = mt5.symbol_info_tick(trade_symbol)
+        if tick is None:
+            return None
+
+        if config.PAPER_TRADING_ENABLED:
+            close_price = float(tick.bid) if pos.type == 0 else float(tick.ask)
+            deal = paper_engine.close_position(pos.ticket, close_price, reason)
+            if deal:
+                return SimpleNamespace(retcode=mt5.TRADE_RETCODE_DONE, order=pos.ticket)
+            return None
+
+        close_type = mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY
+        close_price = float(tick.bid) if close_type == mt5.ORDER_TYPE_SELL else float(tick.ask)
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": trade_symbol,
+            "position": pos.ticket,
+            "volume": float(pos.volume),
+            "type": close_type,
+            "price": close_price,
+            "deviation": 50,
+            "magic": config.MAGIC,
+            "comment": sanitize_comment(f"Close_{reason}"),
+            "type_filling": mt5.ORDER_FILLING_IOC
+        }
+        return mt5_order_send_with_recovery(req, f"close_position_safe {symbol}")
+
+    except Exception as e:
+        logger.logger.error(f"{nowstr()} {symbol}: close_position_safe exception: {e}")
+        logger.log_error("close_position_safe", str(e), "ERROR", symbol)
+        return None
+
+def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp_price: float, reason: str, confluence_score: int = 0, fvg_signal: bool = False, strategy_hits: Optional[Dict[str, bool]] = None):
+    """Safe trade execution with comprehensive logging"""
+    comment_base = f"{config.MODE}_{direction}_{reason}"
+    comment = sanitize_comment(comment_base)
+    logger.logger.debug(f"Sanitized comment: '{comment_base}' -> '{comment}'")
+    
+    try:
+        if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
+            logger.logger.warning(f"{nowstr()} {symbol}: No connection for trade")
+            return None
+        
+        trade_symbol = resolve_broker_symbol(symbol)
+        tick = mt5.symbol_info_tick(trade_symbol)
+        if tick is None:
+            logger.logger.warning(f"{nowstr()} {symbol}: no tick in send_trade_safe")
+            return None
+
+        if config.PAPER_TRADING_ENABLED:
+            price = float(tick.ask) if direction == 'buy' else float(tick.bid)
+            slippage = config.PAPER_SLIPPAGE_PIPS * (1 if direction == 'buy' else -1)
+            price += slippage
+            paper_engine.update_price(symbol, float(tick.bid), float(tick.ask))
+            res = paper_engine.open_position(symbol, direction, lot, price, sl_price, tp_price, comment)
+            ticket = res.get("order", 0)
+            trade_tracker.add_trade(ticket, symbol, direction, price, sl_price, tp_price, confluence_score, fvg_signal, lot, strategy_hits)
+            logger.log_trade({
+                'symbol': symbol,
+                'direction': direction.upper(),
+                'entry_price': round(price, 3),
+                'sl_price': round(sl_price, 3) if sl_price else 0,
+                'tp_price': round(tp_price, 3) if tp_price else 0,
+                'volume': lot,
+                'reason': reason,
+                'status': 'paper_executed',
+                'ticket': ticket,
+                'magic': config.MAGIC,
+                'consecutive_losses': trade_tracker.consecutive_losses,
+                'confluence_score': confluence_score,
+                'fvg_signal': fvg_signal
+            })
+            logger.logger.info(f"{nowstr()} {symbol}: Paper trade executed ticket {ticket}")
+            return SimpleNamespace(**res)
+        
+        price = float(tick.ask) if direction == 'buy' else float(tick.bid)
+        order_type = mt5.ORDER_TYPE_BUY if direction == 'buy' else mt5.ORDER_TYPE_SELL
+        
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": trade_symbol,
+            "volume": lot,
+            "type": order_type,
+            "price": price,
+            "sl": float(sl_price) if sl_price else 0.0,
+            "tp": float(tp_price) if tp_price else 0.0,
+            "deviation": 50,
+            "magic": config.MAGIC,
+            "comment": comment,
+            "type_filling": mt5.ORDER_FILLING_IOC
+        }
+        
+        logger.logger.debug(f"Trade request for {symbol}: {request}")
+        
+        res = mt5_order_send_with_recovery(request, f"send_trade_safe {symbol}")
+        
+        if res is None:
+            logger.logger.warning(f"{nowstr()} {symbol}: initial order_send returned None -> fallback market_entry, comment='{comment}'")
+            entry = market_entry_safe(symbol, direction, lot, comment=comment)
+            
+            if entry is None:
+                logger.logger.error(f"{nowstr()} {symbol}: market entry failed, giving up")
+                debug_mt5_error()
+                return None
+            
+            time.sleep(0.25)
+            attach = attach_sl_tp_safe(symbol, sl_price, tp_price)
+            
+            if attach:
+                try:
+                    if direction == 'buy':
+                        beep_cash_buy()
+                    else:
+                        beep_cash_sell()
+                    trade_flash(f"{symbol} {direction.upper()} executed via fallback! SL={sl_price:.2f} TP={tp_price:.2f}")
+                except Exception:
+                    pass
+            
+            return attach
+        
+        rc = getattr(res, "retcode", None)
+        logger.logger.info(f"{nowstr()} {symbol}: order_send returned res.retcode={rc}")
+        
+        success_codes = [
+            mt5.TRADE_RETCODE_DONE,
+            mt5.TRADE_RETCODE_DONE_PARTIAL,
+            mt5.TRADE_RETCODE_PLACED,
+        ]
+        
+        if rc is None or (isinstance(rc, int) and rc not in success_codes):
+            logger.logger.warning(f"{nowstr()} {symbol}: order_send retcode suggests failure - attempting attach fallback")
+            
+            entry = market_entry_safe(symbol, direction, lot, comment=comment)
+            if entry is None:
+                return None
+            
+            time.sleep(0.25)
+            attach = attach_sl_tp_safe(symbol, sl_price, tp_price)
+            
+            if attach:
+                try:
+                    if direction == 'buy':
+                        beep_cash_buy()
+                    else:
+                        beep_cash_sell()
+                    trade_flash(f"{symbol} {direction.upper()} executed via fallback! SL={sl_price:.2f} TP={tp_price:.2f}")
+                except Exception:
+                    pass
+            
+            return attach
+        
+        logger.logger.info(f"{nowstr()} {symbol}: Trade executed successfully, ticket: {getattr(res, 'order', 'unknown')}")
+        
+        try:
+            if direction == 'buy':
+                beep_cash_buy()
+            else:
+                beep_cash_sell()
+            trade_flash(f"{symbol} {direction.upper()} executed! SL={sl_price:.2f} TP={tp_price:.2f}")
+        except Exception:
+            pass
+        
+        trade_data = {
+            'symbol': symbol,
+            'direction': direction.upper(),
+            'entry_price': round(price, 3),
+            'sl_price': round(sl_price, 3) if sl_price else 0,
+            'tp_price': round(tp_price, 3) if tp_price else 0,
+            'volume': lot,
+            'reason': reason,
+            'status': 'executed',
+            'ticket': getattr(res, 'order', 0),
+            'magic': config.MAGIC,
+            'consecutive_losses': trade_tracker.consecutive_losses,
+            'confluence_score': confluence_score,
+            'fvg_signal': fvg_signal
+        }
+        
+        logger.log_trade(trade_data)
+        
+        ticket = getattr(res, 'order', 0)
+        if ticket > 0:
+            trade_tracker.add_trade(ticket, symbol, direction, price, sl_price, tp_price, confluence_score, fvg_signal, lot, strategy_hits)
+        
+        return res
+        
+    except Exception as e:
+        logger.logger.error(f"{nowstr()} {symbol}: ERROR in send_trade_safe: {e}")
+        logger.log_error("send_trade_safe", str(e), "ERROR", symbol)
+        debug_mt5_error()
+        return None
+
+def ensure_position_tracked(symbol: str, pos: Any) -> None:
+    """Bootstrap tracker state for already-open live positions (e.g., after bot restart)."""
+    try:
+        ticket = int(getattr(pos, 'ticket', 0) or 0)
+        if ticket <= 0:
+            return
+        if trade_tracker.get_trade(ticket) is not None:
+            return
+
+        direction = 'buy' if getattr(pos, 'type', None) == 0 else 'sell'
+        entry_price = float(getattr(pos, 'price_open', 0.0) or 0.0)
+        sl_price = float(getattr(pos, 'sl', 0.0) or 0.0)
+        tp_price = float(getattr(pos, 'tp', 0.0) or 0.0)
+        volume = float(getattr(pos, 'volume', config.LOT_FIXED) or config.LOT_FIXED)
+
+        if entry_price <= 0:
+            return
+
+        if sl_price <= 0:
+            min_stop = symbol_min_stop(symbol) or 0.5
+            if direction == 'buy':
+                sl_price = entry_price - min_stop
+            else:
+                sl_price = entry_price + min_stop
+
+        trade_tracker.add_trade(
+            ticket=ticket,
+            symbol=symbol,
+            direction=direction,
+            entry_price=entry_price,
+            sl_price=sl_price,
+            tp_price=tp_price,
+            confluence_score=0,
+            fvg_signal=False,
+            lot_size=volume
+        )
+        logger.logger.info(f"{nowstr()} {symbol}: bootstrapped tracker for live ticket={ticket}")
+    except Exception as e:
+        logger.log_error("ensure_position_tracked", str(e), "WARNING", symbol)
+
+
+def compute_chart_dynamic_trailing_sl(symbol: str, direction: str, current_price: float, pip_value: float, current_profit_pips: float) -> Tuple[Optional[float], Optional[str], float]:
+    """
+    Derive trailing stop from live chart movement with no manual levels:
+    - ATR-based adaptive distance
+    - recent structure (swing high/low)
+    - pip buffer derived from symbol pip value
+    """
+    if not config.CHART_DYNAMIC_TRAIL_ENABLED:
+        return None, None, 0.0
+    if current_profit_pips < float(config.CHART_DYNAMIC_TRAIL_MIN_PROFIT_PIPS):
+        return None, None, 0.0
+
+    try:
+        lookback = max(5, int(config.CHART_DYNAMIC_TRAIL_LOOKBACK_BARS))
+        bars_needed = max(60, lookback + 10)
+        df = calc_indicators_safe(get_bars_enhanced(symbol, config.ENTRY_TF, bars_needed))
+        if df.empty:
+            return None, None, 0.0
+
+        atr_val = float(df.iloc[-1].get('atr', 0.0) or 0.0)
+        if atr_val <= 0:
+            atr_val = float((df['high'].iloc[-20:] - df['low'].iloc[-20:]).mean())
+        if atr_val <= 0:
+            return None, None, 0.0
+
+        recent = df.iloc[-lookback:]
+        swing_low = float(recent['low'].min())
+        swing_high = float(recent['high'].max())
+
+        trend_strength = float(detect_market_condition_enhanced(df).get("trend_strength", 0.0) or 0.0)
+        adaptive_mult = float(config.CHART_DYNAMIC_TRAIL_ATR_BASE_MULT) - min(0.6, trend_strength * 0.25)
+        adaptive_mult = clamp(
+            adaptive_mult,
+            float(config.CHART_DYNAMIC_TRAIL_ATR_MIN_MULT),
+            float(config.CHART_DYNAMIC_TRAIL_ATR_MAX_MULT)
+        )
+
+        pip_buffer = max(float(pip_value) * float(config.CHART_DYNAMIC_TRAIL_SWING_BUFFER_PIPS), float(pip_value))
+        dynamic_distance = max(atr_val * adaptive_mult, pip_buffer)
+
+        if direction == 'buy':
+            atr_sl = current_price - dynamic_distance
+            structure_sl = swing_low - pip_buffer
+            dynamic_sl = max(atr_sl, structure_sl)
+        else:
+            atr_sl = current_price + dynamic_distance
+            structure_sl = swing_high + pip_buffer
+            dynamic_sl = min(atr_sl, structure_sl)
+
+        reason = f"chart_dynamic_trail(atr={atr_val:.4f},mult={adaptive_mult:.2f},lb={lookback})"
+        return dynamic_sl, reason, atr_val
+    except Exception as e:
+        logger.logger.debug(f"{symbol}: chart dynamic trailing calc failed: {e}")
+        return None, None, 0.0
+
+
+# ==================== ENHANCED HYBRID SL MANAGEMENT ====================
+def manage_hybrid_trailing_enhanced(symbol: str):
+    """Enhanced trailing stop management with safety checks"""
+    if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
+        return
+    
+    pos = latest_our_position(symbol)
+    if pos is None:
+        return
+    
+    tick = mt5.symbol_info_tick(resolve_broker_symbol(symbol))
+    if tick is None:
+        return
+    
+    if pos.type == 0:
+        current_price = tick.bid
+    else:
+        current_price = tick.ask
+    
+    ticket = pos.ticket
+    ensure_position_tracked(symbol, pos)
+    trade_info = trade_tracker.get_trade(ticket)
+    profit_pips = 0.0
+    pip_value = 0.01
+    direction = 'buy' if pos.type == 0 else 'sell'
+    if trade_info:
+        direction = trade_info.get('direction', direction)
+        pip_value = float(trade_info.get('pip_value', pip_value) or pip_value)
+        entry = float(trade_info.get('entry_price', current_price) or current_price)
+        if direction == 'buy':
+            profit_pips = (current_price - entry) / max(pip_value, 1e-9)
+        else:
+            profit_pips = (entry - current_price) / max(pip_value, 1e-9)
+
+    result = trade_tracker.update_trade(ticket, current_price)
+    
+    if result is not None:
+        new_sl, move_reason = result
+        
+        trade_info = trade_tracker.get_trade(ticket)
+        if trade_info:
+            entry = trade_info['entry_price']
+            direction = trade_info['direction']
+            
+            if direction == 'buy':
+                profit_pips = (current_price - entry) / trade_info['pip_value']
+            else:
+                profit_pips = (entry - current_price) / trade_info['pip_value']
+            
+            current_profit_usd = trade_tracker.calculate_current_profit_usd(ticket, current_price)
+            
+            atr_value = 0
+            try:
+                df = calc_indicators_safe(get_bars_enhanced(symbol, config.ENTRY_TF, 80))
+                if not df.empty:
+                    atr_value = float(df.iloc[-1].get('atr', 0))
+            except:
+                pass
+
+            dynamic_sl, dynamic_reason, dynamic_atr = compute_chart_dynamic_trailing_sl(
+                symbol=symbol,
+                direction=direction,
+                current_price=float(current_price),
+                pip_value=float(trade_info.get('pip_value', pip_value) or pip_value),
+                current_profit_pips=float(profit_pips)
+            )
+            if dynamic_sl is not None:
+                atr_value = max(atr_value, dynamic_atr)
+                if direction == 'buy' and dynamic_sl > new_sl:
+                    new_sl = dynamic_sl
+                    move_reason = f"{move_reason}|{dynamic_reason}"
+                elif direction == 'sell' and dynamic_sl < new_sl:
+                    new_sl = dynamic_sl
+                    move_reason = f"{move_reason}|{dynamic_reason}"
+
+            if config.VOLATILITY_ADJUSTED_SL and atr_value > 0:
+                atr_mult = 2.0
+                if direction == 'buy':
+                    atr_trail_sl = current_price - (atr_value * atr_mult)
+                    if atr_trail_sl > new_sl:
+                        new_sl = atr_trail_sl
+                        move_reason = f"{move_reason}|atr_{atr_mult}x"
+                else:
+                    atr_trail_sl = current_price + (atr_value * atr_mult)
+                    if atr_trail_sl < new_sl:
+                        new_sl = atr_trail_sl
+                        move_reason = f"{move_reason}|atr_{atr_mult}x"
+            
+            old_sl = pos.sl
+            if old_sl != new_sl:
+                try:
+                    result = modify_position_sl_with_retry(
+                        symbol=symbol,
+                        pos=pos,
+                        new_sl=new_sl,
+                        tp=pos.tp,
+                        context=f"manage_hybrid_trailing_enhanced {symbol}"
+                    )
+
+                    if result:
+                        logger.logger.info(f"{nowstr()} {symbol}: SL moved from {old_sl:.5f} to {new_sl:.5f} "
+                                         f"at {profit_pips:.1f} pips profit (${current_profit_usd:.2f}) "
+                                         f"reason: {move_reason}")
+                        
+                        sl_data = {
+                            'ticket': ticket,
+                            'symbol': symbol,
+                            'direction': direction,
+                            'entry_price': entry,
+                            'current_price': current_price,
+                            'old_sl': old_sl,
+                            'new_sl': new_sl,
+                            'profit_in_pips': profit_pips,
+                            'profit_usd': current_profit_usd,
+                            'reason': move_reason,
+                            'move_type': 'trailing',
+                            'atr_value': atr_value
+                        }
+                        
+                        logger.log_sl_movement(sl_data)
+                    else:
+                        logger.logger.error(f"{nowstr()} {symbol}: Failed to move SL to {new_sl}")
+                        logger.log_error("manage_hybrid_trailing_enhanced", 
+                                       f"Failed to move SL for ticket {ticket}", 
+                                       "ERROR", symbol)
+                except Exception as e:
+                    logger.logger.error(f"{nowstr()} {symbol}: Error moving SL: {e}")
+                    logger.log_error("manage_hybrid_trailing_enhanced", str(e), "ERROR", symbol)
+
+    if result is None:
+        try:
+            tracked = trade_tracker.get_trade(ticket)
+            if tracked:
+                current_profit_usd = trade_tracker.calculate_current_profit_usd(ticket, current_price)
+                dynamic_sl, dynamic_reason, dynamic_atr = compute_chart_dynamic_trailing_sl(
+                    symbol=symbol,
+                    direction=tracked.get('direction', 'buy'),
+                    current_price=float(current_price),
+                    pip_value=float(tracked.get('pip_value', 0.01) or 0.01),
+                    current_profit_pips=float(profit_pips)
+                )
+                if dynamic_sl is not None:
+                    old_sl = float(getattr(pos, 'sl', 0.0) or 0.0)
+                    can_move = (
+                        (tracked.get('direction') == 'buy' and dynamic_sl > old_sl) or
+                        (tracked.get('direction') == 'sell' and dynamic_sl < old_sl)
+                    )
+                    if can_move:
+                        moved = modify_position_sl_with_retry(
+                            symbol=symbol,
+                            pos=pos,
+                            new_sl=dynamic_sl,
+                            tp=pos.tp,
+                            context=f"dynamic_chart_trailing {symbol}"
+                        )
+                        if moved:
+                            tracked['current_sl'] = float(dynamic_sl)
+                            logger.logger.info(
+                                f"{nowstr()} {symbol}: dynamic chart trailing moved SL "
+                                f"{old_sl:.5f} -> {dynamic_sl:.5f} (reason={dynamic_reason}, atr={dynamic_atr:.4f})"
+                            )
+                logger.logger.debug(
+                    f"{nowstr()} {symbol}: no SL move ticket={ticket} profit=${current_profit_usd:.2f} "
+                    f"start=${config.SMART_TRAIL_START_USD:.2f} current_sl={tracked.get('current_sl', 0):.5f}"
+                )
+        except Exception:
+            pass
+
+    trade_info = trade_tracker.get_trade(ticket)
+    if trade_info and trade_info.get('open_time'):
+        age_minutes = (datetime.now() - trade_info['open_time']).total_seconds() / 60
+        if age_minutes >= config.MAX_TRADE_DURATION_MINUTES:
+            logger.logger.warning(f"{nowstr()} {symbol}: closing trade {ticket} due to max duration")
+            close_position_safe(symbol, reason="max_duration")
+    
+    if config.PARTIAL_CLOSE_ENABLED and pos.tp and pos.tp != 0:
+        trade_info = trade_tracker.get_trade(ticket)
+        if trade_info and not trade_info.get('partial_closed', False):
+            entry = trade_info['entry_price']
+            tp = trade_info['tp_price']
+            direction = trade_info['direction']
+            
+            if direction == 'buy':
+                tp_distance = tp - entry
+                current_distance = current_price - entry
+            else:
+                tp_distance = entry - tp
+                current_distance = entry - current_price
+            
+            if tp_distance > 0:
+                tp_progress = current_distance / tp_distance
+                
+                if tp_progress >= config.PARTIAL_CLOSE_PCT:
+                    try:
+                        result = close_partial_position_safe(symbol, pct=config.PARTIAL_CLOSE_PCT)
+                        if result:
+                            trade_info['partial_closed'] = True
+                            logger.logger.info(f"{nowstr()} {symbol}: Partial close executed at {tp_progress*100:.1f}% of TP")
+                    except Exception as e:
+                        logger.logger.error(f"{nowstr()} {symbol}: Partial close error: {e}")
+                        logger.log_error("manage_hybrid_trailing_enhanced", str(e), "WARNING", symbol)
+
+def check_closed_trades_enhanced():
+    """Enhanced closed trade checking with learning updates"""
+    try:
+        if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
+            return
+        
+        positions = get_positions_safe()
+        active_tickets = set()
+        
+        if positions:
+            for pos in positions:
+                if getattr(pos, "magic", None) == config.MAGIC:
+                    active_tickets.add(pos.ticket)
+        
+        tickets_to_remove = []
+        for ticket in list(trade_tracker.trades.keys()):
+            if ticket not in active_tickets:
+                tickets_to_remove.append(ticket)
+
+        closed_deals = paper_engine.get_closed_deals() if config.PAPER_TRADING_ENABLED else mt5.history_deals_get(datetime.now() - timedelta(hours=1), datetime.now())
+        deals_by_ticket: Dict[int, Any] = {}
+        if closed_deals:
+            for deal in closed_deals:
+                deal_ticket = getattr(deal, "ticket", None) if not isinstance(deal, dict) else deal.get("ticket")
+                if deal_ticket is None:
+                    continue
+                deals_by_ticket[int(deal_ticket)] = deal
+        
+        for ticket in tickets_to_remove:
+            trade_info = trade_tracker.get_trade(ticket)
+            if trade_info:
+                symbol = trade_info['symbol']
+                deal = deals_by_ticket.get(int(ticket))
+                if deal is not None:
+                    profit = getattr(deal, "profit", 0.0) if not isinstance(deal, dict) else deal.get("profit", 0.0)
+                    comment = getattr(deal, "comment", "") if not isinstance(deal, dict) else deal.get("comment", "")
+                    
+                    signal_type = "unknown"
+                    parts = comment.split("_")
+                    if len(parts) >= 3:
+                        signal_type = parts[2]
+                    
+                    outcome = "win" if profit > 0 else "loss"
+                    global_state.update_learning(symbol, signal_type, outcome)
+                    
+                    global_state.update_consecutive_losses(symbol, profit)
+                    trade_tracker.update_consecutive_losses(profit)
+                    global_state.update_strategy_expectancy(
+                        symbol,
+                        trade_info.get("strategy_hits", {}),
+                        profit
+                    )
+                    if performance_tracker:
+                        performance_tracker.record_trade(profit)
+                    global_state.recent_performance.append(profit)
+                    global_state.persist_readiness_state(get_readiness_snapshot())
+                    global_state.trade_learning.add_trade({
+                        "symbol": symbol,
+                        "profit": profit,
+                        "market_regime": global_state.market_regimes.get(symbol, "unknown"),
+                        "time_of_day": datetime.now().strftime("%H:%M"),
+                        "confluence_score": trade_info.get("confluence_score", 0)
+                    })
+                    global_state.trade_learning.analyze_trade_patterns()
+                    
+                    logger.logger.info(f"Trade {ticket} closed: ${profit:.2f} ({outcome})")
+            
+            trade_tracker.remove_trade(ticket)
+            logger.logger.debug(f"Removed closed trade {ticket} from tracker")
+            
+    except Exception as e:
+        logger.logger.error(f"Error in check_closed_trades_enhanced: {e}")
+        logger.log_error("check_closed_trades_enhanced", str(e), "ERROR")
+
+# ==================== ENHANCED PERFORMANCE MONITORING ====================
+def print_daily_summary_enhanced():
+    """Enhanced daily performance summary"""
+    try:
+        if not config.PAPER_TRADING_ENABLED and not connection_manager.check_connection():
+            logger.logger.warning("print_daily_summary_enhanced: No connection")
+            return
+        
+        acct = get_account_info_safe()
+        if acct is None:
+            logger.logger.warning("print_daily_summary_enhanced: no account info")
+            return
+        
+        balance = float(acct.balance)
+        equity = float(acct.equity) if hasattr(acct, 'equity') else balance
+        used = float(acct.margin) if hasattr(acct, 'margin') else 0.0
+        free = balance - used
+        
+        open_positions = get_positions_safe()
+        my_open = []
+        if open_positions:
+            if config.PAPER_TRADING_ENABLED:
+                my_open = open_positions
+            else:
+                my_open = [p for p in open_positions if getattr(p, "magic", None) == config.MAGIC]
+        
+        floating = sum(getattr(p, "profit", 0.0) for p in my_open)
+        
+        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        history = [] if config.PAPER_TRADING_ENABLED else mt5.history_deals_get(today_start, datetime.now())
+        win_count = 0
+        loss_count = 0
+        total_profit = 0
+        total_loss = 0
+        
+        if history:
+            for deal in history:
+                if getattr(deal, "magic", None) == config.MAGIC:
+                    profit = getattr(deal, "profit", 0.0)
+                    if profit > 0:
+                        win_count += 1
+                        total_profit += profit
+                    elif profit < 0:
+                        loss_count += 1
+                        total_loss += abs(profit)
+        
+        if config.PAPER_TRADING_ENABLED and performance_tracker:
+            total_trades = performance_tracker.total_trades
+            win_rate = performance_tracker.win_rate()
+            profit_factor = performance_tracker.profit_factor()
+            daily_pnl = performance_tracker.total_profit - performance_tracker.total_loss
+        else:
+            total_trades = win_count + loss_count
+            win_rate = (win_count / total_trades * 100) if total_trades > 0 else 0
+            profit_factor = (total_profit / total_loss) if total_loss > 0 else float('inf')
+            daily_pnl = total_profit - total_loss
+        sharpe = performance_tracker.sharpe_ratio() if performance_tracker else 0.0
+        
+        logger.logger.info("=" * 80)
+        logger.logger.info("ENHANCED DAILY PERFORMANCE SUMMARY")
+        logger.logger.info("=" * 80)
+        logger.logger.info(f"Balance: ${balance:.2f}")
+        logger.logger.info(f"Equity: ${equity:.2f}")
+        logger.logger.info(f"Free Margin: ${free:.2f}")
+        logger.logger.info(f"Floating P/L: ${floating:.2f}")
+        logger.logger.info(f"Open Trades: {len(my_open)}")
+        logger.logger.info(f"Daily Trades: {global_state.daily_trades_count}/{config.MAX_DAILY_TRADES}")
+        logger.logger.info(f"Win Rate: {win_rate:.1f}% ({win_count}/{total_trades})")
+        logger.logger.info(f"Profit Factor: {profit_factor:.2f}")
+        logger.logger.info(f"Sharpe Ratio: {sharpe:.2f}")
+        logger.logger.info(f"Daily P/L: ${daily_pnl:.2f}")
+        logger.logger.info(f"Max Drawdown: {global_state.max_drawdown:.2f}%")
+        logger.logger.info(f"Consecutive Losses: {trade_tracker.consecutive_losses}/{config.CONSECUTIVE_LOSS_LIMIT}")
+        logger.logger.info(f"Tracked Trades: {len(trade_tracker.trades)}")
+        readiness_ok, readiness_reason, readiness_snapshot = evaluate_readiness_gate()
+        logger.logger.info(
+            f"Readiness Gate: {'PASS' if readiness_ok else 'BLOCK'} ({readiness_reason}) "
+            f"[WR={readiness_snapshot['win_rate']:.1f}% PF={readiness_snapshot['profit_factor']:.2f} "
+            f"Sharpe={readiness_snapshot['sharpe_ratio']:.2f} DD={readiness_snapshot['max_drawdown']:.2f}%]"
+        )
+        global_state.persist_readiness_state(readiness_snapshot)
+        logger.logger.info("=" * 80)
+        
+        logger.log_performance({
+            'timestamp': datetime.now().isoformat(),
+            'date': datetime.now().date().isoformat(),
+            'balance': balance,
+            'equity': equity,
+            'floating_pnl': floating,
+            'total_trades': total_trades,
+            'win_rate': win_rate,
+            'profit_factor': profit_factor,
+            'sharpe_ratio': sharpe,
+            'max_drawdown': global_state.max_drawdown,
+            'daily_trades': global_state.daily_trades_count,
+            'daily_pnl': daily_pnl,
+            'consecutive_losses': trade_tracker.consecutive_losses
+        })
+        
+    except Exception as e:
+        logger.logger.error(f"print_daily_summary_enhanced error: {e}")
+        logger.log_error("print_daily_summary_enhanced", str(e), "ERROR")
+
+def get_readiness_snapshot() -> Dict[str, float]:
+    """Compute objective performance metrics used by readiness gate."""
+    run_trades = float(performance_tracker.total_trades if performance_tracker else 0.0)
+    run_wr = float(performance_tracker.win_rate() if performance_tracker else 0.0)
+    run_pf = float(performance_tracker.profit_factor() if performance_tracker else 0.0)
+    run_sharpe = float(performance_tracker.sharpe_ratio() if performance_tracker else 0.0)
+    run_dd = float(global_state.max_drawdown if global_state else 0.0)
+
+    baseline = getattr(global_state, "readiness_baseline", {}) if global_state else {}
+    base_trades = float(baseline.get("total_trades", 0.0) or 0.0)
+    base_wr = float(baseline.get("win_rate", 0.0) or 0.0)
+    base_pf = float(baseline.get("profit_factor", 0.0) or 0.0)
+    base_sharpe = float(baseline.get("sharpe_ratio", 0.0) or 0.0)
+    base_dd = float(baseline.get("max_drawdown", 0.0) or 0.0)
+
+    total = base_trades + run_trades
+    if total <= 0:
+        return {"total_trades": 0.0, "win_rate": 0.0, "profit_factor": 0.0, "sharpe_ratio": 0.0, "max_drawdown": max(base_dd, run_dd)}
+
+    wr = ((base_wr * base_trades) + (run_wr * run_trades)) / total
+    pf = ((base_pf * base_trades) + (run_pf * run_trades)) / total
+    sharpe = ((base_sharpe * base_trades) + (run_sharpe * run_trades)) / total
+    return {
+        "total_trades": total,
+        "win_rate": wr,
+        "profit_factor": pf,
+        "sharpe_ratio": sharpe,
+        "max_drawdown": max(base_dd, run_dd),
+    }
+
+def evaluate_readiness_gate() -> Tuple[bool, str, Dict[str, float]]:
+    """
+    Returns (allowed, reason, snapshot).
+    Gate blocks new entries when objective KPIs are below configured thresholds.
+    """
+    snap = get_readiness_snapshot()
+    total_trades = int(snap["total_trades"])
+    if total_trades < int(config.READINESS_MIN_TRADES):
+        return True, f"warmup({total_trades}/{config.READINESS_MIN_TRADES})", snap
+    if snap["win_rate"] < float(config.READINESS_MIN_WIN_RATE):
+        return False, f"win_rate {snap['win_rate']:.1f}% < {config.READINESS_MIN_WIN_RATE:.1f}%", snap
+    if snap["profit_factor"] < float(config.READINESS_MIN_PROFIT_FACTOR):
+        return False, f"profit_factor {snap['profit_factor']:.2f} < {config.READINESS_MIN_PROFIT_FACTOR:.2f}", snap
+    if snap["sharpe_ratio"] < float(config.READINESS_MIN_SHARPE):
+        return False, f"sharpe {snap['sharpe_ratio']:.2f} < {config.READINESS_MIN_SHARPE:.2f}", snap
+    if snap["max_drawdown"] > float(config.READINESS_MAX_DRAWDOWN):
+        return False, f"max_dd {snap['max_drawdown']:.2f}% > {config.READINESS_MAX_DRAWDOWN:.2f}%", snap
+    return True, "ready", snap
+
+# ==================== BACKTESTING FRAMEWORK ====================
+class BacktestEngine:
+    """Lightweight backtesting engine using historical CSV data."""
+
+    def __init__(self, data_files: Dict[str, str], starting_balance: float):
+        self.data_files = data_files
+        self.starting_balance = starting_balance
+
+    def run(self):
+        logger.logger.info("Backtest mode active - starting simulation")
+        results = {}
+
+        for symbol, path in self.data_files.items():
+            if not os.path.exists(path):
+                logger.logger.warning(f"Backtest file missing for {symbol}: {path}")
+                continue
+
+            df = pd.read_csv(path)
+            if "time" in df.columns:
+                df["time"] = pd.to_datetime(df["time"])
+            df = calc_indicators_safe(df)
+
+            balance = self.starting_balance
+            equity = balance
+            tracker = PerformanceTracker(balance)
+            open_position = None
+            wins = 0
+            losses = 0
+
+            warmup = max(config.EMA_SLOW, config.ATR_PERIOD, config.RSI_PERIOD) + 5
+            for idx in range(warmup, len(df)):
+                bar = df.iloc[idx]
+                price = float(bar["close"])
+                tracker.record_equity(balance)
+
+                if open_position:
+                    direction = open_position["direction"]
+                    sl = open_position["sl"]
+                    tp = open_position["tp"]
+                    if (direction == "buy" and ((sl and price <= sl) or (tp and price >= tp))) or \
+                       (direction == "sell" and ((sl and price >= sl) or (tp and price <= tp))):
+                        exit_price = sl if sl and ((direction == "buy" and price <= sl) or (direction == "sell" and price >= sl)) else tp
+                        diff = exit_price - open_position["entry_price"]
+                        if direction == "sell":
+                            diff = -diff
+                        profit = diff * open_position["volume"] * config.PAPER_CONTRACT_SIZE
+                        balance += profit
+                        tracker.record_trade(profit)
+                        if profit > 0:
+                            wins += 1
+                        else:
+                            losses += 1
+                        open_position = None
+
+                if open_position is None:
+                    df_slice = df.iloc[:idx + 1]
+                    market_regime = global_state.confluence_manager.detect_market_regime(df_slice)
+                    trend_signals = get_trend_signals(df_slice, df_slice, market_regime)
+                    confluence = global_state.confluence_manager.analyze_confluence(
+                        symbol, df_slice, trend_signals, market_regime
+                    )
+                    direction = confluence.get("direction")
+                    if direction:
+                        atr = float(bar.get("atr", 0))
+                        if atr <= 0:
+                            continue
+                        sl = price - (config.SL_ATR_MULT * atr) if direction == "buy" else price + (config.SL_ATR_MULT * atr)
+                        tp = price + (config.TP_ATR_MULT * atr) if direction == "buy" else price - (config.TP_ATR_MULT * atr)
+                        open_position = {
+                            "direction": direction,
+                            "entry_price": price,
+                            "sl": sl,
+                            "tp": tp,
+                            "volume": config.LOT_FIXED
+                        }
+
+            results[symbol] = {
+                "ending_balance": balance,
+                "win_rate": (wins / (wins + losses) * 100) if wins + losses > 0 else 0.0,
+                "profit_factor": tracker.profit_factor(),
+                "sharpe_ratio": tracker.sharpe_ratio(),
+                "max_drawdown": tracker.max_drawdown
+            }
+
+        logger.logger.info("Backtest results:")
+        for symbol, stats in results.items():
+            logger.logger.info(f"{symbol}: Balance={stats['ending_balance']:.2f}, "
+                             f"WinRate={stats['win_rate']:.1f}%, "
+                             f"Sharpe={stats['sharpe_ratio']:.2f}, "
+                             f"MaxDD={stats['max_drawdown']:.2f}%")
+
+        try:
+            backtests_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backtests')
+            os.makedirs(backtests_dir, exist_ok=True)
+            report_path = os.path.join(backtests_dir, f"{datetime.now().date().isoformat()}_report.json")
+            with open(report_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'generated_at': datetime.now().isoformat(),
+                    'starting_balance': self.starting_balance,
+                    'results': results
+                }, f, indent=2)
+            logger.logger.info(f"Backtest report saved to {report_path}")
+        except Exception as e:
+            logger.log_error('BacktestEngine.run', f'Failed to write backtest report: {e}', 'WARNING')
+
+        return results
+
+# ==================== ENHANCED MAIN TRADING LOOP WITH FVG AND LIQUIDITY ====================
+def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
+    """Enhanced trading loop for a symbol with FVG and Liquidity integration"""
+    logger.logger.info(f"{nowstr()} Enhanced thread started for {symbol}")
+    last_bar_time = None
+    
+    while not stop_event.is_set():
+        try:
+            if not connection_manager.reconnect_if_needed():
+                logger.logger.warning(f"{symbol}: Connection issues, waiting...")
+                time.sleep(10)
+                continue
+
+            if config.PAPER_TRADING_ENABLED:
+                tick = mt5.symbol_info_tick(resolve_broker_symbol(symbol))
+                if tick:
+                    paper_engine.update_price(symbol, float(tick.bid), float(tick.ask))
+                    paper_engine.evaluate_positions()
+            
+            thread_manager.heartbeat(threading.current_thread().name)
+
+            if date.today() != global_state.daily_start_date:
+                global_state.reset_daily_stats()
+            
+            global_state.update_daily_stats()
+
+            # Refresh optional market context used by soft/conditional filters.
+            now_ts = time.time()
+            if now_ts - global_state.last_news_refresh >= 300:
+                global_state.update_news_events()
+                global_state.last_news_refresh = now_ts
+            if now_ts - global_state.last_correlation_refresh >= 300:
+                global_state.update_correlation_data()
+                global_state.last_correlation_refresh = now_ts
+            
+            if time.time() - global_state.last_summary_time > config.SUMMARY_INTERVAL:
+                print_daily_summary_enhanced()
+                global_state.last_summary_time = time.time()
+            
+            if is_in_no_trade_zone():
+                logger.logger.debug(f"{nowstr()} {symbol}: inside no-trade zone; skipping")
+                manage_hybrid_trailing_enhanced(symbol)
+                check_closed_trades_enhanced()
+                time.sleep(30)
+                continue
+
+            if not is_within_daily_trade_window():
+                logger.logger.info(f"{nowstr()} {symbol}: outside configured trade window {config.TRADE_WINDOW_START}-{config.TRADE_WINDOW_END}; waiting")
+                manage_hybrid_trailing_enhanced(symbol)
+                check_closed_trades_enhanced()
+                time.sleep(30)
+                continue
+
+            session_preferred = is_in_trading_session(config.PREFERRED_SESSION)
+            if not session_preferred:
+                logger.logger.info(f"{nowstr()} {symbol}: outside preferred session {config.PREFERRED_SESSION}, applying lower priority")
+
+            if config.ECONOMIC_NEWS_FILTER and global_state.news_events and is_news_window(global_state.news_events, datetime.now()):
+                logger.logger.info(f"{nowstr()} {symbol}: news filter active, skipping trade window")
+                time.sleep(30)
+                continue
+            if config.AVOID_ASIAN_SESSION:
+                h = datetime.utcnow().hour
+                st = int(config.ASIAN_SESSION_START_HOUR_UTC)
+                en = int(config.ASIAN_SESSION_END_HOUR_UTC)
+                in_asian = (st <= h < en) if st < en else (h >= st or h < en)
+                if in_asian:
+                    logger.logger.info(f"{nowstr()} {symbol}: asian low-liquidity filter active")
+                    time.sleep(30)
+                    continue
+
+            if global_state.correlation_data and not passes_correlation_filter(symbol, global_state.correlation_data):
+                logger.logger.info(f"{nowstr()} {symbol}: correlation filter blocked trade")
+                time.sleep(30)
+                continue
+            
+            if global_state.daily_trades_count >= config.MAX_DAILY_TRADES:
+                logger.logger.warning(f"{nowstr()} {symbol}: reached MAX_DAILY_TRADES")
+                time.sleep(60)
+                continue
+            
+            if global_state.daily_loss_triggered:
+                if (not config.DAILY_LOSS_HARD_STOP) and time.time() >= getattr(global_state, 'circuit_breaker_until', 0.0):
+                    global_state.daily_loss_triggered = False
+                    logger.logger.info(f"{nowstr()} {symbol}: daily cooldown elapsed, resuming trading")
+                else:
+                    logger.logger.warning(f"{nowstr()} {symbol}: daily limit triggered - pausing")
+                    time.sleep(60)
+                    continue
+
+            if time.time() < getattr(global_state, 'circuit_breaker_until', 0.0):
+                remaining = int(global_state.circuit_breaker_until - time.time())
+                logger.logger.warning(f"{nowstr()} {symbol}: circuit breaker active ({remaining}s remaining)")
+                time.sleep(30)
+                continue
+            
+            if trade_tracker.should_pause_trading():
+                logger.logger.critical(f"{nowstr()} {symbol}: Consecutive loss limit reached - PAUSED")
+                time.sleep(60)
+                continue
+            
+            if global_state.should_pause_symbol(symbol):
+                logger.logger.warning(f"{nowstr()} {symbol}: Symbol consecutive loss limit reached")
+                time.sleep(60)
+                continue
+
+            if config.ENFORCE_READINESS_GATE:
+                ready, reason, snap = evaluate_readiness_gate()
+                if (
+                    config.LIVE_ACCOUNT_MODE
+                    and config.LIVE_BLOCK_DURING_READINESS_WARMUP
+                    and int(snap.get("total_trades", 0)) < int(config.READINESS_MIN_TRADES)
+                ):
+                    ready = False
+                    reason = f"live_warmup_block({int(snap.get('total_trades', 0))}/{int(config.READINESS_MIN_TRADES)})"
+                if not ready:
+                    logger.logger.warning(f"{nowstr()} {symbol}: readiness gate blocked new entries ({reason})")
+                    manage_hybrid_trailing_enhanced(symbol)
+                    check_closed_trades_enhanced()
+                    time.sleep(30)
+                    continue
+            
+            total_positions = 0
+            for sym in config.SYMBOLS:
+                total_positions += len(active_positions(sym))
+            
+            if total_positions >= config.MAX_POSITIONS_TOTAL:
+                logger.logger.debug(f"{nowstr()} {symbol}: max total positions reached ({total_positions})")
+                time.sleep(10)
+                continue
+            
+            df = calc_indicators_safe(get_bars_enhanced(symbol, config.ENTRY_TF, 400))
+            df_htf = calc_indicators_safe(get_bars_enhanced(symbol, config.HTF_TF, 250))
+            df_h1 = calc_indicators_safe(get_bars_enhanced(symbol, config.HTF_H1_TF, 250))
+            df_h4 = calc_indicators_safe(get_bars_enhanced(symbol, config.HTF_H4_TF, 250))
+            df_m15 = calc_indicators_safe(get_bars_enhanced(symbol, config.MTF_ENTRY_TF, 250))
+
+            if df.empty or df_htf.empty or df_h1.empty or df_h4.empty or df_m15.empty:
+                time.sleep(1)
+                continue
+
+            checks = [
+                (df, config.ENTRY_TF, "entry"),
+                (df_htf, config.HTF_TF, "htf"),
+                (df_h1, config.HTF_H1_TF, "h1"),
+                (df_h4, config.HTF_H4_TF, "h4"),
+                (df_m15, config.MTF_ENTRY_TF, "m15"),
+            ]
+            bad_data = False
+            for data_df, tf, label in checks:
+                ok, reason = validate_market_data(data_df, symbol, tf)
+                if not ok:
+                    logger.logger.warning(f"{symbol}: skipping analysis, {label} data invalid ({reason})")
+                    bad_data = True
+                    break
+            if bad_data:
+                time.sleep(1)
+                continue
+            
+            bar = df.iloc[-1]
+            relax_mode = False
+            allow_relax = config.AUTO_RELAX_FILTERS and (
+                config.PAPER_TRADING_ENABLED or config.BACKTEST_MODE or config.RELAX_FILTERS_LIVE_TRADING
+            )
+            if allow_relax:
+                last_attempt = global_state.last_trade_attempt.get(symbol, 0)
+                if last_attempt and (time.time() - last_attempt) >= config.NO_TRADE_RELAX_MINUTES * 60:
+                    relax_mode = True
+                elif not last_attempt and (time.time() - global_state.start_time) >= config.NO_TRADE_RELAX_MINUTES * 60:
+                    relax_mode = True
+
+            atr_threshold = config.MIN_ATR * (config.RELAX_MIN_ATR_PCT if relax_mode else 1.0)
+            if float(bar.get('atr', 0)) < atr_threshold:
+                time.sleep(1)
+                continue
+            
+            market_regime = global_state.confluence_manager.detect_market_regime(df)
+            global_state.market_regimes[symbol] = market_regime
+            
+            trend_signals = get_trend_signals(df, df_htf, market_regime)
+            
+            confluence_result = global_state.confluence_manager.analyze_confluence(
+                symbol, df, trend_signals, market_regime
+            )
+            
+            try:
+                rsi_val = float(bar.get('rsi', math.nan))
+                atr_val = float(bar.get('atr', math.nan))
+                ema_fast_val = float(bar.get('ema_fast', math.nan))
+                ema_slow_val = float(bar.get('ema_slow', math.nan))
+            except Exception:
+                rsi_val = atr_val = ema_fast_val = ema_slow_val = math.nan
+            
+            logger.logger.info(f"{nowstr()} {symbol} | Price={bar['close']:.2f} | "
+                             f"EMAfast={ema_fast_val:.3f} | EMAslow={ema_slow_val:.3f} | "
+                             f"RSI={rsi_val:.2f} | ATR={atr_val:.4f} | "
+                             f"Regime={market_regime} | Confluence={confluence_result['confluence_score']}/5")
+            
+            if last_bar_time is not None and bar['time'] == last_bar_time:
+                manage_hybrid_trailing_enhanced(symbol)
+                check_closed_trades_enhanced()
+                time.sleep(0.2)
+                continue
+            
+            last_bar_time = bar['time']
+            
+            if time.time() - global_state.last_trade_time.get(symbol, 0) < config.COOLDOWN:
+                manage_hybrid_trailing_enhanced(symbol)
+                check_closed_trades_enhanced()
+                time.sleep(0.2)
+                continue
+            
+            chosen_dir = confluence_result['direction']
+            confluence_score = confluence_result.get('confluence_score', 0)
+            if not session_preferred and chosen_dir:
+                confluence_score = max(0, confluence_score - 1)
+            forced_trade = False
+            
+            chosen_reasons = []
+            fvg_signal_active = False
+            liquidity_signal_active = False
+            
+            if confluence_result['direction'] == 'buy':
+                chosen_reasons.extend([s['type'] for s in confluence_result['buy_signals']['trend'][:2]])
+                chosen_reasons.extend([s['pattern'] for s in confluence_result['buy_signals']['crt'][:2]])
+                chosen_reasons.extend([s['level_type'] for s in confluence_result['buy_signals']['snr'][:2]])
+                if confluence_result['buy_signals']['fvg']:
+                    chosen_reasons.extend(['FVG'] * min(2, len(confluence_result['buy_signals']['fvg'])))
+                    fvg_signal_active = True
+                if confluence_result['buy_signals']['liquidity']:
+                    chosen_reasons.extend(['LIQUIDITY'] * min(2, len(confluence_result['buy_signals']['liquidity'])))
+                    liquidity_signal_active = True
+            elif confluence_result['direction'] == 'sell':
+                chosen_reasons.extend([s['type'] for s in confluence_result['sell_signals']['trend'][:2]])
+                chosen_reasons.extend([s['pattern'] for s in confluence_result['sell_signals']['crt'][:2]])
+                chosen_reasons.extend([s['level_type'] for s in confluence_result['sell_signals']['snr'][:2]])
+                if confluence_result['sell_signals']['fvg']:
+                    chosen_reasons.extend(['FVG'] * min(2, len(confluence_result['sell_signals']['fvg'])))
+                    fvg_signal_active = True
+                if confluence_result['sell_signals']['liquidity']:
+                    chosen_reasons.extend(['LIQUIDITY'] * min(2, len(confluence_result['sell_signals']['liquidity'])))
+                    liquidity_signal_active = True
+            
+            # FORCE TRADE LOGIC
+            if (config.FORCE_TRADE_ENABLED and chosen_dir is None and 
+                time.time() - global_state.last_forced_time.get(symbol, 0) >= config.FORCE_TRADE_EVERY):
+                
+                ema_fast = bar.get('ema_fast')
+                ema_slow = bar.get('ema_slow')
+                
+                if pd.notna(ema_fast) and pd.notna(ema_slow):
+                    if ema_fast > ema_slow:
+                        chosen_dir = 'buy'
+                        confluence_score = 1
+                        chosen_reasons = ['Force_EMA_Up']
+                    else:
+                        chosen_dir = 'sell'
+                        confluence_score = 1
+                        chosen_reasons = ['Force_EMA_Down']
+                else:
+                    import random
+                    chosen_dir = random.choice(['buy', 'sell'])
+                    confluence_score = 0
+                    chosen_reasons = ['Force_Random']
+                
+                global_state.last_forced_time[symbol] = time.time()
+                global_state.last_signal_time[symbol] = coerce_timestamp(bar['time'])
+                global_state.last_signal_dir[symbol] = chosen_dir
+                logger.logger.info(f"{nowstr()} {symbol}: FORCE TRADE -> {chosen_dir}")
+                forced_trade = True
+            
+            momentum_strength = 0.0
+            if chosen_dir:
+                mtf_score, mtf_details = compute_mtf_confirmation_score(df_h4, df_h1, df_m15, chosen_dir)
+                if mtf_score < float(config.MIN_CONFIRMATION_SCORE):
+                    logger.logger.info(
+                        f"{nowstr()} {symbol}: MTF confirmation blocked ({mtf_score:.1f}<{config.MIN_CONFIRMATION_SCORE:.1f}) details={mtf_details}"
+                    )
+                    time.sleep(0.2)
+                    continue
+                ok_fire, fire_reason = evaluate_fire_conditions(confluence_result, chosen_dir)
+                if not ok_fire and not forced_trade:
+                    logger.logger.info(f"{nowstr()} {symbol}: fire conditions blocked ({fire_reason})")
+                    time.sleep(0.2)
+                    continue
+
+                if config.MTF_CONFIRMATION_REQUIRED and not get_mtf_alignment(df_h1, df_h4, chosen_dir) and not forced_trade:
+                    logger.logger.info(f"{nowstr()} {symbol}: MTF trend misalignment on H1/H4 for {chosen_dir}")
+                    time.sleep(0.2)
+                    continue
+
+                global_state.last_trade_attempt[symbol] = time.time()
+                signal_timestamp = global_state.last_signal_time.get(symbol)
+                signal_dir = global_state.last_signal_dir.get(symbol)
+                if signal_timestamp is None or signal_dir != chosen_dir:
+                    global_state.last_signal_time[symbol] = coerce_timestamp(bar['time'])
+                    global_state.last_signal_dir[symbol] = chosen_dir
+
+                if config.ENTRY_DELAY_BARS > 0 and not forced_trade:
+                    required_delay = config.ENTRY_DELAY_BARS * timeframe_seconds(config.ENTRY_TF)
+                    last_signal_ts = global_state.last_signal_time.get(symbol)
+                    if last_signal_ts and (coerce_timestamp(bar['time']) - last_signal_ts) < required_delay:
+                        logger.logger.debug(f"{nowstr()} {symbol}: waiting entry delay bars")
+                        time.sleep(0.2)
+                        continue
+                
+                if config.MOMENTUM_CONFIRMATION_REQUIRED and not forced_trade:
+                    confirmed, strength = calculate_momentum_strength(df, chosen_dir)
+                    momentum_strength = float(strength)
+                    min_momentum = config.RELAX_MIN_MOMENTUM if relax_mode else config.MIN_MOMENTUM_STRENGTH
+                    if not confirmed or strength < min_momentum:
+                        logger.logger.info(f"{nowstr()} {symbol}: momentum filter failed strength={strength:.2f}")
+                        time.sleep(0.2)
+                        continue
+
+            opened = active_positions(symbol)
+            
+            if (chosen_dir and 
+                len(opened) < config.MAX_TRADES_PER_SYMBOL and 
+                not global_state.daily_loss_triggered and
+                not trade_tracker.should_pause_trading() and
+                not global_state.should_pause_symbol(symbol)):
+                
+                trade_symbol = resolve_broker_symbol(symbol)
+                info = mt5.symbol_info(trade_symbol)
+                if info is None:
+                    time.sleep(0.2)
+                    continue
+                
+                tick = mt5.symbol_info_tick(trade_symbol)
+                if tick is None:
+                    time.sleep(0.2)
+                    continue
+
+                spread_points = get_spread_points(symbol)
+                if spread_points is not None and spread_points > config.MAX_SPREAD_POINTS:
+                    logger.logger.info(f"{nowstr()} {symbol}: spread {spread_points:.1f} > max {config.MAX_SPREAD_POINTS}, skipping")
+                    time.sleep(0.2)
+                    continue
+                
+                entry_price = float(tick.ask) if chosen_dir == 'buy' else float(tick.bid)
+                atr = float(bar['atr']) if not pd.isna(bar.get('atr')) else info.point * 50
+                trend_strength = detect_market_condition_enhanced(df).get("trend_strength", 0.0)
+                skip_entry, skip_reason = should_skip_chase_entry(
+                    df=df,
+                    direction=chosen_dir,
+                    atr=atr,
+                    market_regime=market_regime,
+                    has_smc_signal=(fvg_signal_active or liquidity_signal_active)
+                )
+                if skip_entry and not forced_trade:
+                    logger.logger.info(f"{nowstr()} {symbol}: entry quality filter blocked ({skip_reason})")
+                    time.sleep(0.2)
+                    continue
+
+                sl_dist = atr * config.SL_ATR_MULT
+                tp_dist = atr * config.TP_ATR_MULT
+                
+                if chosen_dir == 'buy':
+                    sl_price = entry_price - sl_dist
+                    tp_price = entry_price + tp_dist
+                else:
+                    sl_price = entry_price + sl_dist
+                    tp_price = entry_price - tp_dist
+
+                if config.USE_SUPPORT_RESISTANCE_SL:
+                    sl_price = calculate_support_resistance_sl(df, chosen_dir, entry_price, atr)
+
+                if config.USE_ATR_MULTIPLIER_SL:
+                    atr_sl = atr * config.ATR_SL_MULTIPLIER
+                    if chosen_dir == 'buy':
+                        sl_price = min(sl_price, entry_price - atr_sl)
+                    else:
+                        sl_price = max(sl_price, entry_price + atr_sl)
+
+                if config.VOLATILITY_ADJUSTED_SL:
+                    sl_price = adjust_sl_for_volatility(entry_price, chosen_dir, atr, sl_price)
+
+                sl_price = adjust_sl_for_regime_and_quality(
+                    entry_price=entry_price,
+                    direction=chosen_dir,
+                    atr=atr,
+                    sl_price=sl_price,
+                    market_regime=market_regime,
+                    confluence_score=confluence_score
+                )
+
+                # FVG-BASED TARGETS
+                fvg_based_tp = False
+                if fvg_signal_active and confluence_result.get('fvg_signals'):
+                    fvg_signal = confluence_result['fvg_signals'][0]
+                    if fvg_signal['direction'] == chosen_dir:
+                        # Use FVG-based TP levels
+                        if fvg_signal.get('tp1_price') and config.FVG_USE_MIDPOINT_TP:
+                            tp1_price = fvg_signal['tp1_price']
+                            fvg_risk_reward = abs(tp1_price - entry_price) / abs(entry_price - sl_price)
+                            if fvg_risk_reward > 1.5:
+                                tp_price = tp1_price
+                                fvg_based_tp = True
+                                logger.logger.info(f"Using FVG midpoint TP: {tp_price:.5f} (R:R={fvg_risk_reward:.2f})")
+                        
+                        # Optionally use opposite side TP
+                        if (fvg_signal.get('tp2_price') and config.FVG_USE_OPPOSITE_SIDE_TP and 
+                            fvg_signal.get('tp1_price')):
+                            tp2_risk_reward = abs(fvg_signal['tp2_price'] - entry_price) / abs(entry_price - sl_price)
+                            if tp2_risk_reward > 2.0:
+                                tp_price = fvg_signal['tp2_price']
+                                fvg_based_tp = True
+                                logger.logger.info(f"Using FVG opposite side TP: {tp_price:.5f} (R:R={tp2_risk_reward:.2f})")
+                        
+                        # FVG-specific SL (beyond breaker candle)
+                        fvg_sl_dist = atr * config.FVG_SL_BREAKER_MULTIPLIER
+                        if chosen_dir == 'buy':
+                            fvg_sl_price = entry_price - fvg_sl_dist
+                        else:
+                            fvg_sl_price = entry_price + fvg_sl_dist
+                        
+                        # Use the wider SL (more conservative)
+                        if chosen_dir == 'buy':
+                            sl_price = min(sl_price, fvg_sl_price)
+                        else:
+                            sl_price = max(sl_price, fvg_sl_price)
+                        
+                        # Ensure minimum stop distance
+                        min_fvg_stop = atr * config.FVG_MIN_STOP_ATR_MULTIPLIER
+                        if chosen_dir == 'buy' and (entry_price - sl_price) < min_fvg_stop:
+                            sl_price = entry_price - min_fvg_stop
+                        if chosen_dir == 'sell' and (sl_price - entry_price) < min_fvg_stop:
+                            sl_price = entry_price + min_fvg_stop
+
+                if not fvg_based_tp:
+                    tp_price = calculate_dynamic_tp(entry_price, chosen_dir, atr, market_regime, confluence_score, trend_strength)
+
+                min_stop = symbol_min_stop(symbol) or info.point * 10
+                if chosen_dir == 'buy' and (entry_price - sl_price) < min_stop:
+                    sl_price = entry_price - min_stop
+                if chosen_dir == 'sell' and (sl_price - entry_price) < min_stop:
+                    sl_price = entry_price + min_stop
+
+                risk = abs(entry_price - sl_price)
+                reward = abs(tp_price - entry_price)
+                rr = (reward / risk) if risk > 0 else 0
+                min_rr = config.RELAX_MIN_RR_RATIO if relax_mode else config.MIN_RR_RATIO
+                if rr < min_rr:
+                    required_reward = risk * min_rr
+                    if chosen_dir == 'buy':
+                        tp_price = entry_price + required_reward
+                    else:
+                        tp_price = entry_price - required_reward
+                    reward = abs(tp_price - entry_price)
+                    rr = (reward / risk) if risk > 0 else 0
+                    logger.logger.info(f"{nowstr()} {symbol}: adjusted TP to satisfy minimum R:R -> {rr:.2f}")
+
+                current_spread = float(spread_points or 0.0)
+                global_state.record_spread(symbol, current_spread)
+                spread_ratio = global_state.spread_ratio(symbol, current_spread)
+
+                market_data = {
+                    "volume_ratio": float(df['tick_volume'].iloc[-1]) / max(float(df['tick_volume'].iloc[-20:].mean()), 1.0) if 'tick_volume' in df.columns else 1.0,
+                    "trend_strength": detect_market_condition_enhanced(df).get("trend_strength", 0.0),
+                    "spread_points": current_spread,
+                    "avg_spread_points": current_spread / max(1e-6, spread_ratio),
+                    "spread_ratio": spread_ratio,
+                    "last_signal_time": global_state.last_signal_time.get(symbol, 0),
+                    "rr_ratio": rr
+                }
+                atr_baseline = float(df['atr'].iloc[-50:].median()) if 'atr' in df.columns and len(df) >= 10 else float(atr)
+                market_data['atr_baseline'] = atr_baseline
+                market_data.update(detect_order_flow_imbalance(df))
+                quality_score = global_state.trade_filter.compute_quality_score(
+                    market_data,
+                    confluence_score,
+                    min_rr,
+                    relax_mode,
+                )
+                dynamic_quality_min = global_state.dynamic_quality_threshold(symbol, market_regime, session_preferred)
+                if not forced_trade:
+                    no_trade_env, no_trade_reason = global_state.trade_filter.classify_no_trade_environment(market_data, float(atr))
+                    if no_trade_env:
+                        logger.logger.info(f"{nowstr()} {symbol}: no-trade environment ({no_trade_reason})")
+                        time.sleep(0.2)
+                        continue
+                    if spread_ratio > config.EXECUTION_MAX_SPREAD_RATIO:
+                        logger.logger.info(f"{nowstr()} {symbol}: execution filter blocked entry (spread_ratio={spread_ratio:.2f})")
+                        time.sleep(0.2)
+                        continue
+                    if config.QUALITY_SCORE_HARD_BLOCK and quality_score < dynamic_quality_min:
+                        logger.logger.info(f"{nowstr()} {symbol}: quality gate blocked entry (score={quality_score:.1f}<{dynamic_quality_min:.1f})")
+                        time.sleep(0.2)
+                        continue
+                    if config.PRECISION_MODE_ENABLED:
+                        precision_quality_min = dynamic_quality_min + float(config.PRECISION_MIN_QUALITY_BUFFER)
+                        if quality_score < precision_quality_min:
+                            logger.logger.info(
+                                f"{nowstr()} {symbol}: precision gate blocked (quality {quality_score:.2f} < {precision_quality_min:.2f})"
+                            )
+                            time.sleep(0.2)
+                            continue
+                        if config.MOMENTUM_CONFIRMATION_REQUIRED and momentum_strength < float(config.PRECISION_MIN_MOMENTUM_STRENGTH):
+                            logger.logger.info(
+                                f"{nowstr()} {symbol}: precision gate blocked (momentum {momentum_strength:.2f} < {config.PRECISION_MIN_MOMENTUM_STRENGTH:.2f})"
+                            )
+                            time.sleep(0.2)
+                            continue
+                        if pd.notna(rsi_val):
+                            center = 50.0
+                            buffer = float(config.PRECISION_RSI_CENTER_BUFFER)
+                            if chosen_dir == 'buy' and rsi_val < (center + buffer):
+                                logger.logger.info(
+                                    f"{nowstr()} {symbol}: precision gate blocked (RSI {rsi_val:.2f} not above {center + buffer:.2f} for buy)"
+                                )
+                                time.sleep(0.2)
+                                continue
+                            if chosen_dir == 'sell' and rsi_val > (center - buffer):
+                                logger.logger.info(
+                                    f"{nowstr()} {symbol}: precision gate blocked (RSI {rsi_val:.2f} not below {center - buffer:.2f} for sell)"
+                                )
+                                time.sleep(0.2)
+                                continue
+                        atr_entry_dist = abs(entry_price - float(bar.get('close', entry_price))) / max(float(atr), 1e-9)
+                        if atr_entry_dist > float(config.PRECISION_MAX_ENTRY_DISTANCE_ATR):
+                            logger.logger.info(
+                                f"{nowstr()} {symbol}: precision gate blocked (entry distance {atr_entry_dist:.2f} ATR > {config.PRECISION_MAX_ENTRY_DISTANCE_ATR:.2f})"
+                            )
+                            time.sleep(0.2)
+                            continue
+                    if not global_state.trade_filter.filter_trade(
+                        {"direction": chosen_dir},
+                        market_data,
+                        min_trend_strength=(config.RELAX_MIN_TREND_STRENGTH if relax_mode else None),
+                        max_spread_multiplier=(config.RELAX_MAX_SPREAD_MULTIPLIER if relax_mode else None),
+                        min_rr_ratio=min_rr
+                    ):
+                        logger.logger.info(f"{nowstr()} {symbol}: trade filter blocked entry")
+                        time.sleep(0.2)
+                        continue
+
+                if config.USE_FIXED_LOT:
+                    lot = round_lot(symbol, config.LOT_FIXED)
+                elif config.DYNAMIC_POSITION_SIZING:
+                    lot = calculate_position_size(symbol, entry_price, sl_price)
+                    smart_risk_mult = compute_smart_risk_multiplier(
+                        quality_score=quality_score,
+                        confluence_score=confluence_score,
+                        market_regime=market_regime,
+                        spread_ratio=spread_ratio,
+                        recent_performance=list(global_state.recent_performance),
+                    )
+                    lot = lot * smart_risk_mult
+                    lot = global_state.adaptive_trading.adjust_position_size(
+                        lot, list(global_state.recent_performance)
+                    )
+                    lot = round_lot(symbol, lot)
+                else:
+                    lot = round_lot(symbol, config.LOT_FIXED)
+                
+                lot = round_lot(symbol, correlated_exposure_lot_adjustment(symbol, chosen_dir, lot))
+                if lot <= 0:
+                    logger.logger.warning(f"{nowstr()} {symbol}: invalid lot after adjustments, skipping trade")
+                    time.sleep(0.2)
+                    continue
+
+                potential_loss_usd = estimate_loss_usd(symbol, entry_price, sl_price, lot)
+
+                if potential_loss_usd > config.MAX_LOSS_PER_TRADE:
+                    logger.logger.warning(f"{symbol}: Potential loss ${potential_loss_usd:.2f} > max ${config.MAX_LOSS_PER_TRADE}")
+                    if potential_loss_usd > 0:
+                        adjustment = config.MAX_LOSS_PER_TRADE / potential_loss_usd
+                        lot = round_lot(symbol, lot * adjustment)
+                        potential_loss_usd = estimate_loss_usd(symbol, entry_price, sl_price, lot)
+                        logger.logger.info(f"{symbol}: Adjusted lot for max-loss control -> {lot}")
+                
+                logger.logger.info(f"{nowstr()} {symbol} ATTEMPT {chosen_dir} lot={lot:.3f} "
+                                 f"entry={entry_price:.5f} sl={sl_price:.5f} tp={tp_price:.5f} "
+                                 f"confluence={confluence_score}/5 quality={quality_score:.1f}/{dynamic_quality_min:.1f} "
+                                 f"reasons={chosen_reasons} potential_loss=${potential_loss_usd:.2f}")
+                
+                short_reason = ""
+                if chosen_reasons:
+                    short_reasons = []
+                    for r in chosen_reasons[:2]:
+                        if len(r) > 8:
+                            short_reasons.append(r[:8])
+                        else:
+                            short_reasons.append(r)
+                    short_reason = "_".join(short_reasons)
+                else:
+                    short_reason = "Signal"
+                
+                # Add signal prefixes
+                signal_prefix = ""
+                if fvg_signal_active:
+                    signal_prefix = "FVG_"
+                elif liquidity_signal_active:
+                    signal_prefix = "LIQ_"
+                
+                short_reason = signal_prefix + short_reason
+                
+                if fvg_signal_active:
+                    confluence_score += config.FVG_CONFLUENCE_WEIGHT
+                if liquidity_signal_active:
+                    confluence_score += config.LIQUIDITY_CONFLUENCE_WEIGHT
+
+                side_key = 'buy_signals' if chosen_dir == 'buy' else 'sell_signals'
+                selected_side = confluence_result.get(side_key, {})
+                strategy_hits = {
+                    'trend_following': bool(selected_side.get('trend')),
+                    'crt': bool(selected_side.get('crt')),
+                    'snr': bool(selected_side.get('snr')),
+                    'fvg': bool(selected_side.get('fvg')),
+                    'liquidity': bool(selected_side.get('liquidity')),
+                }
+                
+                if is_duplicate_trade_level(symbol, chosen_dir, entry_price, atr):
+                    logger.logger.info(f"{nowstr()} {symbol}: duplicate level filter blocked entry at {entry_price:.5f}")
+                    time.sleep(0.2)
+                    continue
+
+                if not global_state.try_reserve_daily_trade_slot(symbol):
+                    time.sleep(0.2)
+                    continue
+
+                res = send_trade_safe(symbol, chosen_dir, lot, sl_price, tp_price, 
+                                    short_reason, confluence_score, fvg_signal_active, strategy_hits)
+                
+                if res is None:
+                    global_state.release_daily_trade_slot()
+                    logger.logger.warning(f"{nowstr()} {symbol}: trade attempt failed. mt5.last_error={mt5.last_error()}")
+                    debug_mt5_error()
+                else:
+                    logger.logger.info(f"{nowstr()} {symbol}: TRADE EXECUTED ✅ direction={chosen_dir} confluence={confluence_score}/5")
+                    
+                    if fvg_signal_active and confluence_result.get('fvg_signals'):
+                        fvg_signal = confluence_result['fvg_signals'][0]
+                        logger.logger.info(f"FVG Signal used: {fvg_signal.get('type', 'N/A')} Strength: {fvg_signal.get('zone_strength', 0):.2f}")
+                    
+                    if liquidity_signal_active and confluence_result.get('liquidity_signals'):
+                        liq_signal = confluence_result['liquidity_signals'][0]
+                        logger.logger.info(f"Liquidity Signal used: {liq_signal.get('type', 'N/A')} Strength: {liq_signal.get('strength', 0):.2f}")
+                    
+                    try:
+                        if chosen_dir == 'buy':
+                            beep_cash_buy()
+                        else:
+                            beep_cash_sell()
+                    except Exception:
+                        pass
+                    
+                    global_state.last_trade_time[symbol] = time.time()
+                    global_state.record_trade_level(symbol, chosen_dir, entry_price)
+            
+            manage_hybrid_trailing_enhanced(symbol)
+            check_closed_trades_enhanced()
+            time.sleep(0.2)
+            
+        except Exception as e:
+            logger.logger.error(f"{nowstr()} {symbol} enhanced loop exception: {e}")
+            logger.log_error("trade_symbol_enhanced", str(e), "ERROR", symbol)
+            time.sleep(2)
+
+# ==================== ENHANCED MAIN EXECUTION ====================
+def main_enhanced():
+    """Enhanced main execution with full automation"""
+    try:
+        if config.BACKTEST_MODE:
+            backtester = BacktestEngine(config.BACKTEST_DATA_FILES, STARTING_BALANCE)
+            backtester.run()
+            return
+
+        logger.logger.info("=" * 80)
+        logger.logger.info("SAFE CONFLUENCE XAU BOT v16 + FVG + LIQUIDITY SMC - COMPLETE INTEGRATION")
+        logger.logger.info("TREND + CRT + SNR + FVG + LIQUIDITY - PROFESSIONAL EDITION")
+        logger.logger.info("=" * 80)
+        logger.logger.info(f"Run ID: {logger.run_timestamp}")
+        logger.logger.info(f"Log Directory: {logger.log_dir}")
+        logger.logger.info(f"Starting with symbols: {config.SYMBOLS}")
+        logger.logger.info(f"Starting balance: ${STARTING_BALANCE:.2f}")
+        if config.PAPER_TRADING_ENABLED:
+            logger.logger.info("Paper trading mode: ENABLED (simulated execution)")
+        logger.logger.info("=" * 80)
+        logger.logger.info("SAFETY CONFIGURATION:")
+        logger.logger.info(f"  • Lot size: {config.LOT_FIXED}")
+        logger.logger.info(f"  • Cooldown: {config.COOLDOWN} seconds")
+        logger.logger.info(f"  • SL Multiplier: {config.SL_ATR_MULT}")
+        logger.logger.info(f"  • Max loss per trade: ${config.MAX_LOSS_PER_TRADE}")
+        logger.logger.info(f"  • Consecutive loss limit: {config.CONSECUTIVE_LOSS_LIMIT}")
+        logger.logger.info("=" * 80)
+        logger.logger.info("STRATEGY CONFIGURATION:")
+        logger.logger.info(f"  • CRT Enabled: {config.CRT_ENABLED}")
+        logger.logger.info(f"  • SNR Enabled: {config.SNR_ENABLED}")
+        logger.logger.info(f"  • FVG Enabled: {config.FVG_ENABLED}")
+        logger.logger.info(f"  • Liquidity SMC Enabled: {config.LIQUIDITY_SMC_ENABLED}")
+        logger.logger.info(f"  • Min Confluence Score: {config.MIN_CONFLUENCE_SCORE}")
+        logger.logger.info(f"  • FVG Confluence Weight: {config.FVG_CONFLUENCE_WEIGHT}")
+        logger.logger.info(f"  • Liquidity Confluence Weight: {config.LIQUIDITY_CONFLUENCE_WEIGHT}")
+        logger.logger.info("=" * 80)
+        logger.logger.info("FVG SPECIFIC SETTINGS:")
+        logger.logger.info(f"  • FVG Min Strength: {config.FVG_MIN_STRENGTH}")
+        logger.logger.info(f"  • FVG Freshness Bars: {config.FVG_FRESHNESS_THRESHOLD_BARS}")
+        logger.logger.info(f"  • FVG Use Midpoint TP: {config.FVG_USE_MIDPOINT_TP}")
+        logger.logger.info(f"  • FVG Use Opposite TP: {config.FVG_USE_OPPOSITE_SIDE_TP}")
+        logger.logger.info(f"  • FVG SL Breaker Multiplier: {config.FVG_SL_BREAKER_MULTIPLIER}")
+        logger.logger.info("=" * 80)
+        logger.logger.info("LIQUIDITY SMC SETTINGS:")
+        logger.logger.info(f"  • Liquidity Lookback: {config.LIQUIDITY_LOOKBACK_PERIODS} bars")
+        logger.logger.info(f"  • Volume Multiplier: {config.LIQUIDITY_VOLUME_MULTIPLIER}")
+        logger.logger.info(f"  • Zone Width: {config.LIQUIDITY_ZONE_WIDTH_PCT * 100}%")
+        logger.logger.info("=" * 80)
+        logger.logger.info("AUTOMATION FEATURES:")
+        logger.logger.info("  ✅ Automatic logging (12 log files)")
+        logger.logger.info("  ✅ Automatic connection recovery")
+        logger.logger.info("  ✅ Intelligent data caching")
+        logger.logger.info("  ✅ Automatic supervisor monitoring")
+        logger.logger.info("  ✅ Quint strategy confluence (Trend + CRT + SNR + FVG + Liquidity)")
+        logger.logger.info("  ✅ FVG detection: Bullish, Bearish, Partial, Mitigated")
+        logger.logger.info("  ✅ Liquidity SMC: Order blocks, breaker blocks, liquidity pools")
+        logger.logger.info("  ✅ Volume-based smart money detection")
+        logger.logger.info("  ✅ FVG strength scoring and volume prioritization")
+        logger.logger.info("  ✅ FVG-based TP1 (midpoint) and TP2 (opposite side)")
+        logger.logger.info("=" * 80)
+        
+        supervisor = AutomatedSupervisor()
+        supervisor_thread = threading.Thread(target=supervisor.run, name="Supervisor", daemon=True)
+        supervisor_thread.start()
+        logger.logger.info("Supervisor thread started")
+        thread_manager.register_thread("Supervisor", supervisor_thread)
+        
+        trader_threads: Dict[str, threading.Thread] = {}
+        for symbol in config.SYMBOLS:
+            t = threading.Thread(target=trade_symbol_enhanced, args=(symbol, thread_manager.stop_event), 
+                               name=f"Trader_{symbol}", daemon=True)
+            t.start()
+            trader_threads[symbol] = t
+            time.sleep(0.5)
+            logger.logger.info(f"Trading thread started for {symbol}")
+            thread_manager.register_thread(t.name, t, symbol)
+        
+        logger.logger.info("✅ ALL SYSTEMS INITIALIZED AND RUNNING")
+        logger.logger.info("=" * 80)
+        
+        while True:
+            try:
+                if not connection_manager.reconnect_if_needed():
+                    logger.logger.warning("Main loop: Connection issues detected")
+                    time.sleep(10)
+                    continue
+                
+                if time.time() - global_state.last_summary_time > config.SUMMARY_INTERVAL:
+                    print_daily_summary_enhanced()
+                    global_state.last_summary_time = time.time()
+                
+                active_threads = threading.active_count()
+                if active_threads < len(config.SYMBOLS) + 2:
+                    logger.logger.warning(f"Thread count low: {active_threads}")
+                    thread_manager.cleanup_stale_threads(timeout=300)
+
+                for symbol in config.SYMBOLS:
+                    worker = trader_threads.get(symbol)
+                    if worker is None or not worker.is_alive():
+                        logger.logger.warning(f"Respawning trader thread for {symbol}")
+                        new_worker = threading.Thread(
+                            target=trade_symbol_enhanced,
+                            args=(symbol, thread_manager.stop_event),
+                            name=f"Trader_{symbol}",
+                            daemon=True,
+                        )
+                        new_worker.start()
+                        trader_threads[symbol] = new_worker
+                        thread_manager.register_thread(new_worker.name, new_worker, symbol)
+                
+                time.sleep(10)
+                
+            except KeyboardInterrupt:
+                logger.logger.info("Bot stopped by user (KeyboardInterrupt)")
+                break
+            except Exception as e:
+                logger.logger.error(f"Main supervisor loop exception: {e}")
+                logger.log_error("main_enhanced", str(e), "CRITICAL")
+                time.sleep(5)
+                
+    except KeyboardInterrupt:
+        logger.logger.info("Bot stopped by user (KeyboardInterrupt)")
+    except Exception as e:
+        logger.logger.critical(f"Critical error in main_enhanced: {e}")
+        logger.log_error("main_enhanced", str(e), "CRITICAL")
+    finally:
+        try:
+            logger.logger.info("Shutting down bot...")
+            thread_manager.stop_all()
+            for thread in threading.enumerate():
+                if thread.name.startswith("Trader_"):
+                    thread.join(timeout=2)
+            logger.logger.info("=" * 80)
+            logger.logger.info("FINAL SUMMARY")
+            logger.logger.info("=" * 80)
+            if not config.BACKTEST_MODE:
+                print_daily_summary_enhanced()
+            
+            logger.logger.info(f"Logs saved to: {logger.log_dir}")
+            if not config.BACKTEST_MODE:
+                logger.logger.info("Shutting down MT5...")
+                mt5.shutdown()
+                logger.logger.info("MT5 shutdown complete")
+            logger.logger.info("=" * 80)  
+        except Exception as e:
+            logger.logger.error(f"Shutdown error: {e}")
+
+if __name__ == "__main__":
+    main_enhanced() 
