@@ -17,7 +17,7 @@ import logging
 import hashlib
 import random
 import re
-from datetime import datetime, date, time as dt_time, timedelta, timezone
+from datetime import datetime, date, time as dt_time, timedelta
 from typing import Dict, List, Tuple, Optional, Any
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
@@ -173,17 +173,15 @@ class FVGStrategy:
             if not self._validate_fvg_formation(candle1, candle2, candle3):
                 continue
             
-            # Determine direction using standard ICT/FVG convention:
-            # bullish imbalance = displacement up leaves gap between candle1 high and candle3 low.
-            # bearish imbalance = displacement down leaves gap between candle3 high and candle1 low.
-            if candle1['high'] < candle3['low']:
+            # Determine direction
+            if candle1['low'] > candle3['high']:
                 direction = 'bullish'
-                fvg_high = candle3['low']
-                fvg_low = candle1['high']
-            elif candle1['low'] > candle3['high']:
-                direction = 'bearish'
                 fvg_high = candle1['low']
                 fvg_low = candle3['high']
+            elif candle1['high'] < candle3['low']:
+                direction = 'bearish'
+                fvg_high = candle3['low']
+                fvg_low = candle1['high']
             else:
                 if self._is_partial_fvg(candle1, candle3):
                     direction = 'partial'
@@ -461,9 +459,9 @@ class FVGStrategy:
                                  df: pd.DataFrame) -> bool:
         """Check if price is approaching the FVG zone"""
         if zone.direction == 'bullish':
-            return current_price > zone.high and (current_price - zone.high) < zone.gap_size * 2
-        else:
             return current_price < zone.low and (zone.low - current_price) < zone.gap_size * 2
+        else:
+            return current_price > zone.high and (current_price - zone.high) < zone.gap_size * 2
     
     def _create_fvg_signal(self, zone: FVGZone, current_price: float,
                           atr: float, strength: float) -> Dict:
@@ -509,12 +507,12 @@ def detect_fvg(df: pd.DataFrame, lookback_bars: int = 50) -> List[Dict]:
         candle2 = df_subset.iloc[i-1]
         candle3 = df_subset.iloc[i]
         
-        if candle1['high'] < candle3['low']:
+        if candle1['low'] > candle3['high']:
             fvg = {
                 'type': 'bullish',
-                'high': float(candle3['low']),
-                'low': float(candle1['high']),
-                'gap_size': float(candle3['low'] - candle1['high']),
+                'high': float(candle1['low']),
+                'low': float(candle3['high']),
+                'gap_size': float(candle1['low'] - candle3['high']),
                 'start_idx': i-2,
                 'end_idx': i,
                 'volume_confirmation': True,
@@ -522,12 +520,12 @@ def detect_fvg(df: pd.DataFrame, lookback_bars: int = 50) -> List[Dict]:
             }
             fvgs.append(fvg)
         
-        elif candle1['low'] > candle3['high']:
+        elif candle1['high'] < candle3['low']:
             fvg = {
                 'type': 'bearish',
-                'high': float(candle1['low']),
-                'low': float(candle3['high']),
-                'gap_size': float(candle1['low'] - candle3['high']),
+                'high': float(candle3['low']),
+                'low': float(candle1['high']),
+                'gap_size': float(candle3['low'] - candle1['high']),
                 'start_idx': i-2,
                 'end_idx': i,
                 'volume_confirmation': True,
@@ -798,7 +796,7 @@ def _check_conflicts(fvg_signal: Dict, trend_signals: List[Dict],
     with open(os.path.join(base_path, 'data', 'historical_xau_h4.csv'), 'w', encoding='utf-8') as f:
         f.write(generate_synthetic_data(500))
     
-    print("[OK] All files created successfully!")
+    print("✅ All files created successfully!")
 
 # Run file creation
 create_file_structure()
@@ -807,8 +805,8 @@ create_file_structure()
 @dataclass
 class BotConfig:
     # ==== MT5 Connection ====
-    LOGIN: int = int(os.getenv("MT5_LOGIN", "0"))
-    PASSWORD: str = os.getenv("MT5_PASSWORD", "")
+    LOGIN: int = int(os.getenv("MT5_LOGIN", "52536980"))
+    PASSWORD: str = os.getenv("MT5_PASSWORD", "z!Kt1zsRa8Buyb")
     SERVER: str = os.getenv("MT5_SERVER", "ICMarketsSC-Demo")
 
     # ==== Symbols & Timeframes ====
@@ -822,7 +820,7 @@ class BotConfig:
 
     # ==== Risk Management ====
     USE_FIXED_LOT: bool = True
-    LOT_FIXED: float = 0.03
+    LOT_FIXED: float = 0.01
     MAX_TRADES_PER_SYMBOL: int = 2
     MAX_POSITIONS_TOTAL: int = 4
     MAX_LOSS_PER_TRADE: float = 15.0
@@ -839,17 +837,9 @@ class BotConfig:
     VOLATILITY_ADJUSTED_SL: bool = False
     MIN_RR_RATIO: float = 2.0
 
-    COOLDOWN: int = int(os.getenv("COOLDOWN", "1200"))
-    SMART_COOLDOWN_ENABLED: bool = env_bool("SMART_COOLDOWN_ENABLED", True)
-    SMART_COOLDOWN_MIN_SECONDS: int = int(os.getenv("SMART_COOLDOWN_MIN_SECONDS", "300"))
-    SMART_COOLDOWN_STRONG_MULT: float = float(os.getenv("SMART_COOLDOWN_STRONG_MULT", "0.35"))
-    OPPORTUNITY_MODE_ENABLED: bool = env_bool("OPPORTUNITY_MODE_ENABLED", True)
-    OPPORTUNITY_MIN_CONFLUENCE: int = int(os.getenv("OPPORTUNITY_MIN_CONFLUENCE", "4"))
-    OPPORTUNITY_MTF_DISCOUNT: float = float(os.getenv("OPPORTUNITY_MTF_DISCOUNT", "10.0"))
-    OPPORTUNITY_QUALITY_DISCOUNT: float = float(os.getenv("OPPORTUNITY_QUALITY_DISCOUNT", "5.0"))
-    OPPORTUNITY_TIME_FILTER_SECONDS: int = int(os.getenv("OPPORTUNITY_TIME_FILTER_SECONDS", "90"))
-    FORCE_TRADE_EVERY: int = 1200
-    FORCE_TRADE_ENABLED: bool = env_bool("FORCE_TRADE_ENABLED", False)
+    COOLDOWN: int = 1800
+    FORCE_TRADE_EVERY: int = 1400
+    FORCE_TRADE_ENABLED: bool = True
 
     # ==== Indicator Settings ====
     EMA_FAST: int = 12
@@ -889,11 +879,6 @@ class BotConfig:
     # ==== HTF Confirmation ====
     HTF_H4_TF: int = mt5.TIMEFRAME_H4
     HTF_H1_TF: int = mt5.TIMEFRAME_H1
-    MTF_ENTRY_TF: int = mt5.TIMEFRAME_M15
-    MIN_CONFIRMATION_SCORE: float = 70.0
-    AVOID_ASIAN_SESSION: bool = True
-    ASIAN_SESSION_START_HOUR_UTC: int = 0
-    ASIAN_SESSION_END_HOUR_UTC: int = 6
 
     EMA_FAST_H1: int = 13
     EMA_SLOW_H1: int = 34
@@ -956,7 +941,7 @@ class BotConfig:
     # ==== Daily Protection ====
     DAILY_LOSS_PCT: float = 5.0
     DAILY_LOSS_USD_LIMIT: float = 30.0
-    DAILY_LOSS_HARD_STOP: bool = env_bool("DAILY_LOSS_HARD_STOP", True)
+    DAILY_LOSS_HARD_STOP: bool = False
     DAILY_PROFIT_PCT: float = 3.0
     MAX_DRAWDOWN_PCT: float = 5.0
     MAX_DAILY_TRADES: int = 60
@@ -975,7 +960,7 @@ class BotConfig:
     MAX_RECONNECT_ATTEMPTS: int = 10
     RECONNECT_BACKOFF_BASE: float = 2.0
 
-    DATA_CACHE_SECONDS: int = int(os.getenv("DATA_CACHE_SECONDS", "15"))
+    DATA_CACHE_SECONDS: int = 60
     VALIDATE_SYMBOLS_ON_STARTUP: bool = True
     ENABLE_FALLBACK_DATA_SOURCE: bool = env_bool("ENABLE_FALLBACK_DATA_SOURCE", True)
     MAX_STALE_DATA_SECONDS: int = int(os.getenv("MAX_STALE_DATA_SECONDS", "900"))
@@ -986,8 +971,6 @@ class BotConfig:
     DYNAMIC_RSI_LOW_Q: float = float(os.getenv("DYNAMIC_RSI_LOW_Q", "0.2"))
     DYNAMIC_RSI_HIGH_Q: float = float(os.getenv("DYNAMIC_RSI_HIGH_Q", "0.8"))
     CIRCUIT_BREAKER_COOL_OFF_MINUTES: int = int(os.getenv("CIRCUIT_BREAKER_COOL_OFF_MINUTES", "180"))
-    RUN_STARTUP_SELF_TESTS: bool = env_bool("RUN_STARTUP_SELF_TESTS", True)
-    SELF_TEST_ONLY: bool = env_bool("SELF_TEST_ONLY", False)
 
     # ==== Trade Quality Filters ====
     MAX_SPREAD_POINTS: float = 30.0
@@ -1088,10 +1071,6 @@ class BotConfig:
     AUTO_TUNE_WEIGHT_ADJUST_RATE: float = 0.20
     AUTO_TUNE_WEIGHT_MIN: float = 0.08
     AUTO_TUNE_WEIGHT_MAX: float = 0.60
-    STRATEGY_KILL_SWITCH_ENABLED: bool = True
-    STRATEGY_KILL_MIN_SAMPLES: int = 25
-    STRATEGY_KILL_EXPECTANCY_USD: float = -0.75
-    STRATEGY_KILL_RECOVERY_EXPECTANCY_USD: float = 0.15
     ENFORCE_READINESS_GATE: bool = False
     READINESS_MIN_TRADES: int = 40
     READINESS_MIN_WIN_RATE: float = 48.0
@@ -1200,10 +1179,6 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("TP_ATR_MULT must be greater than 0.")
     if bot_config.MIN_CONFLUENCE_SCORE < 1:
         errors.append("MIN_CONFLUENCE_SCORE must be at least 1.")
-    if not (0 <= bot_config.MIN_CONFIRMATION_SCORE <= 100):
-        errors.append("MIN_CONFIRMATION_SCORE must be between 0 and 100.")
-    if not (0 <= bot_config.ASIAN_SESSION_START_HOUR_UTC <= 23 and 0 <= bot_config.ASIAN_SESSION_END_HOUR_UTC <= 23):
-        errors.append("ASIAN session hours must be between 0 and 23.")
     if not (0 <= bot_config.DAILY_LOSS_PCT <= 100):
         errors.append("DAILY_LOSS_PCT must be between 0 and 100.")
     if bot_config.DAILY_LOSS_USD_LIMIT < 0:
@@ -1227,10 +1202,6 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("AUTO_TUNE_WEIGHT_MIN cannot exceed AUTO_TUNE_WEIGHT_MAX.")
     if bot_config.AUTO_TUNE_MIN_SAMPLES < 1:
         errors.append("AUTO_TUNE_MIN_SAMPLES must be at least 1.")
-    if bot_config.STRATEGY_KILL_MIN_SAMPLES < 1:
-        errors.append("STRATEGY_KILL_MIN_SAMPLES must be at least 1.")
-    if bot_config.STRATEGY_KILL_RECOVERY_EXPECTANCY_USD < bot_config.STRATEGY_KILL_EXPECTANCY_USD:
-        errors.append("STRATEGY_KILL_RECOVERY_EXPECTANCY_USD must be >= STRATEGY_KILL_EXPECTANCY_USD.")
     if not (0 < bot_config.AUTO_TUNE_WEIGHT_ADJUST_RATE <= 1):
         errors.append("AUTO_TUNE_WEIGHT_ADJUST_RATE must be between 0 and 1.")
     if not (0 < bot_config.READINESS_MIN_WIN_RATE <= 100):
@@ -1299,16 +1270,6 @@ def validate_config_or_exit(bot_config: BotConfig) -> None:
         errors.append("MAX_TRADE_DURATION_MINUTES must be greater than 0.")
     if bot_config.TRAIL_PROFIT_STEP_USD <= 0:
         errors.append("TRAIL_PROFIT_STEP_USD must be greater than 0.")
-    if bot_config.SMART_COOLDOWN_MIN_SECONDS < 0:
-        errors.append("SMART_COOLDOWN_MIN_SECONDS cannot be negative.")
-    if not (0.1 <= bot_config.SMART_COOLDOWN_STRONG_MULT <= 1.0):
-        errors.append("SMART_COOLDOWN_STRONG_MULT must be between 0.1 and 1.0.")
-    if bot_config.OPPORTUNITY_MIN_CONFLUENCE < bot_config.MIN_CONFLUENCE_SCORE:
-        errors.append("OPPORTUNITY_MIN_CONFLUENCE must be >= MIN_CONFLUENCE_SCORE.")
-    if bot_config.OPPORTUNITY_MTF_DISCOUNT < 0 or bot_config.OPPORTUNITY_QUALITY_DISCOUNT < 0:
-        errors.append("Opportunity discounts cannot be negative.")
-    if bot_config.OPPORTUNITY_TIME_FILTER_SECONDS < 0:
-        errors.append("OPPORTUNITY_TIME_FILTER_SECONDS cannot be negative.")
     if bot_config.BACKTEST_MODE:
         missing_files = [
             sym for sym, path in bot_config.BACKTEST_DATA_FILES.items()
@@ -1329,32 +1290,16 @@ def validate_live_safety_or_exit(bot_config: BotConfig) -> None:
         return
 
     errors = []
-    if bot_config.LOGIN <= 0:
-        errors.append("LIVE_ACCOUNT_MODE requires MT5_LOGIN to be set.")
-    if not bot_config.PASSWORD:
-        errors.append("LIVE_ACCOUNT_MODE requires MT5_PASSWORD to be set via environment variable.")
-    if not bot_config.SERVER:
-        errors.append("LIVE_ACCOUNT_MODE requires MT5_SERVER to be set.")
     if bot_config.PAPER_TRADING_ENABLED or bot_config.BACKTEST_MODE:
         errors.append("LIVE_ACCOUNT_MODE cannot be used with PAPER_TRADING_ENABLED or BACKTEST_MODE.")
     if bot_config.LIVE_REQUIRE_READINESS_GATE and not bot_config.ENFORCE_READINESS_GATE:
         errors.append("LIVE_ACCOUNT_MODE requires ENFORCE_READINESS_GATE=True.")
     if bot_config.LIVE_REQUIRE_DAILY_HARD_STOP and not bot_config.DAILY_LOSS_HARD_STOP:
         errors.append("LIVE_ACCOUNT_MODE requires DAILY_LOSS_HARD_STOP=True.")
-    if bot_config.FORCE_TRADE_ENABLED:
-        errors.append("LIVE_ACCOUNT_MODE requires FORCE_TRADE_ENABLED=False.")
-    if bot_config.SMART_COOLDOWN_MIN_SECONDS < 180:
-        errors.append("LIVE_ACCOUNT_MODE requires SMART_COOLDOWN_MIN_SECONDS >= 180.")
-    if bot_config.OPPORTUNITY_QUALITY_DISCOUNT > 8:
-        errors.append("LIVE_ACCOUNT_MODE requires OPPORTUNITY_QUALITY_DISCOUNT <= 8.")
     if bot_config.DAILY_LOSS_USD_LIMIT <= 0:
         errors.append("LIVE_ACCOUNT_MODE requires DAILY_LOSS_USD_LIMIT > 0.")
     if bot_config.MAX_LOSS_PER_TRADE <= 0:
         errors.append("LIVE_ACCOUNT_MODE requires MAX_LOSS_PER_TRADE > 0.")
-    if bot_config.MAX_DAILY_TRADES > 20:
-        errors.append("LIVE_ACCOUNT_MODE requires MAX_DAILY_TRADES <= 20.")
-    if bot_config.MIN_RR_RATIO < 1.5:
-        errors.append("LIVE_ACCOUNT_MODE requires MIN_RR_RATIO >= 1.5.")
 
     if errors:
         formatted = "\n".join(f"- {err}" for err in errors)
@@ -1400,8 +1345,8 @@ class AutomatedLogger:
         self.logger.info(f"Run Timestamp: {self.run_timestamp}")
         self.logger.info(f"Log Directory: {self.log_dir}")
         self.logger.info("=" * 80)
-        self.logger.info("[OK] ALL LOG FILES CREATED AUTOMATICALLY")
-        self.logger.info("[OK] ERROR LOGS AUTO-CLEANED ON STARTUP")
+        self.logger.info("✅ ALL LOG FILES CREATED AUTOMATICALLY")
+        self.logger.info("✅ ERROR LOGS AUTO-CLEANED ON STARTUP")
         self.logger.info("=" * 80)
     
     def auto_clean_error_logs(self):
@@ -1539,7 +1484,7 @@ class AutomatedLogger:
             writer = csv.writer(f)
             writer.writerow([
                 'timestamp', 'symbol', 'trend_signals', 'crt_signals', 'snr_signals',
-                'fvg_signals', 'liquidity_signals', 'confluence_score', 'market_regime', 'final_decision', 'action_taken', 'dynamic_weights', 'strategy_breakdown', 'disabled_strategies'
+                'fvg_signals', 'liquidity_signals', 'confluence_score', 'market_regime', 'final_decision', 'action_taken', 'dynamic_weights', 'strategy_breakdown'
             ])
         
         # FVG Signals Log
@@ -1749,8 +1694,7 @@ class AutomatedLogger:
                     confluence_data.get('final_decision', ''),
                     confluence_data.get('action_taken', ''),
                     confluence_data.get('dynamic_weights', ''),
-                    confluence_data.get('strategy_breakdown', ''),
-                    confluence_data.get('disabled_strategies', '')
+                    confluence_data.get('strategy_breakdown', '')
                 ])
         except Exception as e:
             self.logger.error(f"Failed to log confluence: {e}")
@@ -1900,7 +1844,7 @@ class ConnectionManager:
                 self.reconnect_attempts = 0
                 self.last_connection_check = time.time()
                 
-                logger.logger.info("[OK] MT5 Connected Successfully")
+                logger.logger.info(f"✅ MT5 Connected Successfully")
                 logger.logger.info(f"Account: {acct.login}, Balance: ${acct.balance:.2f}")
                 
                 return float(acct.balance)
@@ -1931,10 +1875,10 @@ class ConnectionManager:
             try:
                 info = get_symbol_info_safe(symbol)
                 if info is None:
-                    logger.logger.error(f"[ERROR] Symbol {symbol} not found!")
+                    logger.logger.error(f"❌ Symbol {symbol} not found!")
                     logger.log_error("validate_all_symbols", f"Symbol {symbol} not found", "ERROR")
                 else:
-                    logger.logger.info(f"[OK] Symbol {symbol} validated")
+                    logger.logger.info(f"✅ Symbol {symbol} validated")
                     logger.logger.info(
                         f"{symbol} point={getattr(info, 'point', 'n/a')}, "
                         f"trade_tick_size={getattr(info, 'trade_tick_size', 'n/a')}, "
@@ -1984,7 +1928,7 @@ class ConnectionManager:
                 self.initialize_with_retry()
                 
                 if self.connected:
-                    logger.logger.info("[OK] Successfully reconnected to MT5")
+                    logger.logger.info("✅ Successfully reconnected to MT5")
                     return True
                 else:
                     logger.logger.error("Failed to reconnect to MT5")
@@ -2087,66 +2031,6 @@ def mt5_order_send_with_recovery(request: Dict[str, Any], context: str, max_atte
     debug_mt5_error()
     return None
 
-def validate_trade_request(symbol: str, direction: str, price: float, sl_price: float,
-                           tp_price: float, lot: float, min_rr_ratio: Optional[float] = None) -> Tuple[bool, str]:
-    """Final pre-flight guard before paper/live order creation."""
-    numeric_values = {
-        "price": price,
-        "sl_price": sl_price,
-        "tp_price": tp_price,
-        "lot": lot,
-    }
-    for name, value in numeric_values.items():
-        try:
-            if not math.isfinite(float(value)):
-                return False, f"{name}_not_finite"
-        except Exception:
-            return False, f"{name}_invalid"
-
-    price = float(price)
-    sl_price = float(sl_price)
-    tp_price = float(tp_price)
-    lot = float(lot)
-
-    if lot <= 0:
-        return False, "lot_must_be_positive"
-    if price <= 0 or sl_price <= 0 or tp_price <= 0:
-        return False, "prices_must_be_positive"
-
-    direction = direction.lower()
-    if direction == "buy":
-        if not (sl_price < price < tp_price):
-            return False, "buy_requires_sl_below_entry_and_tp_above_entry"
-        risk = price - sl_price
-        reward = tp_price - price
-    elif direction == "sell":
-        if not (tp_price < price < sl_price):
-            return False, "sell_requires_tp_below_entry_and_sl_above_entry"
-        risk = sl_price - price
-        reward = price - tp_price
-    else:
-        return False, "direction_must_be_buy_or_sell"
-
-    if risk <= 0 or reward <= 0:
-        return False, "risk_reward_distance_invalid"
-
-    min_stop = symbol_min_stop(symbol) or 0.0
-    if min_stop > 0 and (risk < min_stop or reward < min_stop):
-        return False, f"distance_below_min_stop:{min_stop:.5f}"
-
-    rr_threshold = float(config.MIN_RR_RATIO if min_rr_ratio is None else min_rr_ratio)
-    rr = reward / max(risk, 1e-9)
-    if rr < rr_threshold:
-        return False, f"rr_too_low:{rr:.2f}<{rr_threshold:.2f}"
-
-    potential_loss = estimate_loss_usd(symbol, price, sl_price, lot)
-    if potential_loss <= 0:
-        return False, "potential_loss_invalid"
-    if potential_loss > float(config.MAX_LOSS_PER_TRADE):
-        return False, f"potential_loss_exceeds_max:{potential_loss:.2f}>{config.MAX_LOSS_PER_TRADE:.2f}"
-
-    return True, "ok"
-
 def nowstr():
     return datetime.now().strftime("%Y.%m.%d %H:%M:%S")
 
@@ -2240,57 +2124,6 @@ def get_spread_points(symbol: str) -> Optional[float]:
 
 # Initialize logger FIRST
 logger = AutomatedLogger()
-
-def run_startup_self_tests() -> None:
-    """Fast deterministic checks for high-risk strategy assumptions."""
-    if not config.RUN_STARTUP_SELF_TESTS:
-        return
-
-    try:
-        fvg_cfg = FVGConfig(
-            MIN_CANDLE_BODY_RATIO=0.5,
-            HTF_CONFIRMATION_REQUIRED=False,
-            MAX_GAP_PERCENTAGE=0.20,
-        )
-        fvg = FVGStrategy(fvg_cfg)
-
-        bullish_df = pd.DataFrame([
-            {"open": 99.0, "high": 100.0, "low": 98.8, "close": 99.9, "tick_volume": 100},
-            {"open": 100.2, "high": 102.8, "low": 100.1, "close": 102.7, "tick_volume": 160},
-            {"open": 101.5, "high": 104.0, "low": 101.0, "close": 103.8, "tick_volume": 180},
-        ])
-        bearish_df = pd.DataFrame([
-            {"open": 103.8, "high": 104.0, "low": 102.8, "close": 103.0, "tick_volume": 100},
-            {"open": 102.6, "high": 102.7, "low": 100.1, "close": 100.2, "tick_volume": 160},
-            {"open": 100.0, "high": 100.5, "low": 98.0, "close": 98.2, "tick_volume": 180},
-        ])
-
-        bullish_zones = fvg.detect_fvg(bullish_df, "SELFTEST_BUY")
-        bearish_zones = fvg.detect_fvg(bearish_df, "SELFTEST_SELL")
-
-        if not bullish_zones or bullish_zones[0].direction != "bullish":
-            raise AssertionError("FVG bullish gap-up classification failed")
-        if not bearish_zones or bearish_zones[0].direction != "bearish":
-            raise AssertionError("FVG bearish gap-down classification failed")
-
-        buy_signal = fvg._create_fvg_signal(bullish_zones[0], bullish_zones[0].high + 0.1, 0.5, 0.9)
-        sell_signal = fvg._create_fvg_signal(bearish_zones[0], bearish_zones[0].low - 0.1, 0.5, 0.9)
-        if buy_signal["direction"] != "buy" or not (buy_signal["tp2_price"] > buy_signal["entry_price"] > buy_signal["sl_price"]):
-            raise AssertionError("FVG bullish trade geometry failed")
-        if sell_signal["direction"] != "sell":
-            raise AssertionError("FVG bearish signal direction failed")
-        if not (sell_signal["sl_price"] > sell_signal["entry_price"] > sell_signal["tp2_price"]):
-            raise AssertionError("FVG bearish trade geometry failed")
-
-        logger.logger.info("Startup self-tests passed")
-    except Exception as exc:
-        logger.logger.critical(f"Startup self-tests failed: {exc}")
-        raise SystemExit(f"Startup self-tests failed: {exc}")
-
-run_startup_self_tests()
-if config.SELF_TEST_ONLY:
-    print("SELF_TEST_ONLY completed successfully")
-    raise SystemExit(0)
 
 # Initialize connection manager
 connection_manager = ConnectionManager()
@@ -3119,7 +2952,7 @@ class TradeTracker:
                     cooldown = max(15, int(config.CONSECUTIVE_LOSS_COOLDOWN_MINUTES)) * 60
                     self.paused_until = max(self.paused_until, time.time() + cooldown)
                     logger.logger.critical(
-                        f"[WARN] Trading cooldown active for {cooldown//60}m after {self.consecutive_losses} consecutive losses"
+                        f"⚠️ Trading cooldown active for {cooldown//60}m after {self.consecutive_losses} consecutive losses"
                     )
                     logger.log_error(
                         "update_consecutive_losses",
@@ -3931,7 +3764,7 @@ def beep_cash_partial():
 def trade_flash(message):
     try:
         print("\n" + "="*60)
-        print("CASH ALERT: " + message)
+        print("💰💰💰  " + message + "  💰💰💰")
         print("="*60 + "\n")
     except Exception:
         pass
@@ -4114,32 +3947,6 @@ class ConfluenceManager:
             weights = global_state.get_auto_tuned_weights(symbol, base_weights)
         except Exception:
             weights = base_weights
-
-        strategy_enabled = {}
-        try:
-            strategy_enabled = global_state.get_strategy_enabled_map(symbol)
-        except Exception:
-            strategy_enabled = {
-                "trend_following": True, "crt": True, "snr": True, "fvg": True, "liquidity": True
-            }
-
-        if not strategy_enabled.get("trend_following", True):
-            buy_signals['trend'], sell_signals['trend'] = [], []
-            weights['trend_following'] = 0.0
-        if not strategy_enabled.get("crt", True):
-            buy_signals['crt'], sell_signals['crt'] = [], []
-            weights['crt'] = 0.0
-        if not strategy_enabled.get("snr", True):
-            buy_signals['snr'], sell_signals['snr'] = [], []
-            weights['snr'] = 0.0
-        if not strategy_enabled.get("fvg", True):
-            buy_signals['fvg'], sell_signals['fvg'] = [], []
-            weights['fvg'] = 0.0
-        if not strategy_enabled.get("liquidity", True):
-            buy_signals['liquidity'], sell_signals['liquidity'] = [], []
-            weights['liquidity'] = 0.0
-
-        disabled_strategies = [k for k, v in strategy_enabled.items() if not v]
         liquidity_weight = weights.get('liquidity', config.LIQUIDITY_CONFLUENCE_WEIGHT)
 
         strategy_breakdown = {
@@ -4238,7 +4045,6 @@ class ConfluenceManager:
         if config.AUTO_TUNE_STRATEGY_WEIGHTS:
             confluence_data['dynamic_weights'] = json.dumps({k: round(v, 4) for k, v in weights.items()})
         confluence_data['strategy_breakdown'] = json.dumps(strategy_breakdown)
-        confluence_data['disabled_strategies'] = json.dumps(disabled_strategies)
         
         logger.log_confluence(confluence_data)
         
@@ -4254,8 +4060,7 @@ class ConfluenceManager:
             'liquidity_signals': liquidity_signals,
             'fvg_confluence': fvg_confluence,
             'trend_direction': trend_direction,
-            'strategy_breakdown': strategy_breakdown,
-            'disabled_strategies': disabled_strategies
+            'strategy_breakdown': strategy_breakdown
         }
 
 # ==================== TRADE FILTERS & ADAPTIVE LOGIC ====================
@@ -4304,8 +4109,7 @@ class TradeFilter:
         last_signal_time = market_data.get("last_signal_time")
         if last_signal_time is None:
             return True
-        threshold = float(market_data.get("time_filter_seconds", self.time_since_last_signal))
-        return (time.time() - last_signal_time) >= threshold
+        return (time.time() - last_signal_time) >= self.time_since_last_signal
     
     def _check_risk_reward(self, signal: Dict[str, Any], market_data: Dict[str, Any],
                            min_rr_ratio: Optional[float]) -> bool:
@@ -4482,40 +4286,6 @@ class EnhancedGlobalState:
                     self.strategy_expectancy[symbol][name] = {"profit_sum": 0.0, "count": 0.0}
                 self.strategy_expectancy[symbol][name]["profit_sum"] += float(profit)
                 self.strategy_expectancy[symbol][name]["count"] += 1.0
-
-    def get_strategy_enabled_map(self, symbol: str) -> Dict[str, bool]:
-        """
-        Hard strategy guard:
-        - disables strategy contributions when expectancy is persistently negative
-        - re-enables only after expectancy recovers above recovery threshold
-        """
-        default_enabled = {
-            "trend_following": True,
-            "crt": True,
-            "snr": True,
-            "fvg": True,
-            "liquidity": True,
-        }
-        if not config.STRATEGY_KILL_SWITCH_ENABLED:
-            return default_enabled
-
-        stats = self.strategy_expectancy.get(symbol, {})
-        out = dict(default_enabled)
-        min_samples = int(config.STRATEGY_KILL_MIN_SAMPLES)
-        disable_thr = float(config.STRATEGY_KILL_EXPECTANCY_USD)
-        recover_thr = float(config.STRATEGY_KILL_RECOVERY_EXPECTANCY_USD)
-
-        for k in out.keys():
-            st = stats.get(k, {})
-            count = float(st.get("count", 0.0) or 0.0)
-            if count < min_samples:
-                continue
-            expectancy = float(st.get("profit_sum", 0.0) or 0.0) / max(1.0, count)
-            if expectancy <= disable_thr:
-                out[k] = False
-            elif expectancy >= recover_thr:
-                out[k] = True
-        return out
 
     def get_auto_tuned_weights(self, symbol: str, base_weights: Dict[str, float]) -> Dict[str, float]:
         """
@@ -5227,32 +4997,6 @@ def calculate_dynamic_tp(entry_price: float, direction: str, atr: float, market_
     return entry_price - (atr * multiplier)
 
 
-def is_high_confidence_opportunity(confluence_score: float, session_preferred: bool,
-                                   market_regime: str, has_smc_signal: bool) -> bool:
-    """Identify setups that can justify faster reaction while preserving hard risk gates."""
-    if not config.OPPORTUNITY_MODE_ENABLED:
-        return False
-    if not session_preferred:
-        return False
-    if confluence_score < config.OPPORTUNITY_MIN_CONFLUENCE:
-        return False
-    if market_regime not in {"trending", "volatile"}:
-        return False
-    return bool(has_smc_signal)
-
-
-def compute_effective_cooldown(symbol: str, confluence_score: float, session_preferred: bool,
-                               market_regime: str, has_smc_signal: bool) -> int:
-    """Use shorter cooldowns only for stronger, context-confirmed opportunities."""
-    base = int(config.COOLDOWN)
-    if not config.SMART_COOLDOWN_ENABLED:
-        return base
-    if not is_high_confidence_opportunity(confluence_score, session_preferred, market_regime, has_smc_signal):
-        return base
-    adjusted = int(base * float(config.SMART_COOLDOWN_STRONG_MULT))
-    return max(int(config.SMART_COOLDOWN_MIN_SECONDS), adjusted)
-
-
 def should_skip_chase_entry(df: pd.DataFrame, direction: str, atr: float, market_regime: str,
                             has_smc_signal: bool = False) -> Tuple[bool, str]:
     """Avoid late/chase entries where reward quality degrades."""
@@ -5330,61 +5074,6 @@ def get_mtf_alignment(df_h1: pd.DataFrame, df_h4: pd.DataFrame, direction: str) 
     if direction == 'buy':
         return h1_fast > h1_slow and h4_fast > h4_slow
     return h1_fast < h1_slow and h4_fast < h4_slow
-
-def compute_mtf_confirmation_score(df_h4: pd.DataFrame, df_h1: pd.DataFrame, df_m15: pd.DataFrame, direction: str) -> Tuple[float, Dict[str, Any]]:
-    """
-    Multi-timeframe confirmation engine (0-100):
-    - H4: macro trend bias
-    - H1: trend + structure (proxy BOS/CHOCH)
-    - M15: pullback and entry-zone quality
-    """
-    details = {"h4_bias": False, "h1_structure": False, "m15_entry_zone": False}
-    if df_h4.empty or df_h1.empty or df_m15.empty:
-        return 0.0, details
-    try:
-        h4_fast, h4_slow = float(df_h4['ema_fast'].iloc[-1]), float(df_h4['ema_slow'].iloc[-1])
-        h1_fast, h1_slow = float(df_h1['ema_fast'].iloc[-1]), float(df_h1['ema_slow'].iloc[-1])
-        h4_close = float(df_h4['close'].iloc[-1])
-        h1_close = float(df_h1['close'].iloc[-1])
-
-        # H4 macro bias
-        if direction == 'buy':
-            details["h4_bias"] = (h4_fast > h4_slow and h4_close > h4_fast)
-        else:
-            details["h4_bias"] = (h4_fast < h4_slow and h4_close < h4_fast)
-
-        # H1 structure proxy for BOS/CHOCH (new swing expansion + EMA agreement)
-        recent_h1 = df_h1.iloc[-20:]
-        prev_h1 = df_h1.iloc[-40:-20] if len(df_h1) >= 40 else df_h1.iloc[:-20]
-        if not prev_h1.empty:
-            if direction == 'buy':
-                bos = float(recent_h1['high'].max()) > float(prev_h1['high'].max())
-                details["h1_structure"] = bos and h1_fast > h1_slow and h1_close > h1_fast
-            else:
-                bos = float(recent_h1['low'].min()) < float(prev_h1['low'].min())
-                details["h1_structure"] = bos and h1_fast < h1_slow and h1_close < h1_fast
-
-        # M15 pullback + SR zone proxy using recent swings + ATR buffer
-        atr_m15 = float(df_m15['atr'].iloc[-1]) if 'atr' in df_m15.columns and not pd.isna(df_m15['atr'].iloc[-1]) else 0.0
-        m15_close = float(df_m15['close'].iloc[-1])
-        m15_fast, m15_slow = float(df_m15['ema_fast'].iloc[-1]), float(df_m15['ema_slow'].iloc[-1])
-        swing_low = float(df_m15['low'].iloc[-30:].min())
-        swing_high = float(df_m15['high'].iloc[-30:].max())
-        zone_buf = max(atr_m15 * 0.6, 0.05)
-        if direction == 'buy':
-            near_support = abs(m15_close - swing_low) <= zone_buf
-            details["m15_entry_zone"] = near_support and m15_fast >= m15_slow
-        else:
-            near_resistance = abs(swing_high - m15_close) <= zone_buf
-            details["m15_entry_zone"] = near_resistance and m15_fast <= m15_slow
-
-        score = 0.0
-        score += 40.0 if details["h4_bias"] else 0.0
-        score += 35.0 if details["h1_structure"] else 0.0
-        score += 25.0 if details["m15_entry_zone"] else 0.0
-        return score, details
-    except Exception:
-        return 0.0, details
 
 
 def evaluate_fire_conditions(confluence_result: Dict[str, Any], direction: str) -> Tuple[bool, str]:
@@ -6138,11 +5827,6 @@ def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp
             price = float(tick.ask) if direction == 'buy' else float(tick.bid)
             slippage = config.PAPER_SLIPPAGE_PIPS * (1 if direction == 'buy' else -1)
             price += slippage
-            ok, reason_msg = validate_trade_request(symbol, direction, price, sl_price, tp_price, lot)
-            if not ok:
-                logger.logger.warning(f"{nowstr()} {symbol}: paper trade pre-flight blocked ({reason_msg})")
-                logger.log_error("send_trade_safe", f"paper pre-flight blocked: {reason_msg}", "WARNING", symbol)
-                return None
             paper_engine.update_price(symbol, float(tick.bid), float(tick.ask))
             res = paper_engine.open_position(symbol, direction, lot, price, sl_price, tp_price, comment)
             ticket = res.get("order", 0)
@@ -6167,11 +5851,6 @@ def send_trade_safe(symbol: str, direction: str, lot: float, sl_price: float, tp
         
         price = float(tick.ask) if direction == 'buy' else float(tick.bid)
         order_type = mt5.ORDER_TYPE_BUY if direction == 'buy' else mt5.ORDER_TYPE_SELL
-        ok, reason_msg = validate_trade_request(symbol, direction, price, sl_price, tp_price, lot)
-        if not ok:
-            logger.logger.warning(f"{nowstr()} {symbol}: trade pre-flight blocked ({reason_msg})")
-            logger.log_error("send_trade_safe", f"pre-flight blocked: {reason_msg}", "WARNING", symbol)
-            return None
         
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -6980,15 +6659,6 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 logger.logger.info(f"{nowstr()} {symbol}: news filter active, skipping trade window")
                 time.sleep(30)
                 continue
-            if config.AVOID_ASIAN_SESSION:
-                h = datetime.now(timezone.utc).hour
-                st = int(config.ASIAN_SESSION_START_HOUR_UTC)
-                en = int(config.ASIAN_SESSION_END_HOUR_UTC)
-                in_asian = (st <= h < en) if st < en else (h >= st or h < en)
-                if in_asian:
-                    logger.logger.info(f"{nowstr()} {symbol}: asian low-liquidity filter active")
-                    time.sleep(30)
-                    continue
 
             if global_state.correlation_data and not passes_correlation_filter(symbol, global_state.correlation_data):
                 logger.logger.info(f"{nowstr()} {symbol}: correlation filter blocked trade")
@@ -7054,9 +6724,8 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             df_htf = calc_indicators_safe(get_bars_enhanced(symbol, config.HTF_TF, 250))
             df_h1 = calc_indicators_safe(get_bars_enhanced(symbol, config.HTF_H1_TF, 250))
             df_h4 = calc_indicators_safe(get_bars_enhanced(symbol, config.HTF_H4_TF, 250))
-            df_m15 = calc_indicators_safe(get_bars_enhanced(symbol, config.MTF_ENTRY_TF, 250))
 
-            if df.empty or df_htf.empty or df_h1.empty or df_h4.empty or df_m15.empty:
+            if df.empty or df_htf.empty or df_h1.empty or df_h4.empty:
                 time.sleep(1)
                 continue
 
@@ -7065,7 +6734,6 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                 (df_htf, config.HTF_TF, "htf"),
                 (df_h1, config.HTF_H1_TF, "h1"),
                 (df_h4, config.HTF_H4_TF, "h4"),
-                (df_m15, config.MTF_ENTRY_TF, "m15"),
             ]
             bad_data = False
             for data_df, tf, label in checks:
@@ -7192,13 +6860,6 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
             
             momentum_strength = 0.0
             if chosen_dir:
-                mtf_score, mtf_details = compute_mtf_confirmation_score(df_h4, df_h1, df_m15, chosen_dir)
-                if mtf_score < float(config.MIN_CONFIRMATION_SCORE):
-                    logger.logger.info(
-                        f"{nowstr()} {symbol}: MTF confirmation blocked ({mtf_score:.1f}<{config.MIN_CONFIRMATION_SCORE:.1f}) details={mtf_details}"
-                    )
-                    time.sleep(0.2)
-                    continue
                 ok_fire, fire_reason = evaluate_fire_conditions(confluence_result, chosen_dir)
                 if not ok_fire and not forced_trade:
                     logger.logger.info(f"{nowstr()} {symbol}: fire conditions blocked ({fire_reason})")
@@ -7315,11 +6976,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                         if fvg_signal.get('tp1_price') and config.FVG_USE_MIDPOINT_TP:
                             tp1_price = fvg_signal['tp1_price']
                             fvg_risk_reward = abs(tp1_price - entry_price) / abs(entry_price - sl_price)
-                            tp1_is_directional = (
-                                (chosen_dir == 'buy' and tp1_price > entry_price) or
-                                (chosen_dir == 'sell' and tp1_price < entry_price)
-                            )
-                            if tp1_is_directional and fvg_risk_reward > 1.5:
+                            if fvg_risk_reward > 1.5:
                                 tp_price = tp1_price
                                 fvg_based_tp = True
                                 logger.logger.info(f"Using FVG midpoint TP: {tp_price:.5f} (R:R={fvg_risk_reward:.2f})")
@@ -7328,11 +6985,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                         if (fvg_signal.get('tp2_price') and config.FVG_USE_OPPOSITE_SIDE_TP and 
                             fvg_signal.get('tp1_price')):
                             tp2_risk_reward = abs(fvg_signal['tp2_price'] - entry_price) / abs(entry_price - sl_price)
-                            tp2_is_directional = (
-                                (chosen_dir == 'buy' and fvg_signal['tp2_price'] > entry_price) or
-                                (chosen_dir == 'sell' and fvg_signal['tp2_price'] < entry_price)
-                            )
-                            if tp2_is_directional and tp2_risk_reward > 2.0:
+                            if tp2_risk_reward > 2.0:
                                 tp_price = fvg_signal['tp2_price']
                                 fvg_based_tp = True
                                 logger.logger.info(f"Using FVG opposite side TP: {tp_price:.5f} (R:R={tp2_risk_reward:.2f})")
@@ -7557,7 +7210,7 @@ def trade_symbol_enhanced(symbol: str, stop_event: threading.Event):
                     logger.logger.warning(f"{nowstr()} {symbol}: trade attempt failed. mt5.last_error={mt5.last_error()}")
                     debug_mt5_error()
                 else:
-                    logger.logger.info(f"{nowstr()} {symbol}: TRADE EXECUTED [OK] direction={chosen_dir} confluence={confluence_score}/5")
+                    logger.logger.info(f"{nowstr()} {symbol}: TRADE EXECUTED ✅ direction={chosen_dir} confluence={confluence_score}/5")
                     
                     if fvg_signal_active and confluence_result.get('fvg_signals'):
                         fvg_signal = confluence_result['fvg_signals'][0]
@@ -7608,44 +7261,44 @@ def main_enhanced():
             logger.logger.info("Paper trading mode: ENABLED (simulated execution)")
         logger.logger.info("=" * 80)
         logger.logger.info("SAFETY CONFIGURATION:")
-        logger.logger.info(f"  - Lot size: {config.LOT_FIXED}")
-        logger.logger.info(f"  - Cooldown: {config.COOLDOWN} seconds")
-        logger.logger.info(f"  - SL Multiplier: {config.SL_ATR_MULT}")
-        logger.logger.info(f"  - Max loss per trade: ${config.MAX_LOSS_PER_TRADE}")
-        logger.logger.info(f"  - Consecutive loss limit: {config.CONSECUTIVE_LOSS_LIMIT}")
+        logger.logger.info(f"  • Lot size: {config.LOT_FIXED}")
+        logger.logger.info(f"  • Cooldown: {config.COOLDOWN} seconds")
+        logger.logger.info(f"  • SL Multiplier: {config.SL_ATR_MULT}")
+        logger.logger.info(f"  • Max loss per trade: ${config.MAX_LOSS_PER_TRADE}")
+        logger.logger.info(f"  • Consecutive loss limit: {config.CONSECUTIVE_LOSS_LIMIT}")
         logger.logger.info("=" * 80)
         logger.logger.info("STRATEGY CONFIGURATION:")
-        logger.logger.info(f"  - CRT Enabled: {config.CRT_ENABLED}")
-        logger.logger.info(f"  - SNR Enabled: {config.SNR_ENABLED}")
-        logger.logger.info(f"  - FVG Enabled: {config.FVG_ENABLED}")
-        logger.logger.info(f"  - Liquidity SMC Enabled: {config.LIQUIDITY_SMC_ENABLED}")
-        logger.logger.info(f"  - Min Confluence Score: {config.MIN_CONFLUENCE_SCORE}")
-        logger.logger.info(f"  - FVG Confluence Weight: {config.FVG_CONFLUENCE_WEIGHT}")
-        logger.logger.info(f"  - Liquidity Confluence Weight: {config.LIQUIDITY_CONFLUENCE_WEIGHT}")
+        logger.logger.info(f"  • CRT Enabled: {config.CRT_ENABLED}")
+        logger.logger.info(f"  • SNR Enabled: {config.SNR_ENABLED}")
+        logger.logger.info(f"  • FVG Enabled: {config.FVG_ENABLED}")
+        logger.logger.info(f"  • Liquidity SMC Enabled: {config.LIQUIDITY_SMC_ENABLED}")
+        logger.logger.info(f"  • Min Confluence Score: {config.MIN_CONFLUENCE_SCORE}")
+        logger.logger.info(f"  • FVG Confluence Weight: {config.FVG_CONFLUENCE_WEIGHT}")
+        logger.logger.info(f"  • Liquidity Confluence Weight: {config.LIQUIDITY_CONFLUENCE_WEIGHT}")
         logger.logger.info("=" * 80)
         logger.logger.info("FVG SPECIFIC SETTINGS:")
-        logger.logger.info(f"  - FVG Min Strength: {config.FVG_MIN_STRENGTH}")
-        logger.logger.info(f"  - FVG Freshness Bars: {config.FVG_FRESHNESS_THRESHOLD_BARS}")
-        logger.logger.info(f"  - FVG Use Midpoint TP: {config.FVG_USE_MIDPOINT_TP}")
-        logger.logger.info(f"  - FVG Use Opposite TP: {config.FVG_USE_OPPOSITE_SIDE_TP}")
-        logger.logger.info(f"  - FVG SL Breaker Multiplier: {config.FVG_SL_BREAKER_MULTIPLIER}")
+        logger.logger.info(f"  • FVG Min Strength: {config.FVG_MIN_STRENGTH}")
+        logger.logger.info(f"  • FVG Freshness Bars: {config.FVG_FRESHNESS_THRESHOLD_BARS}")
+        logger.logger.info(f"  • FVG Use Midpoint TP: {config.FVG_USE_MIDPOINT_TP}")
+        logger.logger.info(f"  • FVG Use Opposite TP: {config.FVG_USE_OPPOSITE_SIDE_TP}")
+        logger.logger.info(f"  • FVG SL Breaker Multiplier: {config.FVG_SL_BREAKER_MULTIPLIER}")
         logger.logger.info("=" * 80)
         logger.logger.info("LIQUIDITY SMC SETTINGS:")
-        logger.logger.info(f"  - Liquidity Lookback: {config.LIQUIDITY_LOOKBACK_PERIODS} bars")
-        logger.logger.info(f"  - Volume Multiplier: {config.LIQUIDITY_VOLUME_MULTIPLIER}")
-        logger.logger.info(f"  - Zone Width: {config.LIQUIDITY_ZONE_WIDTH_PCT * 100}%")
+        logger.logger.info(f"  • Liquidity Lookback: {config.LIQUIDITY_LOOKBACK_PERIODS} bars")
+        logger.logger.info(f"  • Volume Multiplier: {config.LIQUIDITY_VOLUME_MULTIPLIER}")
+        logger.logger.info(f"  • Zone Width: {config.LIQUIDITY_ZONE_WIDTH_PCT * 100}%")
         logger.logger.info("=" * 80)
         logger.logger.info("AUTOMATION FEATURES:")
-        logger.logger.info("  [OK] Automatic logging (12 log files)")
-        logger.logger.info("  [OK] Automatic connection recovery")
-        logger.logger.info("  [OK] Intelligent data caching")
-        logger.logger.info("  [OK] Automatic supervisor monitoring")
-        logger.logger.info("  [OK] Quint strategy confluence (Trend + CRT + SNR + FVG + Liquidity)")
-        logger.logger.info("  [OK] FVG detection: Bullish, Bearish, Partial, Mitigated")
-        logger.logger.info("  [OK] Liquidity SMC: Order blocks, breaker blocks, liquidity pools")
-        logger.logger.info("  [OK] Volume-based smart money detection")
-        logger.logger.info("  [OK] FVG strength scoring and volume prioritization")
-        logger.logger.info("  [OK] FVG-based TP1 (midpoint) and TP2 (opposite side)")
+        logger.logger.info("  ✅ Automatic logging (12 log files)")
+        logger.logger.info("  ✅ Automatic connection recovery")
+        logger.logger.info("  ✅ Intelligent data caching")
+        logger.logger.info("  ✅ Automatic supervisor monitoring")
+        logger.logger.info("  ✅ Quint strategy confluence (Trend + CRT + SNR + FVG + Liquidity)")
+        logger.logger.info("  ✅ FVG detection: Bullish, Bearish, Partial, Mitigated")
+        logger.logger.info("  ✅ Liquidity SMC: Order blocks, breaker blocks, liquidity pools")
+        logger.logger.info("  ✅ Volume-based smart money detection")
+        logger.logger.info("  ✅ FVG strength scoring and volume prioritization")
+        logger.logger.info("  ✅ FVG-based TP1 (midpoint) and TP2 (opposite side)")
         logger.logger.info("=" * 80)
         
         supervisor = AutomatedSupervisor()
@@ -7664,7 +7317,7 @@ def main_enhanced():
             logger.logger.info(f"Trading thread started for {symbol}")
             thread_manager.register_thread(t.name, t, symbol)
         
-        logger.logger.info("[OK] ALL SYSTEMS INITIALIZED AND RUNNING")
+        logger.logger.info("✅ ALL SYSTEMS INITIALIZED AND RUNNING")
         logger.logger.info("=" * 80)
         
         while True:
